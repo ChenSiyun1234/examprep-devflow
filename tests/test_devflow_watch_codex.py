@@ -251,6 +251,33 @@ class TestWatchCodexBehavior(WatchCodexBase):
         leftovers = [f for f in os.listdir(self.dir) if f.endswith(".tmp")]
         self.assertEqual(leftovers, [])      # temp file was os.replace'd into place, none left behind
 
+    def test_is_codex_quota_notice_is_precise(self):
+        # the exact bot notice -> True; a substantive (long) review that merely MENTIONS usage limits
+        # -> False (must not be dropped as a rate-limit notice) (Codex r2)
+        self.assertTrue(G.is_codex_quota_notice(
+            "You have reached your Codex usage limits for code reviews. See the dashboard."))
+        long_review = "### Codex Review\n- " + "the watcher usage limit / codex handling looks off; " * 30
+        self.assertFalse(G.is_codex_quota_notice(long_review))
+
+    def test_quota_notice_after_seen_review_not_re_alerted(self):
+        # a quota notice arriving AFTER a seen review must not advance the dedupe key / re-alert (Codex r2)
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        self.run_watch(prs, reviews_by_pr={1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]})  # baseline
+        _, out, _ = self.run_watch(
+            prs, reviews_by_pr={1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]},
+            comments_by_pr={1: [codex_quota("2026-01-04T00:00:00Z", "p1#q1")]})   # newer quota notice
+        self.assertNotIn("ACTIONABLE_CODEX_REVIEWS", out)   # stale review NOT re-alerted (key over non-quota)
+        self.assertIn("CODEX_QUOTA_LIMITED", out)           # but rate-limit is still signalled
+
+    def test_legacy_mixed_case_seen_slice_is_migrated_on_load(self):
+        # a seen file written by pre-normalization code (mixed-case key) must still match (Codex r2)
+        with open(self.seen, "w", encoding="utf-8") as f:
+            json.dump({"Owner/Repo": {"1": {"key": "2026-01-03T00:00:00Z|p1#r1"}}}, f)
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        _, out, _ = self.run_watch(prs, reviews_by_pr={1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]},
+                                   repo="owner/repo")
+        self.assertNoNew(out)   # legacy slice migrated on load -> already-seen, not re-alerted
+
     def test_gh_unauthenticated_returns_nonzero(self):
         rc, out, _ = self.run_watch([{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}],
                                     auth_ok=False)

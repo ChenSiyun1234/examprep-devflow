@@ -362,7 +362,10 @@ def _load_codex_seen(path: str) -> dict:
         return {}
     # Tolerate PARTIAL corruption / legacy slices too: keep only dict repo-slices whose per-PR
     # entries are themselves dicts, so a present-but-non-dict slice/entry can't crash the use sites.
-    return {repo: {pr: entry for pr, entry in slc.items() if isinstance(entry, dict)}
+    # case-fold the top-level repo key (GitHub repos are case-insensitive) so a legacy mixed-case
+    # slice written before key-normalization still matches the lowercased lookup, instead of being
+    # missed and re-alerting every previously-seen review.
+    return {repo.lower(): {pr: entry for pr, entry in slc.items() if isinstance(entry, dict)}
             for repo, slc in data.items() if isinstance(slc, dict)}
 
 
