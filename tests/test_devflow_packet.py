@@ -210,6 +210,32 @@ class TestBuildPacket(unittest.TestCase):
         self.assertNotIn("$HOME", joined)
         self.assertNotIn("%APPDATA%", joined)
 
+    def test_note_drive_prefix_without_space_stripped(self):
+        # "C:\\dir:detail" (drive colon, no space after the trailing colon) must still strip (Codex r4)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [{"note": r"C:\Windows\System32:rm it"}]}
+        joined = " ".join(build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]["tasks"])
+        self.assertIn("rm it", joined)
+        self.assertNotIn("System32", joined)
+
+    def test_string_blocking_comment_sanitized(self):
+        # a string (non-dict) blocking comment must be path-sanitized like a dict note (Codex r4)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": ["/etc/passwd:rotate creds"]}
+        joined = " ".join(build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]["tasks"])
+        self.assertIn("rotate creds", joined)
+        self.assertNotIn("/etc/passwd", joined)
+
+    def test_advisory_steps_path_sanitized(self):
+        # advisory recommended_steps must be path-sanitized before becoming approved tasks (Codex r4)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_ADVISORY,
+              "advisory_packet": {"recommended_steps": ["/etc/passwd: rotate it", "refactor the parser"]}}
+        ii = build_packet(st, GATE_ADVISORY, "approved", "T0")["implementation_instructions"]
+        joined = " ".join(ii["tasks"])
+        self.assertIn("rotate it", joined)
+        self.assertNotIn("/etc/passwd", joined)
+        self.assertIn("refactor the parser", joined)
+
     def test_unsafe_path_in_note_of_safe_path_comment_stripped(self):
         # even when the structured path is safe, an unsafe "PATH: detail" hidden in the note is stripped
         st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
@@ -343,6 +369,23 @@ class TestSafeThreadSlug(unittest.TestCase):
             with self.assertRaises(PacketError):
                 write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
         self.assertFalse(os.path.exists(json_path))          # nothing written through the symlink
+
+    def test_write_refuses_hardlinked_packet_file(self):
+        # a hard-linked existing packet file (st_nlink > 1) must be refused — open(w) would truncate
+        # the shared inode (e.g. a hard link to a tracked file) (Codex r4)
+        from devflow.tools import packet_writer as P
+        base = tempfile.mkdtemp(prefix="pkt-")
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        d = os.path.join(base, safe_thread_slug("demo"))
+        os.makedirs(d, exist_ok=True)
+        json_path = os.path.join(d, "implementation-packet.json")
+        open(json_path, "w").close()                          # pre-existing target
+        real_stat = os.stat
+        with mock.patch.object(P.os, "stat",
+                               side_effect=lambda p, *a, **k: type("S", (), {"st_nlink": 2})()
+                               if p == json_path else real_stat(p, *a, **k)):
+            with self.assertRaises(PacketError):
+                write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
 
     def test_write_refuses_symlinked_ancestor(self):
         # a symlinked ANCESTOR of a relative base (e.g. a stale `.devflow -> .`) must be refused too

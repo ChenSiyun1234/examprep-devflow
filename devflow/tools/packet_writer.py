@@ -73,16 +73,21 @@ def _strip_unsafe_path_prefix(text: str) -> str:
     """Real Codex bullets often carry the location inside the note text as ``PATH: detail``. If that
     leading PATH is unsafe (absolute / drive / ``..`` / ``~`` / env / ``.``), drop it so the task
     text can't direct edits outside the repo; a benign or safe-path note is returned unchanged."""
-    # Try ": " (colon-space) FIRST so a Windows drive colon in "C:\dir: detail" isn't mistaken for the
-    # delimiter; fall back to a bare ":" for the "PATH:detail" (no-space) shape.
+    # A Windows drive path has a colon at index 1 ("C:\dir") that is NOT the "PATH: detail" delimiter
+    # — skip it so the bare-colon fallback doesn't split the head down to just "C".
+    drive = len(text) >= 3 and text[0].isalpha() and text[1] == ":" and text[2] in "\\/"
+    # Try ": " (colon-space) FIRST, then a bare ":" for the "PATH:detail" (no-space) shape.
     for sep_str in (": ", ":"):
-        head, sep, rest = text.partition(sep_str)
-        if sep and rest.strip():
-            h = head.strip()
-            looks_path = ("/" in h or "\\" in h or h.startswith(("~", ".", "$", "%"))
-                          or "$" in h or "%" in h or (len(h) >= 2 and h[1] == ":"))
-            if looks_path and not _is_safe_rel_path(h):
-                return rest.strip()
+        start = 2 if (drive and sep_str == ":") else 0
+        idx = text.find(sep_str, start)
+        if idx != -1:
+            head, rest = text[:idx], text[idx + len(sep_str):]
+            if rest.strip():
+                h = head.strip()
+                looks_path = ("/" in h or "\\" in h or h.startswith(("~", ".", "$", "%"))
+                              or "$" in h or "%" in h or (len(h) >= 2 and h[1] == ":"))
+                if looks_path and not _is_safe_rel_path(h):
+                    return rest.strip()
     return text
 
 
@@ -102,7 +107,7 @@ def _fmt_comment_task(c) -> str:
         if safe:
             return path
         return "(review comment)"                 # no safe path, no note -> never echo a bad path
-    return str(c)
+    return _strip_unsafe_path_prefix(str(c))       # string item -> same unsafe-prefix stripping
 
 
 def _as_list(v) -> list:
@@ -156,8 +161,12 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
     deferred = _as_list(state.get("deferred_followups"))
     is_rejection = str(decision).lower() == "rejected"
 
-    steps = _as_list(advisory.get("recommended_steps"))
+    # advisory steps/summary are UNTRUSTED checkpoint content too — sanitize any embedded unsafe path
+    # prefix here, at the source, so every downstream use (approved_scope/tasks/fallback) is clean.
+    steps = [_strip_unsafe_path_prefix(str(s)) for s in _as_list(advisory.get("recommended_steps"))]
     summary = advisory.get("summary") if isinstance(advisory.get("summary"), str) else None
+    if summary:
+        summary = _strip_unsafe_path_prefix(summary)
 
     # Blocking comments are actionable ONLY at the blocking-fix gate. At the merge gate they are
     # already-resolved history, and at the advisory gate they don't exist yet — turning them into
@@ -364,6 +373,10 @@ def write_packet(base_dir: str, thread_id: str, packet: dict,
     for p in (json_path, md_path):
         if os.path.islink(p):
             raise PacketError(f"refusing to overwrite a symlinked packet file: {p}")
+        # refuse a hard-linked or non-regular existing target — open(w) would truncate the shared
+        # inode (e.g. a hard link to a tracked file), writing through to it.
+        if os.path.exists(p) and (not os.path.isfile(p) or os.stat(p).st_nlink > 1):
+            raise PacketError(f"refusing to overwrite a hard-linked or non-regular packet file: {p}")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(packet, f, ensure_ascii=False, indent=2)
     with open(md_path, "w", encoding="utf-8") as f:
