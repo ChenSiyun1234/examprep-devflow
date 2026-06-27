@@ -203,8 +203,14 @@ def is_codex_quota_notice(body: Optional[str]) -> bool:
     callers must not treat it as actionable, and can use it to back off. Matched precisely (the
     limit phrase AND a code-review/codex context) so a real finding that merely mentions a "usage
     limit" in the code under review isn't misread as rate-limiting."""
-    t = (body or "").lower()
-    return "usage limit" in t and ("code review" in t or "codex" in t)
+    t = (body or "").strip().lower()
+    if not t:
+        return False
+    # Match the ACTUAL bot notice ("You have reached your Codex usage limits for code reviews. …")
+    # — specific phrasing AND a short whole-body — so a substantive review that merely MENTIONS usage
+    # limits (e.g. a review OF this watcher) isn't misclassified and dropped as a rate-limit notice.
+    return (("reached your codex usage limits" in t or "usage limits for code reviews" in t)
+            and len(t) < 600)
 
 
 # Tie-break for "latest" when GitHub's 1-second timestamps collide (Codex posts a review plus
@@ -408,18 +414,21 @@ class ReadOnlyGitHub:
             return (c.get("created_at") or "",
                     _CODEX_SOURCE_RANK.get(c.get("source"), 0),
                     c.get("url") or "")
-        # Dedupe key for the watcher: cover ALL Codex signals sharing the latest timestamp (not just
-        # the single highest-ranked one), so a newly-visible same-second lower-ranked comment changes
-        # the key and is not silently swallowed under GitHub's eventual consistency.
-        _max_ts = max((c.get("created_at") or "") for c in candidates)
-        dedupe_key = _max_ts + "|" + ",".join(sorted(
-            (c.get("url") or "") for c in candidates if (c.get("created_at") or "") == _max_ts))
         # A Codex "usage limits" notice is rate-limiting, NOT a review. Detect whether the OVERALL
-        # latest signal is that notice (so callers can back off), but base the actual review verdict
-        # on the latest NON-quota signal — so a freshly-posted-then-rate-limited review isn't hidden,
-        # and a bare quota notice is never mis-parsed as a verdict.
+        # latest signal is that notice (so callers can back off), but base the verdict on the latest
+        # NON-quota signal — so a freshly-posted-then-rate-limited review isn't hidden, and a bare
+        # quota notice is never mis-parsed as a verdict.
         quota_active = is_codex_quota_notice(max(candidates, key=_key).get("body"))
         real = [c for c in candidates if not is_codex_quota_notice(c.get("body"))]
+        # Dedupe key for the watcher over the NON-quota signals at their latest timestamp: cover ALL
+        # signals sharing that timestamp (not just the highest-ranked one), so a newly-visible
+        # same-second lower-ranked comment advances the key — while a bare quota notice arriving AFTER
+        # a seen review does NOT (it would otherwise re-alert stale feedback). Falls back to all
+        # candidates only when the PR has nothing but quota notices.
+        _basis = real or candidates
+        _max_ts = max((c.get("created_at") or "") for c in _basis)
+        dedupe_key = _max_ts + "|" + ",".join(sorted(
+            (c.get("url") or "") for c in _basis if (c.get("created_at") or "") == _max_ts))
         if not real:
             overall = max(candidates, key=_key)   # only quota notices from Codex -> signal, no review
             return {
@@ -437,6 +446,15 @@ class ReadOnlyGitHub:
             }
         latest = max(real, key=_key)
         packet = parse_review_packet(latest["body"], latest.get("state"))  # default: latest item's verdict
+        # A same-second lower-ranked signal can advance the dedupe key (re-alerting) while `latest`
+        # stays the higher-ranked review; merge that newer signal's items so the alert isn't empty of
+        # the actually-new content.
+        _lt = latest.get("created_at") or ""
+        for c in real:
+            if c is not latest and (c.get("created_at") or "") == _lt:
+                for it in (parse_review_packet(c.get("body"), c.get("state")).get("items") or []):
+                    if it not in packet["items"]:
+                        packet["items"].append(it)
         # Reconcile with terminal review states:
         #  - a CHANGES_REQUESTED review stays in effect until a *newer* APPROVED clears it;
         #  - an APPROVED clears blocking only if it's the most recent signal — a newer plain comment

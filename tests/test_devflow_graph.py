@@ -203,5 +203,29 @@ class TestCodexReviewFixesPR1Round3(unittest.TestCase):
         self.assertFalse(os.path.exists(cli._ckpt_path(tid)))
 
 
+class TestWaitForCodexReviewQuota(unittest.TestCase):
+    def test_keeps_polling_on_quota_only_result(self):
+        # a quota-only result (has_review False) must NOT satisfy the poll as if a review arrived;
+        # it keeps polling and times out (Codex r2, P1)
+        from devflow.nodes import pr_review
+        quota_only = {"has_review": False, "quota_limited": True, "blocking": None, "items": []}
+        state = {"real_github": True, "repo": "o/r", "pr_number": 5,
+                 "max_polls": 2, "poll_seconds": 0, "_sleep_fn": lambda *_: None}
+        with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:
+            RG.return_value.find_latest_codex_review.return_value = quota_only
+            out = pr_review.wait_for_codex_review(state)
+        self.assertEqual(out["codex_review_status"], "timeout")   # quota notice is not the awaited review
+
+    def test_real_review_still_satisfies_poll(self):
+        from devflow.nodes import pr_review
+        real = {"has_review": True, "quota_limited": False, "blocking": False, "items": ["fix x"]}
+        state = {"real_github": True, "repo": "o/r", "pr_number": 5,
+                 "max_polls": 2, "poll_seconds": 0, "_sleep_fn": lambda *_: None}
+        with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:
+            RG.return_value.find_latest_codex_review.return_value = real
+            out = pr_review.wait_for_codex_review(state)
+        self.assertEqual(out["codex_review_status"], "ready")
+
+
 if __name__ == "__main__":
     unittest.main()
