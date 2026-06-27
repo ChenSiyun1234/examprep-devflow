@@ -184,11 +184,8 @@ class TestCodexReviewFixesPR1Round3(unittest.TestCase):
             "blocking_comments", "non_blocking_comments", "deferred_followups",
             "checks_run", "checks_not_run", "files_changed", "errors", "event_log"})
 
-    def test_pause_at_with_langgraph_is_refused(self):
-        from devflow.cli import build_parser
-        args = build_parser().parse_args(
-            ["run", "--thread-id", "x", "--langgraph", "--pause-at", "advisory"])
-        self.assertEqual(args.func(args), 2)  # refused, no silent exit
+    # NOTE: `--pause-at` with `--langgraph` is now SUPPORTED (native interrupt/resume) — the old
+    # "refused" behavior was removed. See tests/test_devflow_langgraph_resume.py for its coverage.
 
     def test_checkpoint_filename_is_length_bounded(self):
         from devflow.cli import _ckpt_path

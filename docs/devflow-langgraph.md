@@ -119,6 +119,48 @@ or the resume payload — otherwise (b) the workflow pauses: a real `interrupt()
 a `DevflowInterrupt` in fallback mode. A rejected gate routes to a safe stop. Approve/reject is never
 inferred; the run halts until a decision is supplied.
 
+## Resume: stdlib fallback vs real LangGraph
+
+Both backends pause at the *same* three gates and never infer a decision; they differ only in how
+the pause is persisted and resumed.
+
+| | stdlib fallback (default) | real LangGraph backend (`--langgraph`) |
+|---|---|---|
+| pause mechanism | raises `DevflowInterrupt`, returns `status="paused"` | native `interrupt(payload)` |
+| checkpoint | a JSON file per `thread_id` | a **SQLite** checkpointer keyed by `thread_id` |
+| resume | re-run from `paused_at_node` with the gate seeded in `approvals` | `Command(resume="approved"\|"rejected")` |
+| extra deps | none (pure stdlib) | `langgraph` + `langgraph-checkpoint-sqlite` |
+
+`thread_id` is the stable key for a run in **both** backends: the id you pass to `run` is the id you
+pass to `resume`, and it is the thread you select in LangGraph Studio.
+
+```bash
+# real LangGraph backend: pause at the advisory gate, resume natively
+python -m devflow.cli run    --task docs-advisory --thread-id lg-demo --langgraph --pause-at advisory
+python -m devflow.cli resume --thread-id lg-demo --gate advisory --decision approved --langgraph
+python -m devflow.cli resume --thread-id lg-demo --gate advisory --decision rejected  --langgraph  # safe stop
+```
+
+Under the hood the approval node calls `interrupt(payload)`; resuming with
+`Command(resume="approved")` makes that call *return* the decision, so state is preserved across the
+gate and the graph continues from exactly where it paused. A rejected decision routes straight to the
+post-run report — the implementation/merge nodes never run.
+
+In **LangGraph Studio** the same gates appear as interrupts: run a thread, it pauses at
+`human_approval_gate` / `human_fix_approval` / `human_merge_approval` showing the interrupt payload,
+and you resume by supplying the decision — no CLI needed.
+
+**Known limitations**
+- The LangGraph *durable* CLI resume needs `langgraph-checkpoint-sqlite` (explicit optional dep, in
+  the `[studio]`/`[langgraph]` extras); without it the CLI prints an install hint and exits non-zero.
+  The stdlib fallback resume has no such dependency.
+- `interrupt()` is called **once per gate, never inside a loop**. On resume the platform re-executes
+  the node up to that `interrupt()` call; the approval nodes do no work before the call, so nothing is
+  duplicated and no GitHub write is ever repeated.
+- The LangGraph resume path is **dry-run only** in this PR — it does not re-enable `--real-github`.
+  Guarded real writes remain on the stdlib `run-docs-advisory` path.
+- Studio's UI (`langgraph dev`) additionally needs `langgraph-cli[inmem]` + a browser.
+
 ## What is dry-run in this PR (hard boundaries)
 
 The scaffold **does not**: create GitHub issues, post `@codex` comments, create branches/PRs, push,

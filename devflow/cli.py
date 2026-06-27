@@ -31,6 +31,7 @@ from devflow.state import (
     GATE_ADVISORY, GATE_FIX, GATE_MERGE,
 )
 from devflow.tools.github_cli import ReadOnlyGitHub, check_gh_available, GhError
+from devflow._compat import HAS_LANGGRAPH
 
 # Windows GBK consoles otherwise mangle the report box-drawing / CJK text.
 for _s in ("stdout", "stderr"):
@@ -100,12 +101,9 @@ def _invoke(app, state, start_node=None):
 
 
 def cmd_run(args) -> int:
-    if args.langgraph and args.pause_at:
-        # LangGraph reports a pause via result['__interrupt__'], not status="paused"; this CLI
-        # doesn't wire LangGraph resume, so a --langgraph pause would exit silently. Refuse it.
-        print("[devflow] --pause-at is not supported with --langgraph (LangGraph resume is not "
-              "wired into this CLI). Use the default stdlib backend for pause/resume.")
-        return 2
+    if args.langgraph:                       # real LangGraph backend: native interrupt/resume
+        return _run_langgraph(args)
+    # default: fully-supported stdlib backend (JSON-checkpoint pause/resume)
     state = new_state(
         task_type=args.task, thread_id=args.thread_id, repo=args.repo,
         approvals=_approvals_from_args(args),
@@ -113,11 +111,10 @@ def cmd_run(args) -> int:
     if args.simulate_advisory or args.simulate_review:
         state["_simulate"] = {"advisory": args.simulate_advisory or "ready",
                               "review": args.simulate_review or "blocking"}
-    # Default to the fully-supported stdlib backend; --langgraph opts into the experimental one.
-    app = build_graph(prefer_fallback=not args.langgraph)
+    app = build_graph(prefer_fallback=True)
     print(f"[devflow] backend={getattr(app, 'backend', '?')}  dry_run=True  "
           f"task={args.task}  thread={args.thread_id}")
-    final = _invoke(app, state)
+    final = app.invoke(state)
     if final.get("status") == "paused":
         _save_ckpt(final)
     else:
@@ -130,7 +127,112 @@ def cmd_run(args) -> int:
     return 0
 
 
+# ====================================================================================
+# Real LangGraph backend — native interrupt() pause + Command(resume=...) resume.
+# Uses a SQLite checkpointer so a pause in one `run` process can be resumed by a later
+# `resume` process (cross-process durability). Dry-run only: no real GitHub writes here.
+# ====================================================================================
+LG_CKPT = os.path.join(CKPT_DIR, "langgraph-checkpoints.sqlite")
+_LG_SQLITE_HINT = (
+    "[devflow] the LangGraph backend's durable resume needs the SQLite checkpointer (optional dep).\n"
+    '  pip install "langgraph-checkpoint-sqlite"   (or: pip install -e ".[studio]")')
+
+
+def _langgraph_saver():
+    """Return a SqliteSaver context manager (durable, cross-process) or None if not installed."""
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+    except Exception:
+        return None
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    return SqliteSaver.from_conn_string(LG_CKPT)
+
+
+def _lg_pending(app, cfg):
+    """(next_nodes, [interrupt payloads]) at the current checkpoint; next_nodes empty == finished."""
+    snap = app.get_state(cfg)
+    payloads = []
+    for task in getattr(snap, "tasks", ()) or ():
+        for itr in getattr(task, "interrupts", ()) or ():
+            payloads.append(getattr(itr, "value", itr))
+    return tuple(snap.next or ()), payloads
+
+
+def _print_lg_pause(next_nodes, payloads, thread_id):
+    print(f"\n*** PAUSED (LangGraph interrupt) at: {', '.join(next_nodes)} ***")
+    alias = "advisory"
+    if payloads:
+        print("Interrupt payload:")
+        print(json.dumps(payloads[0], ensure_ascii=False, indent=2))
+        gate = (payloads[0] or {}).get("gate")
+        alias = next((a for a, full in _GATE_ALIASES.items() if full == gate), "advisory")
+    print(f"\nResume with:\n  python -m devflow.cli resume --thread-id {thread_id} "
+          f"--gate {alias} --decision approved --langgraph")
+
+
+def _run_langgraph(args) -> int:
+    if not HAS_LANGGRAPH:
+        print("[devflow] --langgraph needs langgraph: pip install -r devflow/requirements-dev.txt")
+        return 4
+    cm = _langgraph_saver()
+    if cm is None:
+        print(_LG_SQLITE_HINT)
+        return 4
+    from devflow.graph import _build_state_graph
+    # real_github stays False (new_state default): the langgraph pause/resume path is dry-run only.
+    state = new_state(task_type=args.task, thread_id=args.thread_id, repo=args.repo,
+                      approvals=_approvals_from_args(args))
+    if args.simulate_advisory or args.simulate_review:
+        state["_simulate"] = {"advisory": args.simulate_advisory or "ready",
+                              "review": args.simulate_review or "blocking"}
+    cfg = {"configurable": {"thread_id": args.thread_id}}
+    print(f"[devflow] backend=langgraph (sqlite checkpointer)  dry_run=True  "
+          f"task={args.task}  thread={args.thread_id}")
+    with cm as saver:
+        app = _build_state_graph().compile(checkpointer=saver)
+        app.invoke(state, cfg)
+        nxt, payloads = _lg_pending(app, cfg)
+        if nxt:                               # paused at an approval gate
+            _print_lg_pause(nxt, payloads, args.thread_id)
+            return 0
+        _print_outcome(app.get_state(cfg).values)
+    return 0
+
+
+def _resume_langgraph(args) -> int:
+    if not HAS_LANGGRAPH:
+        print("[devflow] --langgraph needs langgraph: pip install -r devflow/requirements-dev.txt")
+        return 4
+    cm = _langgraph_saver()
+    if cm is None:
+        print(_LG_SQLITE_HINT)
+        return 4
+    from devflow.graph import _build_state_graph
+    from langgraph.types import Command
+    decision = APPROVED if args.decision == "approved" else REJECTED
+    cfg = {"configurable": {"thread_id": args.thread_id}}
+    with cm as saver:
+        app = _build_state_graph().compile(checkpointer=saver)
+        nxt, _ = _lg_pending(app, cfg)
+        if not nxt:
+            print(f"[devflow] no paused LangGraph thread '{args.thread_id}'. Start one with:\n"
+                  f"  python -m devflow.cli run --task <t> --thread-id {args.thread_id} "
+                  f"--langgraph --pause-at <gate>")
+            return 1
+        print(f"[devflow] resume(langgraph) thread={args.thread_id} gate={args.gate} "
+              f"decision={decision}")
+        app.invoke(Command(resume=decision), cfg)   # native resume; approval is never inferred
+        nxt2, payloads2 = _lg_pending(app, cfg)
+        if nxt2:                              # paused at the next gate
+            _print_lg_pause(nxt2, payloads2, args.thread_id)
+            return 0
+        _print_outcome(app.get_state(cfg).values)   # rejected -> safe-stop report; approved -> done
+    return 0
+
+
 def cmd_resume(args) -> int:
+    if getattr(args, "langgraph", False):    # native LangGraph resume via Command(resume=...)
+        return _resume_langgraph(args)
     try:
         state = _load_ckpt(args.thread_id)
     except FileNotFoundError:
@@ -307,6 +409,8 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--real-github", action="store_true",
                     help="re-enable real gh writes on this resume (default: dry-run, even if the "
                          "original run used --real-github)")
+    rs.add_argument("--langgraph", action="store_true",
+                    help="resume a thread paused on the real LangGraph backend (Command(resume=...))")
     rs.set_defaults(func=cmd_resume)
 
     # --- read-only GitHub commands ---

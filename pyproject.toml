@@ -12,9 +12,10 @@ requires-python = ">=3.8"
 dependencies = []
 
 [project.optional-dependencies]
-# the real LangGraph backend + LangGraph Studio (`langgraph dev`)
-langgraph = ["langgraph>=0.2,<0.4"]
-studio = ["langgraph>=0.2,<0.4", "langgraph-cli[inmem]>=0.1.55"]
+# the real LangGraph backend (+ durable sqlite checkpointer for cross-process pause/resume)
+langgraph = ["langgraph>=0.2,<0.4", "langgraph-checkpoint-sqlite>=2.0"]
+# the above plus LangGraph Studio (`langgraph dev`)
+studio = ["langgraph>=0.2,<0.4", "langgraph-checkpoint-sqlite>=2.0", "langgraph-cli[inmem]>=0.1.55"]
 
 [tool.setuptools]
 packages = ["devflow", "devflow.nodes", "devflow.tools"]

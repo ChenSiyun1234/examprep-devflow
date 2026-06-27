@@ -31,9 +31,15 @@ pip install -r devflow/requirements-dev.txt
 # end-to-end dry-run (all gates auto-approved) -> prints a final report
 python -m devflow.cli run --task docs-advisory --thread-id demo-1
 
-# human-approval pause (interrupt) then resume
+# human-approval pause (interrupt) then resume — stdlib fallback (JSON checkpoint)
 python -m devflow.cli run    --task docs-advisory --thread-id demo-2 --pause-at advisory
 python -m devflow.cli resume --thread-id demo-2 --gate advisory --decision approved
+
+# same pause/resume on the real LangGraph backend (native interrupt + Command(resume=...))
+python -m devflow.cli run    --task docs-advisory --thread-id lg-demo --langgraph --pause-at advisory
+python -m devflow.cli resume --thread-id lg-demo --gate advisory --decision approved --langgraph
+# rejecting safe-stops (no implementation, no merge):
+python -m devflow.cli resume --thread-id lg-demo --gate advisory --decision rejected  --langgraph
 
 # read-only GitHub inspection (needs an authenticated `gh` CLI)
 python -m devflow.cli github-check
