@@ -73,7 +73,7 @@ def _strip_unsafe_path_prefix(text: str) -> str:
     """Real Codex bullets often carry the location inside the note text as ``PATH: detail``. If that
     leading PATH is unsafe (absolute / drive / ``..`` / ``~`` / env / ``.``), drop it so the task
     text can't direct edits outside the repo; a benign or safe-path note is returned unchanged."""
-    head, sep, rest = text.partition(": ")
+    head, sep, rest = text.partition(":")   # first colon, with OR without a trailing space
     if sep and rest.strip():
         h = head.strip()
         looks_path = ("/" in h or "\\" in h or h.startswith(("~", "."))
@@ -92,7 +92,8 @@ def _fmt_comment_task(c) -> str:
         note = c.get("note") or c.get("body") or c.get("summary")
         safe = isinstance(path, str) and _is_safe_rel_path(path)
         if safe and note:
-            return f"{path}: {note}"
+            # sanitize the note too — an unsafe "PATH: detail" can be smuggled inside a safe-path note
+            return f"{path}: {_strip_unsafe_path_prefix(str(note))}"
         if note:
             return _strip_unsafe_path_prefix(str(note))   # drop an unsafe path embedded in the note
         if safe:
@@ -187,8 +188,10 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
     if is_fix_gate:
         raw_files += [c["path"] for c in blocking
                       if isinstance(c, dict) and isinstance(c.get("path"), str)]
-    # only accept STRING advisory files — never str()-coerce None/numbers/objects into fake paths
-    raw_files += [f for f in _as_list(advisory.get("files")) if isinstance(f, str)]
+    # advisory's own file list belongs ONLY to the advisory gate — at the merge gate (which approves
+    # no new work) it would wrongly present edit targets. Only accept STRING entries (no str()-coerce).
+    if gate == "advisory_implementation":
+        raw_files += [f for f in _as_list(advisory.get("files")) if isinstance(f, str)]
     files = sorted({p for p in raw_files if _is_safe_rel_path(p)})
     unsafe_files = sorted({p for p in raw_files if not _is_safe_rel_path(p)})
 

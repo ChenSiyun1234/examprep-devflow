@@ -189,6 +189,32 @@ class TestBuildPacket(unittest.TestCase):
         self.assertNotIn("../outside.py", joined)
         self.assertIn("just fix the parser", joined)          # plain note untouched
 
+    def test_note_unsafe_path_stripped_without_space(self):
+        # "PATH:detail" (colon, NO space) must be stripped just like "PATH: detail" (Codex r2)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [{"note": "/etc/passwd:rotate creds"}]}
+        joined = " ".join(build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]["tasks"])
+        self.assertIn("rotate creds", joined)
+        self.assertNotIn("/etc/passwd", joined)
+
+    def test_unsafe_path_in_note_of_safe_path_comment_stripped(self):
+        # even when the structured path is safe, an unsafe "PATH: detail" hidden in the note is stripped
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [{"path": "devflow/ok.py", "note": "/etc/passwd: rm it"}]}
+        joined = " ".join(build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]["tasks"])
+        self.assertIn("devflow/ok.py", joined)
+        self.assertIn("rm it", joined)
+        self.assertNotIn("/etc/passwd", joined)
+
+    def test_advisory_files_not_in_merge_gate_packet(self):
+        # advisory.files must only appear at the advisory gate, never at the merge gate (Codex r2)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_MERGE,
+              "advisory_packet": {"summary": "s", "files": ["devflow/a.py", "devflow/b.py"]}}
+        merge_files = build_packet(st, GATE_MERGE, "approved", "T0")["implementation_instructions"]["files_likely_touched"]
+        self.assertEqual(merge_files, [])
+        adv_files = build_packet(st, GATE_ADVISORY, "approved", "T0")["implementation_instructions"]["files_likely_touched"]
+        self.assertEqual(adv_files, ["devflow/a.py", "devflow/b.py"])   # still present at advisory gate
+
     def test_non_string_advisory_files_dropped(self):
         # advisory_packet.files with non-string entries must not be str()-coerced into fake paths
         st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_ADVISORY,
