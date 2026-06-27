@@ -382,10 +382,19 @@ class TestSafeThreadSlug(unittest.TestCase):
         open(json_path, "w").close()                          # pre-existing target
         real_stat = os.stat
         with mock.patch.object(P.os, "stat",
-                               side_effect=lambda p, *a, **k: type("S", (), {"st_nlink": 2})()
+                               side_effect=lambda p, *a, **k: type("S", (), {"st_nlink": 2, "st_mode": 0o100644})()
                                if p == json_path else real_stat(p, *a, **k)):
             with self.assertRaises(PacketError):
                 write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
+
+    def test_write_refuses_regular_file_as_packet_dir(self):
+        # a regular file where the packet dir should be -> clean PacketError, not an uncaught
+        # FileExistsError/NotADirectoryError from os.makedirs (Codex r7)
+        base = tempfile.mkdtemp(prefix="pkt-")
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        open(os.path.join(base, safe_thread_slug("demo")), "w").close()   # slug path is a FILE
+        with self.assertRaises(PacketError):
+            write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
 
     def test_write_refuses_symlinked_ancestor(self):
         # a symlinked ANCESTOR of a relative base (e.g. a stale `.devflow -> .`) must be refused too

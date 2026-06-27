@@ -365,7 +365,13 @@ def write_packet(base_dir: str, thread_id: str, packet: dict,
         if parent == anc:        # reached an absolute anchor ("/" or "C:\\")
             break
         anc = parent
-    os.makedirs(pkt_dir, exist_ok=True)
+    # a regular file at the packet dir (or a file as an ancestor) makes os.makedirs raise
+    # FileExistsError/NotADirectoryError — which cmd_export only catches as PacketError. Surface the
+    # clean refusal instead of an uncaught traceback.
+    try:
+        os.makedirs(pkt_dir, exist_ok=True)
+    except (FileExistsError, NotADirectoryError) as e:
+        raise PacketError(f"refusing to write: a path component is a regular file, not a directory: {pkt_dir}") from e
     json_path = os.path.join(pkt_dir, PACKET_JSON_NAME)
     md_path = os.path.join(pkt_dir, PACKET_MD_NAME)
     # ...and refuse if either packet FILE is itself a symlink — open(..., "w") would follow it and
