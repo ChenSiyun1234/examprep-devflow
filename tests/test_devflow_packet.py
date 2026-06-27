@@ -42,7 +42,7 @@ def advisory_state(thread_id="demo"):
         },
         "review_summary": None,
         "blocking_comments": [], "non_blocking_comments": [], "deferred_followups": [],
-        "human_approval": "pending", "approvals": {},
+        "human_approval": "pending", "approvals": {}, "status": "paused",
         "paused_at_gate": GATE_ADVISORY, "paused_at_node": "human_approval_gate",
     }
 
@@ -197,6 +197,19 @@ class TestBuildPacket(unittest.TestCase):
         self.assertIn("rotate creds", joined)
         self.assertNotIn("/etc/passwd", joined)
 
+    def test_note_drive_and_env_prefixes_stripped(self):
+        # Windows-drive and $/% env prefixes embedded in note text must also be stripped (Codex r3)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [{"note": r"C:\Windows\System32: rm it"},
+                                    {"note": "$HOME/.gitconfig: edit it"},
+                                    {"note": "%APPDATA%/secret: read it"}]}
+        joined = " ".join(build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]["tasks"])
+        self.assertIn("rm it", joined)
+        self.assertIn("edit it", joined)
+        self.assertNotIn("System32", joined)
+        self.assertNotIn("$HOME", joined)
+        self.assertNotIn("%APPDATA%", joined)
+
     def test_unsafe_path_in_note_of_safe_path_comment_stripped(self):
         # even when the structured path is safe, an unsafe "PATH: detail" hidden in the note is stripped
         st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
@@ -340,6 +353,16 @@ class TestSafeThreadSlug(unittest.TestCase):
             with self.assertRaises(PacketError):
                 write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
 
+    def test_write_refuses_symlinked_ancestor_of_absolute_out_dir(self):
+        # a symlinked ANCESTOR of an absolute --out-dir must be refused too (Codex r3)
+        from devflow.tools import packet_writer as P
+        base = tempfile.mkdtemp(prefix="pkt-")            # absolute
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        parent = os.path.dirname(base)                    # an absolute ancestor
+        with mock.patch.object(P.os.path, "islink", side_effect=lambda p: p == parent):
+            with self.assertRaises(PacketError):
+                write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
+
 
 class TestExportCli(unittest.TestCase):
 
@@ -379,6 +402,16 @@ class TestExportCli(unittest.TestCase):
             json.dump([1, 2, 3], f)
         self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
         self.assertEqual(cli.cmd_export_implementation_packet(self._args()), 1)
+
+    def test_export_non_paused_checkpoint_returns_1(self):
+        # a completed/stale checkpoint (status != paused) must NOT emit an "approved" packet (Codex r3)
+        st = advisory_state(self.tid)
+        st["status"] = "done"                     # workflow finished, not paused at a gate
+        cli._save_ckpt(st)
+        self.addCleanup(lambda: os.path.exists(cli._ckpt_path(self.tid)) and os.remove(cli._ckpt_path(self.tid)))
+        rc = cli.cmd_export_implementation_packet(self._args())
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.out, safe_thread_slug(self.tid))))
 
     def test_export_does_not_reference_write_layer(self):
         # structural guarantee: the command never touches the GitHub write path

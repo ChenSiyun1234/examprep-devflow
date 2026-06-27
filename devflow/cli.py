@@ -489,6 +489,14 @@ def cmd_export_implementation_packet(args) -> int:
         print(f"[devflow] checkpoint for thread '{args.thread_id}' is not a devflow state object "
               f"(got {type(state).__name__}); re-run a paused workflow to regenerate it.")
         return 1
+    # Only export from a thread actually PAUSED at a recognized approval gate. A stale/completed/
+    # hand-edited checkpoint (status done/stopped, or no paused_at_gate) must not silently default to
+    # the advisory gate and emit an "approved" packet for a non-existent approval boundary.
+    if state.get("status") != "paused" or state.get("paused_at_gate") not in _GATE_ALIASES.values():
+        print(f"[devflow] thread '{args.thread_id}' is not paused at a recognized approval gate "
+              f"(status={state.get('status')!r}, paused_at_gate={state.get('paused_at_gate')!r}); "
+              f"pause at a gate first: run ... --pause-at <advisory|fix|merge>.")
+        return 1
 
     # If --gate is given, it must not contradict the gate the thread is actually paused at — otherwise
     # a script/typo could mark fix/merge scope "approved" for a thread that only reached the advisory

@@ -73,13 +73,16 @@ def _strip_unsafe_path_prefix(text: str) -> str:
     """Real Codex bullets often carry the location inside the note text as ``PATH: detail``. If that
     leading PATH is unsafe (absolute / drive / ``..`` / ``~`` / env / ``.``), drop it so the task
     text can't direct edits outside the repo; a benign or safe-path note is returned unchanged."""
-    head, sep, rest = text.partition(":")   # first colon, with OR without a trailing space
-    if sep and rest.strip():
-        h = head.strip()
-        looks_path = ("/" in h or "\\" in h or h.startswith(("~", "."))
-                      or (len(h) >= 2 and h[1] == ":"))
-        if looks_path and not _is_safe_rel_path(h):
-            return rest.strip()
+    # Try ": " (colon-space) FIRST so a Windows drive colon in "C:\dir: detail" isn't mistaken for the
+    # delimiter; fall back to a bare ":" for the "PATH:detail" (no-space) shape.
+    for sep_str in (": ", ":"):
+        head, sep, rest = text.partition(sep_str)
+        if sep and rest.strip():
+            h = head.strip()
+            looks_path = ("/" in h or "\\" in h or h.startswith(("~", ".", "$", "%"))
+                          or "$" in h or "%" in h or (len(h) >= 2 and h[1] == ":"))
+            if looks_path and not _is_safe_rel_path(h):
+                return rest.strip()
     return text
 
 
@@ -341,15 +344,18 @@ def write_packet(base_dir: str, thread_id: str, packet: dict,
     # stale `.devflow -> .`): os.makedirs(exist_ok=True) would follow such a symlink and write the
     # packet outside the intended tool-state location. For a relative base we walk its ancestors up to
     # the cwd; for an explicit absolute --out-dir we trust the user's chosen location (check it + slug).
-    to_check = [pkt_dir, base_dir]
-    if not os.path.isabs(base_dir):
-        anc = os.path.dirname(os.path.normpath(base_dir))
-        while anc and anc != ".":
-            to_check.append(anc)
-            anc = os.path.dirname(anc)
-    for p in to_check:
-        if p and os.path.islink(p):
-            raise PacketError(f"refusing to write under a symlinked path component: {p}")
+    # Refuse a symlink at the packet dir, the output base, OR any ancestor — relative (up to its top
+    # component, e.g. a stale `.devflow -> .`) AND absolute (up to the filesystem anchor, e.g. a
+    # symlinked parent of an explicit --out-dir). os.makedirs(exist_ok=True) would follow such a
+    # symlink and write the packet outside the intended tool-state location.
+    anc = pkt_dir
+    while anc:
+        if os.path.islink(anc):
+            raise PacketError(f"refusing to write under a symlinked path component: {anc}")
+        parent = os.path.dirname(anc)
+        if parent == anc:        # reached an absolute anchor ("/" or "C:\\")
+            break
+        anc = parent
     os.makedirs(pkt_dir, exist_ok=True)
     json_path = os.path.join(pkt_dir, PACKET_JSON_NAME)
     md_path = os.path.join(pkt_dir, PACKET_MD_NAME)
