@@ -375,7 +375,11 @@ class ReadOnlyGitHub:
         # latest signal is that notice (so callers can back off), but base the verdict on the latest
         # NON-quota signal — so a freshly-posted-then-rate-limited review isn't hidden, and a bare
         # quota notice is never mis-parsed as a verdict.
-        quota_active = is_codex_quota_notice(max(candidates, key=_key).get("body"))
+        # the OVERALL latest signal is a quota notice if ANY candidate at the max timestamp is one — a
+        # same-second review can otherwise win the rank tie and hide a co-timestamped quota notice.
+        _qmax = max((c.get("created_at") or "") for c in candidates)
+        quota_active = any(is_codex_quota_notice(c.get("body"))
+                           for c in candidates if (c.get("created_at") or "") == _qmax)
         real = [c for c in candidates if not is_codex_quota_notice(c.get("body"))]
         # Dedupe key for the watcher over the NON-quota signals at their latest timestamp: cover ALL
         # signals sharing that timestamp (not just the highest-ranked one), so a newly-visible

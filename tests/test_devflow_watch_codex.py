@@ -269,6 +269,14 @@ class TestWatchCodexBehavior(WatchCodexBase):
         self.assertNotIn("ACTIONABLE_CODEX_REVIEWS", out)   # stale review NOT re-alerted (key over non-quota)
         self.assertIn("CODEX_QUOTA_LIMITED", out)           # but rate-limit is still signalled
 
+    def test_case_colliding_seen_slices_merged_not_clobbered(self):
+        # a file holding BOTH 'Owner/Repo' and 'owner/repo' must merge their PR entries (Codex r2)
+        from devflow.cli import _load_codex_seen
+        with open(self.seen, "w", encoding="utf-8") as f:
+            json.dump({"Owner/Repo": {"1": {"key": "a"}}, "owner/repo": {"2": {"key": "b"}}}, f)
+        merged = _load_codex_seen(self.seen)
+        self.assertEqual(set(merged.get("owner/repo", {})), {"1", "2"})   # neither slice clobbered
+
     def test_legacy_mixed_case_seen_slice_is_migrated_on_load(self):
         # a seen file written by pre-normalization code (mixed-case key) must still match (Codex r2)
         with open(self.seen, "w", encoding="utf-8") as f:

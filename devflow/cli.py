@@ -365,8 +365,15 @@ def _load_codex_seen(path: str) -> dict:
     # case-fold the top-level repo key (GitHub repos are case-insensitive) so a legacy mixed-case
     # slice written before key-normalization still matches the lowercased lookup, instead of being
     # missed and re-alerting every previously-seen review.
-    return {repo.lower(): {pr: entry for pr, entry in slc.items() if isinstance(entry, dict)}
-            for repo, slc in data.items() if isinstance(slc, dict)}
+    out = {}
+    for repo, slc in data.items():
+        if not isinstance(slc, dict):
+            continue
+        # MERGE (not overwrite) into the lowercased key so a file holding both `Owner/Repo` and
+        # `owner/repo` keeps every PR entry instead of the later slice clobbering the earlier one.
+        out.setdefault(repo.lower(), {}).update(
+            {pr: entry for pr, entry in slc.items() if isinstance(entry, dict)})
+    return out
 
 
 def _save_codex_seen(path: str, data: dict, only_repo: str = None) -> None:
