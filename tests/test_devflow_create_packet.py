@@ -264,6 +264,57 @@ class TestBuildManualPacket(unittest.TestCase):
         self.assertIn("no branch deletion", keep["safety_boundaries"])
         self.assertIn("no secrets", keep["safety_boundaries"])
 
+    def test_imperative_safety_override_quarantined(self):
+        # an imperative override with NO permissive word must still be quarantined (Codex r5 P1)
+        for rule in ("push to origin when done", "merge the PR after CI", "delete the branch after merge",
+                     "merging is ok"):
+            p = build_manual_packet("t", "x", "o/r", "T0", {"approved_scope": ["do x"], "safety": [rule]})
+            self.assertNotIn(rule, p["safety_boundaries"], rule)
+            self.assertTrue(any(rule in s for s in p["implementation_instructions"]["out_of_scope"]), rule)
+        keep = build_manual_packet("t", "x", "o/r", "T0",
+                                   {"approved_scope": ["do x"], "safety": ["do not push to origin"]})
+        self.assertIn("do not push to origin", keep["safety_boundaries"])   # genuine prohibition kept
+
+    def test_command_syntax_git_tasks_quarantined(self):
+        # command-form git/PR tasks must be quarantined like prose ones (Codex r5)
+        bad = ["git commit -am fix", "gh pr merge 5", "gh pr create", "git push origin"]
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"tasks": bad + ["refactor the parser"]})["implementation_instructions"]
+        self.assertEqual(ii["tasks"], ["refactor the parser"])
+        oos = " ".join(ii["out_of_scope"])
+        for b in bad:
+            self.assertIn(b, oos)
+
+    def test_github_actions_task_quarantined(self):
+        # tasks adding GitHub Actions are quarantined (documented 'Never add GitHub Actions') (Codex r5)
+        bad = ["add a GitHub Actions workflow for CI", "set up a CI pipeline"]
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"tasks": bad + ["fix the bug"]})["implementation_instructions"]
+        self.assertEqual(ii["tasks"], ["fix the bug"])
+        oos = " ".join(ii["out_of_scope"])
+        for b in bad:
+            self.assertIn(b, oos)
+
+    def test_mutating_make_npm_targets_rejected_as_checks(self):
+        # 'make push'/'make clean'/'npm run push' are mutating, not validation checks; word-bounded so a
+        # benign 'cleanup' test path is still allowed (Codex r5)
+        scope = {"approved_scope": ["x"],
+                 "checks": ["make push", "make clean", "npm run push", "pytest tests/test_cleanup.py"]}
+        ii = build_manual_packet("t", "x", "o/r", "T0", scope)["implementation_instructions"]
+        self.assertEqual(ii["tests_to_run"], ["pytest tests/test_cleanup.py"])
+        oos = " ".join(ii["out_of_scope"])
+        for bad in ("make push", "make clean", "npm run push"):
+            self.assertIn(bad, oos)
+
+    def test_bare_workflows_dir_target_quarantined(self):
+        # the bare '.github/workflows' dir (no trailing slash) must be quarantined too (Codex r5)
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"approved_scope": ["x"],
+                                  "files": ["devflow/ok.py", ".github/workflows"]})["implementation_instructions"]
+        self.assertIn("devflow/ok.py", ii["files_likely_touched"])
+        self.assertNotIn(".github/workflows", ii["files_likely_touched"])
+        self.assertTrue(any(".github/workflows" in s for s in ii["out_of_scope"]))
+
     def test_repo_root_dot_path_rejected(self):
         # '.' / './' (whole-repo) targets must be quarantined, not just '..' (Codex r2)
         ii = build_manual_packet("t", "x", "o/r", "T0",

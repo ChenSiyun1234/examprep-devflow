@@ -381,7 +381,12 @@ _SAFE_CHECK_PREFIXES = (
 _SHELL_META = ("&&", "||", ";", "|", "&", "`", "$(", "${", ">", "<", "\n", "\r")
 # mutating / network sub-actions that must never be promoted into a "check" instruction, even under
 # an allow-listed prefix (e.g. "npm run deploy", "pip install …", "ruff --fix").
-_SIDE_EFFECT_TOKENS = ("install", "deploy", "publish", "release", "upgrade", "--write", "--fix")
+# mutating / network sub-actions that must never be promoted into a "check" instruction, even under
+# an allow-listed prefix (e.g. "make push", "npm run deploy", "make clean", "npm start", "ruff --fix").
+# Word-bounded so a benign substring (e.g. "clean" in a test path "test_cleanup") doesn't trip it.
+_SIDE_EFFECT_RE = re.compile(
+    r"\b(install|deploy|publish|release|upgrade|push|clean|delete|merge|start|serve)\b", re.I)
+_SIDE_EFFECT_FLAGS = ("--write", "--fix", "--apply")
 
 
 def _check_is_allowlisted(cmd) -> bool:
@@ -390,7 +395,7 @@ def _check_is_allowlisted(cmd) -> bool:
     # command (e.g. "pytest && gh pr merge", "python -m x; rm -rf .", "make $(curl ...)").
     if any(meta in c for meta in _SHELL_META):
         return False
-    if any(tok in c for tok in _SIDE_EFFECT_TOKENS):   # mutating/network sub-action -> not a check
+    if _SIDE_EFFECT_RE.search(c) or any(f in c for f in _SIDE_EFFECT_FLAGS):  # mutating sub-action -> not a check
         return False
     # exact match OR prefix followed by a space — a bare-word boundary so "pytestfoo" / "makefile…"
     # can't sneak through a startswith on "pytest" / "make".
@@ -400,10 +405,17 @@ def _check_is_allowlisted(cmd) -> bool:
 # Words that PERMIT/override an action paired with a protected action = a scope rule trying to weaken
 # a hard boundary (e.g. "commits are allowed", "ignore the no-push rule"). Such rules are quarantined.
 _SAFETY_PERMISSIVE = (
-    "allow", "allowed", "ok to", "okay to", "fine to", "is fine", "are fine", "can ", "may ",
-    "enable", "permit", "permitted", "ignore", "skip", "disable", "override", "no need",
-    "feel free", "you can", "it's ok", "without restriction", "go ahead",
+    "allow", "allowed", "ok to", "okay to", "fine to", "is fine", "are fine", "is ok", "is okay",
+    "are ok", "can ", "may ", "enable", "permit", "permitted", "ignore", "skip", "disable",
+    "override", "no need", "no restriction", "no limit", "feel free", "you can", "it's ok",
+    "without restriction", "go ahead",
 )
+# Verbs/markers that make a protected-action rule a genuine PROHIBITION (it reinforces a boundary)
+# rather than a permission. Permissive markers are checked FIRST, so "no restriction on pushing" is
+# caught as permissive before "no" here would (mis)read it as prohibitive.
+_SAFETY_PROHIBITIVE_RE = re.compile(
+    r"\b(do\s+not|don'?t|never|no|not|disallow|must\s+not|may\s+not|cannot|can'?t|avoid|forbid|"
+    r"prohibit|refuse|reject)\b", re.I)
 # Protected git/PR/secret actions, with common INFLECTIONS (commit/commits/committed/committing,
 # push/pushes, merge/merging, PR/PRs, …) — a permissive rule mentioning any of these would weaken a
 # hard boundary. Inflection-aware so "commits are allowed" / "pushes are fine" are caught, not just
@@ -415,23 +427,38 @@ _SAFETY_PROTECTED_RE = re.compile(
 
 
 def _scope_safety_rule_conflicts(rule) -> bool:
-    """True if a scope-file safety rule appears to PERMIT/relax a hard prohibition (so it must not be
-    appended to the canonical boundaries). Conservative: a borderline rule is quarantined, not admitted.
-    Protected actions match common inflections ('commit/commits/committing', 'push/pushes', 'PRs'…)."""
+    """True if a scope-file safety rule must NOT be appended to the canonical boundaries. It is
+    PROTECTED-ACTION-driven: any rule naming a protected action (push/merge/commit/branch-delete/
+    force-push/secret/PR…) is quarantined UNLESS it is clearly PROHIBITIVE. So permissive overrides
+    ('push to origin when done', 'merging is ok', 'you can push') AND ambiguous protected-action rules
+    are quarantined, while genuine prohibitions ('do not push', 'never delete branches', 'no secrets')
+    are kept. When intent is unclear, quarantine — the canonical SAFETY_BOUNDARIES still apply."""
     low = str(rule).lower()
-    permissive = any(w in (" " + low + " ") for w in _SAFETY_PERMISSIVE)
-    return permissive and bool(_SAFETY_PROTECTED_RE.search(low))
+    if not _SAFETY_PROTECTED_RE.search(low):
+        return False                                       # not about a protected action -> keep as-is
+    if any(w in (" " + low + " ") for w in _SAFETY_PERMISSIVE):
+        return True                                        # explicit permission -> quarantine
+    if _SAFETY_PROHIBITIVE_RE.search(low):
+        return False                                       # explicit prohibition -> keep (reinforces boundary)
+    return True                                            # protected action, ambiguous intent -> quarantine
 
 
 # A task line that IS itself a prohibited git/PR action (e.g. "merge the PR", "git push",
 # "open a pull request") must not be handed to Claude Code as work — it's quarantined to out-of-scope.
 _PROHIBITED_TASK_RE = re.compile(
-    r"\b(git\s+push|push(es|ing)?\s+(the\s+|to\s+)?(branch|changes|commits?|code|origin|remote)|"
-    r"force[-\s]?push(es|ing)?|"
-    r"commit(s|ting)?\s+(and\s+push|the\s+(changes|code|files)|changes|code)|"
-    r"merg(e|es|ing)\s+(the\s+|this\s+)?(pr|pull[-\s]request|branch)|"
-    r"(open|create|raise|submit)\s+(a\s+|the\s+)?(pr|pull[-\s]request)|"
-    r"delete\s+(the\s+)?branch|rebase|cherry[-\s]?pick)\b", re.I)
+    r"\b("
+    r"git\s+(commit|push|merge|rebase|cherry-?pick)"                       # git <subcommand> (command form)
+    r"|gh\s+pr\s+(merge|create|ready|review|close)"                        # gh pr <subcommand>
+    r"|gh\s+(release|workflow|run|api)\b"                                  # gh release/workflow/run/api
+    r"|push(es|ing)?\s+(the\s+|to\s+)?(branch|changes|commits?|code|origin|remote)"
+    r"|force[-\s]?push(es|ing)?"
+    r"|commit(s|ting)?\b"                                                  # bare 'commit' (+ inflections)
+    r"|merg(e|es|ing)\s+(the\s+|this\s+)?(pr|pull[-\s]request|branch)"
+    r"|(open|create|raise|submit)\s+(a\s+|the\s+)?(pr|pull[-\s]request)"
+    r"|delete\s+(the\s+)?branch|rebase|cherry[-\s]?pick"
+    r"|github\s*actions|actions?\s+workflow|workflow\s+(file|yaml|yml)"    # GitHub Actions (boundary: never add)
+    r"|\.github[/\\]workflows|ci\s+(workflow|pipeline)"
+    r")", re.I)
 
 
 def _task_is_prohibited(t) -> bool:
@@ -457,7 +484,10 @@ def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
     # devflow must never add/modify GitHub Actions — a workflow file is repo-relative (passes the
     # path filter) but is quarantined as an edit target.
     def _is_workflow(p):
-        return ".github/workflows/" in p.replace("\\", "/").lower()
+        # match the workflows DIRECTORY itself (bare, no trailing slash) AND any file under it, so a
+        # bare ".github/workflows" target can't slip past a trailing-slash-only check.
+        pn = p.replace("\\", "/").lower()
+        return pn.rstrip("/").endswith(".github/workflows") or ".github/workflows/" in pn
     files = sorted({p for p in raw_files if _is_safe_rel_path(p) and not _is_workflow(p)})
     unsafe = sorted({p for p in raw_files if not _is_safe_rel_path(p)})
     workflows = sorted({p for p in raw_files if _is_safe_rel_path(p) and _is_workflow(p)})
