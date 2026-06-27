@@ -52,7 +52,43 @@ python -m devflow.cli watch-codex-reviews --repo owner/name          # prints AC
 
 # advisory flow up to human approval; --real-github performs the guarded issue + @codex writes
 python -m devflow.cli run-docs-advisory --thread-id demo [--real-github --max-polls 6 --poll-seconds 30]
+
+# after approving a gate, export an Implementation Packet to hand off to Claude Code (local files only)
+python -m devflow.cli run --task docs-advisory --thread-id demo --pause-at advisory
+python -m devflow.cli export-implementation-packet --thread-id demo   # --gate/--decision optional
 ```
+
+## Implementation Packet (handoff to Claude Code)
+
+devflow orchestrates and summarizes; **Claude Code remains the code editor**. After Codex
+advisory/review is summarized and you approve a gate, devflow can export a structured
+**Implementation Packet** — the handoff boundary:
+
+> Codex advisory/review → devflow summarizes → **you approve** → devflow exports a packet →
+> Claude Code implements the scoped changes → you review → PR / Codex review continues.
+
+```bash
+# pause at a gate (writes a checkpoint), then export the packet
+python -m devflow.cli run --task docs-advisory --thread-id demo --pause-at advisory
+python -m devflow.cli export-implementation-packet --thread-id demo
+```
+
+It writes two local files under a gitignored tool-state dir:
+
+```
+.devflow/packets/<safe-thread-id>/implementation-packet.md
+.devflow/packets/<safe-thread-id>/implementation-packet.json
+```
+
+The packet contains: metadata (thread/task/repo/generated_at, source issue & PR), the approval
+(gate, decision, approved scope, rejected/deferred), advisory/review content (summaries, blocking &
+non-blocking comments, deferred follow-ups), implementation instructions for Claude Code (files
+likely touched, tasks, out-of-scope, tests to run, safety rules), and explicit safety boundaries.
+
+**This command makes no GitHub calls and never edits repository files** — it only reads the local
+checkpoint and writes the two packet files. devflow does not implement code; the packet tells Claude
+Code what to implement, within scope. On export it prints `IMPLEMENTATION_PACKET_EXPORTED`, the two
+paths, the thread id, source issue/PR, and the suggested next Claude Code message.
 
 ## LangGraph Studio (`langgraph dev`)
 

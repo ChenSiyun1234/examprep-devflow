@@ -283,6 +283,60 @@ gh unavailable/unauthenticated). Tests mock `gh` entirely
 (`tests/test_devflow_watch_codex.py`): actionable/none/dedupe/spoof/per-PR-error/init/json/
 exit-actionable plus an assertion that **every** spawned `gh` command is read-only.
 
+## Implementation Packet (handoff to Claude Code)
+
+The packet is the **boundary between orchestration and editing**: devflow summarizes the
+advisory/review and records the human approval, then exports a structured packet that **Claude Code**
+uses to make the scoped edits. devflow never edits repository files itself.
+
+```
+Codex advisory/review → devflow summarizes → human approves → devflow exports Implementation Packet
+   → Claude Code implements scoped changes → human reviews → PR / Codex review continues
+```
+
+**Design (fits the checkpoint model).** A standalone, read-only command:
+
+```bash
+python -m devflow.cli run    --task docs-advisory --thread-id demo --pause-at advisory  # writes a checkpoint
+python -m devflow.cli export-implementation-packet --thread-id demo [--gate advisory] [--decision approved]
+```
+
+`export-implementation-packet` loads the thread's **checkpoint** (which exists precisely when the run
+is paused at a gate), builds the packet from that state, and writes two files. It deliberately does
+**not** run the graph, add a graph node, call `gh`, or edit code — so the handoff is fully decoupled
+from the workflow and has no side effects beyond the two local files. The gate defaults to the
+thread's `paused_at_gate`; `--decision` defaults to `approved`.
+
+**Output (local tool-state, gitignored — never tracked):**
+
+```
+.devflow/packets/<safe-thread-id>/implementation-packet.md
+.devflow/packets/<safe-thread-id>/implementation-packet.json
+```
+
+`<safe-thread-id>` is sanitized (non-`[A-Za-z0-9-_.]` → `_`, length-bounded) and suffixed with a
+hash of the original id, so no thread id can cause a path collision or directory traversal. `.devflow/`
+is in `.gitignore`.
+
+**Packet contents** (`devflow/tools/packet_writer.py`, pure builder + renderer):
+
+1. **Metadata** — thread_id, task_type, repo, generated_at, source issue #/URL, source PR #/URL.
+2. **Approval** — gate, decision, approved scope, rejected/deferred items.
+3. **Advisory / review** — advisory summary, review summary, blocking & non-blocking comments,
+   deferred follow-ups.
+4. **Implementation instructions for Claude Code** — files likely touched, concrete tasks, explicit
+   out-of-scope items, tests/checks to run, safety rules.
+5. **Safety boundaries** — no secrets, no API keys, no unrelated rewrites, no merge, no
+   branch-deletion, no force-push, no "tests passed" claims unless they actually ran, ask before
+   expanding scope.
+
+On export the CLI prints `IMPLEMENTATION_PACKET_EXPORTED`, the markdown + json paths, the thread id,
+the source issue/PR (if any), and the suggested next Claude Code message. Tests
+(`tests/test_devflow_packet.py`) cover packet build from an approved advisory state, inclusion of
+blocking/non-blocking comments, thread-id path sanitization (incl. traversal attempts), valid JSON,
+the required Markdown sections, that `.devflow/` is gitignored, and that export performs no GitHub
+writes / never references the write layer.
+
 ## GitHub write mode (guarded, opt-in)
 
 `GitHubWriter` adds the only *write* path devflow has. It is **off by default** and limited to four

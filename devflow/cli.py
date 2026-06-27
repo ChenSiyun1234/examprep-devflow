@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 
 from devflow.graph import build_graph, GATE_TO_NODE
 from devflow.state import (
@@ -31,6 +32,7 @@ from devflow.state import (
     GATE_ADVISORY, GATE_FIX, GATE_MERGE,
 )
 from devflow.tools.github_cli import ReadOnlyGitHub, check_gh_available, GhError
+from devflow.tools.packet_writer import build_packet, write_packet
 from devflow._compat import HAS_LANGGRAPH
 
 # Windows GBK consoles otherwise mangle the report box-drawing / CJK text.
@@ -464,6 +466,47 @@ def cmd_watch_codex_reviews(args) -> int:
     return 0
 
 
+# ---- Implementation Packet export (safe handoff to Claude Code; NO repo edits, NO gh writes) ----
+PACKETS_DIR = os.path.join(".devflow", "packets")   # tool-state, gitignored — not tracked product data
+
+
+def cmd_export_implementation_packet(args) -> int:
+    """Export a structured Implementation Packet from a paused thread's checkpoint.
+
+    devflow summarizes + records the human approval; the packet hands the SCOPED work to Claude Code.
+    This command is read-only w.r.t. GitHub and the repo: it loads the local checkpoint, builds the
+    packet, and writes two local files. It NEVER edits code, runs the workflow, or calls gh.
+    """
+    try:
+        state = _load_ckpt(args.thread_id)
+    except (OSError, ValueError):
+        print(f"[devflow] no checkpoint for thread '{args.thread_id}'. Pause at a gate first, e.g.:\n"
+              f"  python -m devflow.cli run --task <task> --thread-id {args.thread_id} "
+              f"--pause-at advisory")
+        return 1
+
+    gate = _GATE_ALIASES.get(args.gate) if args.gate else (state.get("paused_at_gate") or GATE_ADVISORY)
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    packet = build_packet(state, gate=gate, decision=args.decision, generated_at=generated_at)
+    out_dir = args.out_dir or PACKETS_DIR
+    paths = write_packet(out_dir, args.thread_id, packet)
+
+    m = packet["metadata"]
+    print("IMPLEMENTATION_PACKET_EXPORTED")
+    print(f"  markdown:  {paths['md_path']}")
+    print(f"  json:      {paths['json_path']}")
+    print(f"  thread_id: {m.get('thread_id')}")
+    print(f"  gate:      {packet['approval']['gate']}  decision: {packet['approval']['decision']}")
+    if m.get("issue_number"):
+        print(f"  source issue: #{m['issue_number']} {m.get('issue_url') or ''}".rstrip())
+    if m.get("pr_number"):
+        print(f"  source PR:    #{m['pr_number']} {m.get('pr_url') or ''}".rstrip())
+    print("\nNext (hand off to Claude Code):")
+    print(f"  Implement ONLY the scoped tasks in {paths['md_path']}; run the listed checks; do not "
+          f"merge/push/commit; ask before expanding scope.")
+    return 0
+
+
 def cmd_run_docs_advisory(args) -> int:
     """Advisory flow up to the human-approval gate. Real mode does the issue + @codex writes, then
     bounded-polls for the advisory, summarizes, and PAUSES for approval before any repo edits."""
@@ -573,6 +616,18 @@ def build_parser() -> argparse.ArgumentParser:
     wc.add_argument("--body-chars", type=_nonneg_int, default=600,
                     help="truncate each Codex item body preview to N chars (default 600)")
     wc.set_defaults(func=cmd_watch_codex_reviews)
+
+    # --- Implementation Packet export (handoff to Claude Code; local files only, no edits/writes) ---
+    ep = sub.add_parser("export-implementation-packet",
+                        help="export a scoped Implementation Packet for Claude Code from a paused thread")
+    ep.add_argument("--thread-id", required=True, help="thread id of a paused (checkpointed) run")
+    ep.add_argument("--gate", choices=list(_GATE_ALIASES), default=None,
+                    help="gate being approved (default: the thread's paused gate, else advisory)")
+    ep.add_argument("--decision", choices=[APPROVED, REJECTED], default=APPROVED,
+                    help="approval decision recorded in the packet (default: approved)")
+    ep.add_argument("--out-dir", default=None,
+                    help="output base dir (default: .devflow/packets, which is gitignored)")
+    ep.set_defaults(func=cmd_export_implementation_packet)
 
     # --- advisory flow up to human approval (dry-run by default; --real-github opts in) ---
     rda = sub.add_parser("run-docs-advisory",
