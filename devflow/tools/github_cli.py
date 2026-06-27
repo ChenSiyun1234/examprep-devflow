@@ -197,6 +197,12 @@ def is_codex_author(login: Optional[str]) -> bool:
     return bool(login) and login.strip().lower() in _TRUSTED_CODEX_LOGINS
 
 
+# Tie-break for "latest" when GitHub's 1-second timestamps collide (Codex posts a review plus
+# several review-comments in the same second). A higher rank + url makes a *new* same-second signal
+# win the tie so dedupe keys advance and the new feedback is not silently swallowed.
+_CODEX_SOURCE_RANK = {"pr_review": 3, "pr_review_comment": 2, "pr_comment": 1}
+
+
 def parse_review_packet(body: str, state: Optional[str] = None) -> dict:
     """Light, defensive parse of a Codex review body into a structured-ish packet.
 
@@ -256,6 +262,20 @@ class ReadOnlyGitHub:
             "url": data.get("url"),
             "private": data.get("isPrivate"),
         }
+
+    # PR listing ------------------------------------------------------------------------
+    def list_open_prs(self, limit: int = 50) -> list:
+        """List OPEN pull requests (read-only: ``gh pr list``). Returns ``[{number,title,
+        updated_at,url}]``. ``limit`` is clamped to >= 1 (``gh pr list --limit`` rejects 0)."""
+        repo = self.resolve_repo()
+        data = _gh_json(["pr", "list", "-R", repo, "--state", "open",
+                         "--json", "number,title,updatedAt,url",
+                         "--limit", str(max(1, int(limit)))]) or []
+        out = []
+        for pr in data:
+            out.append({"number": pr.get("number"), "title": pr.get("title"),
+                        "updated_at": pr.get("updatedAt"), "url": pr.get("url")})
+        return out
 
     # comments / reviews ----------------------------------------------------------------
     @staticmethod
@@ -329,7 +349,11 @@ class ReadOnlyGitHub:
                 candidates.append({**r, "source": "pr_review"})
         if not candidates:
             return None
-        latest = max(candidates, key=lambda c: c.get("created_at") or "")
+        # tie-break same-second signals by (timestamp, source rank, url) so a brand-new review
+        # posted in the same second as a seen comment is still picked as "latest" (see watcher dedupe)
+        latest = max(candidates, key=lambda c: (c.get("created_at") or "",
+                                                _CODEX_SOURCE_RANK.get(c.get("source"), 0),
+                                                c.get("url") or ""))
         packet = parse_review_packet(latest["body"], latest.get("state"))  # default: latest item's verdict
         # Reconcile with terminal review states:
         #  - a CHANGES_REQUESTED review stays in effect until a *newer* APPROVED clears it;
