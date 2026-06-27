@@ -327,9 +327,38 @@ class ReadOnlyGitHub:
                 "body": r.get("body") or "",
                 "state": r.get("state"),
                 "created_at": r.get("submitted_at"),
+                "commit_id": r.get("commit_id"),
                 "url": r.get("html_url"),
             })
         return out
+
+    def list_prs(self, state: str = "open", limit: int = 50) -> list:
+        """List PRs with SIZE metadata for ranking (read-only). ``state`` in {open, closed, merged,
+        all}. Returns ``[{number,title,branch,head,state,additions,deletions,changed_files,url}]``."""
+        repo = self.resolve_repo()
+        st = state if state in ("open", "closed", "merged", "all") else "open"
+        data = _gh_json(["pr", "list", "-R", repo, "--state", st,
+                         "--json", "number,title,headRefName,headRefOid,state,additions,deletions,"
+                                   "changedFiles,url",
+                         "--limit", str(max(1, int(limit)))]) or []
+        out = []
+        for pr in data:
+            out.append({"number": pr.get("number"), "title": pr.get("title"),
+                        "branch": pr.get("headRefName"), "head": pr.get("headRefOid"),
+                        "state": pr.get("state"),
+                        "additions": pr.get("additions") or 0, "deletions": pr.get("deletions") or 0,
+                        "changed_files": pr.get("changedFiles") or 0, "url": pr.get("url")})
+        return out
+
+    def codex_review_rounds(self, pr_number: int, head: Optional[str] = None) -> dict:
+        """Count SUBSTANTIVE (non-quota) trusted-Codex reviews on a PR, and whether the given
+        ``head`` SHA is already reviewed. Read-only. Returns ``{rounds, reviewed_on_head}``."""
+        revs = [r for r in self.get_pr_reviews(pr_number)
+                if is_codex_author(r.get("author"))
+                and not is_codex_quota_notice(r.get("body"))
+                and (r.get("body") or "").strip()]
+        on_head = bool(head) and any((r.get("commit_id") or "") == head for r in revs)
+        return {"rounds": len(revs), "reviewed_on_head": on_head}
 
     # Codex helpers ---------------------------------------------------------------------
     def find_latest_codex_advisory(self, issue_number: int) -> Optional[dict]:

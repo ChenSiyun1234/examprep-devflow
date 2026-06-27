@@ -1,0 +1,203 @@
+# -*- coding: utf-8 -*-
+"""Tests for `rank-codex-reviews` (read-only PR review-priority ranking) and its pure scorer.
+
+All `gh` calls are mocked (no network, no writes).
+
+    python -m unittest tests.test_devflow_rank_codex
+"""
+
+import contextlib
+import io
+import json
+import re
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+from devflow import cli
+from devflow.tools import github_cli as G
+from devflow.tools.review_priority import score, classify_type
+
+CODEX = "chatgpt-codex-connector[bot]"
+QUOTA_BODY = "You have reached your Codex usage limits for code reviews. See the Codex dashboard."
+_WRITE_TOKENS = {"create", "comment", "merge", "edit", "close", "delete", "review", "push", "clone"}
+
+
+# --------------------------------------------------------------------------- pure scorer
+class TestReviewPriorityScore(unittest.TestCase):
+
+    def test_unreviewed_outranks_well_reviewed(self):
+        fresh = score(additions=200, changed_files=4, title="feat: x", branch="feat/x", codex_rounds=0)
+        worn = score(additions=200, changed_files=4, title="feat: x", branch="feat/x", codex_rounds=6)
+        self.assertGreater(fresh["priority"], worn["priority"])
+        self.assertEqual(fresh["needs_review"], 10)
+        self.assertLess(worn["needs_review"], fresh["needs_review"])
+
+    def test_feature_outranks_bugfix_all_else_equal(self):
+        feat = score(additions=120, changed_files=3, title="feat: add thing", branch="feat/x", codex_rounds=0)
+        bug = score(additions=120, changed_files=3, title="fix: tweak thing", branch="fix/x", codex_rounds=0)
+        self.assertEqual((feat["type"], bug["type"]), ("feature", "bugfix"))
+        self.assertGreater(feat["priority"], bug["priority"])
+
+    def test_bigger_change_has_higher_impact(self):
+        small = score(additions=60, changed_files=1, title="feat: a", branch="feat/a")
+        big = score(additions=1200, changed_files=8, title="feat: b", branch="feat/b")
+        self.assertGreater(big["impact"], small["impact"])
+        self.assertLessEqual(big["impact"], 10)            # capped
+
+    def test_reviewed_on_head_lowers_need(self):
+        not_seen = score(additions=200, changed_files=3, title="feat: x", branch="feat/x", codex_rounds=2)
+        seen = score(additions=200, changed_files=3, title="feat: x", branch="feat/x", codex_rounds=2,
+                     reviewed_on_head=True)
+        self.assertLess(seen["needs_review"], not_seen["needs_review"])
+
+    def test_priority_is_clamped_0_100(self):
+        s = score(additions=99999, changed_files=99, title="feat: huge", branch="feat/x", codex_rounds=0)
+        self.assertLessEqual(s["priority"], 100)
+        self.assertGreaterEqual(s["priority"], 0)
+
+    def test_classify_type_large_fix_is_not_deprioritized(self):
+        self.assertEqual(classify_type("fix: small typo", "fix/typo", 12), "bugfix")
+        self.assertNotEqual(classify_type("fix: rewrite engine", "fix/engine", 900), "bugfix")  # big "fix" not deprioritized
+        self.assertEqual(classify_type("feat: new cmd", "feat/cmd", 100), "feature")
+        self.assertEqual(classify_type("chore: bump", "chore/bump", 5), "mixed")
+
+
+# --------------------------------------------------------------------------- command (mocked gh)
+def pr(num, title, branch, adds, dels=0, files=1, state="OPEN", head=None):
+    return {"number": num, "title": title, "headRefName": branch, "headRefOid": head or f"h{num}",
+            "state": state, "additions": adds, "deletions": dels, "changedFiles": files,
+            "url": f"https://x/pull/{num}"}
+
+
+def rev(commit, body="### Codex Review\n- fix the null case", login=CODEX, state="COMMENTED"):
+    return {"user": {"login": login}, "body": body, "state": state,
+            "submitted_at": "2026-01-03T00:00:00Z", "commit_id": commit, "html_url": "u"}
+
+
+def make_fake_gh(pr_list, reviews_by_pr=None, auth_ok=True, recorder=None):
+    reviews_by_pr = reviews_by_pr or {}
+
+    def fake_run(cmd, **kw):
+        if recorder is not None:
+            recorder.append(cmd)
+        args = cmd[1:]
+        if args[:2] == ["auth", "status"]:
+            return SimpleNamespace(returncode=0 if auth_ok else 1,
+                                   stdout="Logged in to github.com account TESTER" if auth_ok else "",
+                                   stderr="" if auth_ok else "not logged in")
+        if args[:2] == ["repo", "view"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"nameWithOwner": "o/r"}), stderr="")
+        if args[:2] == ["pr", "list"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(pr_list), stderr="")
+        if args and args[0] == "api":
+            path = next((a for a in args[1:] if a.startswith("repos/")), "")
+            m = re.search(r"/pulls/(\d+)/reviews", path)
+            n = int(m.group(1)) if m else -1
+            payload = reviews_by_pr.get(n, [])
+            out = [payload] if "--slurp" in args else payload
+            return SimpleNamespace(returncode=0, stdout=json.dumps(out), stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr="unexpected: " + " ".join(args))
+    return fake_run
+
+
+class RankCodexBase(unittest.TestCase):
+    def run_rank(self, pr_list, reviews_by_pr=None, top=3, include_merged=False, as_json=False,
+                 limit=50, auth_ok=True, repo="o/r"):
+        recorder = []
+        fake = make_fake_gh(pr_list, reviews_by_pr, auth_ok=auth_ok, recorder=recorder)
+        args = SimpleNamespace(repo=repo, limit=limit, top=top, include_merged=include_merged,
+                               json=as_json)
+        buf = io.StringIO()
+        with mock.patch.object(G.shutil, "which", return_value="gh"), \
+             mock.patch.object(G.subprocess, "run", side_effect=fake), \
+             contextlib.redirect_stdout(buf):
+            rc = cli.cmd_rank_codex_reviews(args)
+        return rc, buf.getvalue(), recorder
+
+    def order_of(self, out):
+        return [int(m) for m in re.findall(r"#\s*(\d+) prio=", out)]
+
+
+class TestRankCodexBehavior(RankCodexBase):
+
+    def test_unreviewed_feature_ranks_above_reviewed_feature(self):
+        prs = [pr(1, "feat: big new thing", "feat/big", 600, files=5),
+               pr(2, "feat: other thing", "feat/other", 600, files=5, head="hX")]
+        # PR #2 already has 5 substantive Codex reviews on its head; PR #1 has none
+        reviews = {2: [rev("hX") for _ in range(5)]}
+        rc, out, _ = self.run_rank(prs, reviews_by_pr=reviews)
+        self.assertEqual(rc, 0)
+        self.assertIn("RANKED_CODEX_REVIEW_QUEUE", out)
+        self.assertEqual(self.order_of(out)[0], 1)        # the never-reviewed PR is first
+        self.assertIn("recommend_next=[1, 2]", out)
+
+    def test_unreviewed_feature_ranks_above_small_bugfix(self):
+        prs = [pr(1, "feat: substantial feature", "feat/f", 500, files=5),
+               pr(2, "fix: small bug", "fix/b", 40, files=1)]
+        rc, out, _ = self.run_rank(prs)
+        self.assertEqual(self.order_of(out), [1, 2])
+
+    def test_quota_notice_is_not_counted_as_a_review(self):
+        # a PR whose only Codex "review" is a usage-limit notice must rank as UNREVIEWED (rounds=0)
+        prs = [pr(1, "feat: x", "feat/x", 300, files=4)]
+        rc, out, _ = self.run_rank(prs, reviews_by_pr={1: [rev("h1", body=QUOTA_BODY)]})
+        self.assertIn("rounds=0", out)
+
+    def test_top_n_recommendation_count(self):
+        prs = [pr(i, f"feat: f{i}", f"feat/{i}", 300, files=3) for i in (1, 2, 3, 4)]
+        _, out, _ = self.run_rank(prs, top=2)
+        m = re.search(r"recommend_next=\[([^\]]*)\]", out)
+        self.assertEqual(len([x for x in m.group(1).split(",") if x.strip()]), 2)
+
+    def test_include_merged_keeps_open_and_merged_only(self):
+        prs = [pr(1, "feat: open", "feat/o", 200, files=3, state="OPEN"),
+               pr(2, "feat: merged", "feat/m", 200, files=3, state="MERGED"),
+               pr(3, "feat: closed", "feat/c", 200, files=3, state="CLOSED")]
+        _, out, _ = self.run_rank(prs, include_merged=True)
+        ranked = self.order_of(out)
+        self.assertIn(1, ranked)
+        self.assertIn(2, ranked)
+        self.assertNotIn(3, ranked)                       # closed-unmerged is excluded
+
+    def test_no_prs_emits_no_prs_marker(self):
+        rc, out, _ = self.run_rank([])
+        self.assertEqual(rc, 0)
+        self.assertIn("NO_PRS_TO_RANK", out)
+
+    def test_json_output_parses_and_has_ranking(self):
+        prs = [pr(1, "feat: a", "feat/a", 400, files=4), pr(2, "fix: b", "fix/b", 30, files=1)]
+        _, out, _ = self.run_rank(prs, as_json=True)
+        lines = out.splitlines()
+        start = max(i for i, ln in enumerate(lines) if ln == "{")
+        data = json.loads("\n".join(lines[start:]))
+        self.assertEqual(data["marker"], "RANKED_CODEX_REVIEW_QUEUE")
+        self.assertEqual(data["recommend_next"][0], 1)
+        self.assertEqual(data["ranked"][0]["pr"], 1)
+
+    def test_gh_unauthenticated_returns_nonzero(self):
+        rc, out, _ = self.run_rank([pr(1, "feat: x", "feat/x", 100)], auth_ok=False)
+        self.assertEqual(rc, 3)
+        self.assertNotIn("RANKED_CODEX_REVIEW_QUEUE", out)
+
+
+class TestRankCodexReadOnly(RankCodexBase):
+
+    def test_only_read_only_gh_commands_are_spawned(self):
+        prs = [pr(1, "feat: x", "feat/x", 200, files=3)]
+        _, _, recorder = self.run_rank(prs, reviews_by_pr={1: [rev("h1")]})
+        self.assertTrue(recorder)
+        for cmd in recorder:
+            args = cmd[1:]
+            verb = args[0] if args else ""
+            self.assertNotIn(verb, _WRITE_TOKENS, f"unexpected write verb in {args}")
+            self.assertIn(verb, {"auth", "repo", "pr", "api"})
+            if verb == "api":
+                self.assertNotIn("-f", args)
+                self.assertNotIn("--field", args)
+                self.assertFalse(any(a.startswith("-X") or a == "--method" for a in args))
+            G._assert_read_only(args)
+
+
+if __name__ == "__main__":
+    unittest.main()

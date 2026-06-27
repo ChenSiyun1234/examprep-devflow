@@ -31,6 +31,7 @@ from devflow.state import (
     GATE_ADVISORY, GATE_FIX, GATE_MERGE,
 )
 from devflow.tools.github_cli import ReadOnlyGitHub, check_gh_available, GhError
+from devflow.tools.review_priority import score as score_review_priority
 from devflow._compat import HAS_LANGGRAPH
 
 # Windows GBK consoles otherwise mangle the report box-drawing / CJK text.
@@ -476,6 +477,70 @@ def cmd_watch_codex_reviews(args) -> int:
     return 0
 
 
+def cmd_rank_codex_reviews(args) -> int:
+    """Read-only: rank PRs by Codex-review PRIORITY (unreviewed + big-feature first; well-reviewed
+    or small-bugfix last) and recommend the top-N to request review on next. Deterministic, stdlib
+    heuristic (see review_priority.score). Prints RANKED_CODEX_REVIEW_QUEUE + a ranked table + the
+    recommended batch; never edits code, comments, commits, pushes, or merges."""
+    rc = _require_gh()
+    if rc:
+        return rc
+    gh = ReadOnlyGitHub(args.repo)
+    try:
+        repo = gh.resolve_repo()
+        prs = gh.list_prs(state="all" if args.include_merged else "open", limit=args.limit)
+    except GhError as e:
+        print(f"[devflow] gh error: {e}")
+        return 1
+    # --include-merged ranks OPEN + MERGED (retroactive review of merged work); never closed-unmerged.
+    if args.include_merged:
+        prs = [p for p in prs if p.get("state") in ("OPEN", "MERGED")]
+
+    ranked, errors = [], []
+    for pr in prs:
+        num = pr.get("number")
+        if num is None:
+            continue
+        try:
+            cov = gh.codex_review_rounds(num, head=pr.get("head"))
+        except GhError as e:                            # one PR failing must not abort the ranking
+            errors.append((num, str(e)))
+            cov = {"rounds": 0, "reviewed_on_head": False}
+        s = score_review_priority(
+            additions=pr["additions"], deletions=pr["deletions"], changed_files=pr["changed_files"],
+            title=pr["title"], branch=pr["branch"], codex_rounds=cov["rounds"],
+            reviewed_on_head=cov["reviewed_on_head"])
+        ranked.append({**pr, **s, "reviewed_on_head": cov["reviewed_on_head"]})
+
+    # highest priority first; tie-break by need, then PR number (stable + deterministic)
+    ranked.sort(key=lambda r: (-r["priority"], -r["needs_review"], r["number"]))
+    top = [r["number"] for r in ranked[:args.top]]
+
+    marker = "RANKED_CODEX_REVIEW_QUEUE" if ranked else "NO_PRS_TO_RANK"
+    print(marker)
+    print(f"[rank-codex] repo={repo} ranked={len(ranked)} recommend_next={top} "
+          f"(read-only; top={args.top})")
+    for r in ranked:
+        flag = "  <-- request next" if r["number"] in top else ""
+        head_note = " head-reviewed" if r["reviewed_on_head"] else ""
+        print(f"  #{r['number']:>3} prio={r['priority']:>3} {r['type']:>7} "
+              f"needs={r['needs_review']} impact={r['impact']} rounds={r['codex_rounds']}{head_note} "
+              f"+{r['additions']}/-{r['deletions']} {r['state']}{flag}  {(r['title'] or '')[:48]}")
+    for e_num, e_msg in errors:
+        print(f"  ! PR #{e_num}: gh error: {e_msg}")
+    if args.json:
+        print(json.dumps({
+            "repo": repo, "marker": marker, "recommend_next": top,
+            "ranked": [{"pr": r["number"], "priority": r["priority"], "type": r["type"],
+                        "needs_review": r["needs_review"], "impact": r["impact"],
+                        "codex_rounds": r["codex_rounds"], "reviewed_on_head": r["reviewed_on_head"],
+                        "state": r["state"], "additions": r["additions"], "deletions": r["deletions"],
+                        "title": r["title"]} for r in ranked],
+            "errors": [{"pr": n, "error": m} for n, m in errors],
+        }, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_run_docs_advisory(args) -> int:
     """Advisory flow up to the human-approval gate. Real mode does the issue + @codex writes, then
     bounded-polls for the advisory, summarizes, and PAUSES for approval before any repo edits."""
@@ -585,6 +650,21 @@ def build_parser() -> argparse.ArgumentParser:
     wc.add_argument("--body-chars", type=_nonneg_int, default=600,
                     help="truncate each Codex item body preview to N chars (default 600)")
     wc.set_defaults(func=cmd_watch_codex_reviews)
+
+    rk = sub.add_parser("rank-codex-reviews",
+                        help="read-only: rank PRs by Codex-review priority (unreviewed + big-feature "
+                             "first) and recommend the top-N to request review on next")
+    rk.add_argument("--repo", default=None, help="owner/name (default: current repo)")
+    rk.add_argument("--limit", type=_pos_int, default=50,
+                    help="max PRs to inspect (must be >= 1)")
+    rk.add_argument("--top", type=_pos_int, default=3,
+                    help="how many top-priority PRs to recommend requesting review on (default 3)")
+    rk.add_argument("--include-merged", action="store_true",
+                    help="also rank MERGED PRs (e.g. ones merged before review was available) for "
+                         "retroactive review, not just open PRs")
+    rk.add_argument("--json", action="store_true",
+                    help="also print a machine-readable JSON ranking")
+    rk.set_defaults(func=cmd_rank_codex_reviews)
 
     # --- advisory flow up to human approval (dry-run by default; --real-github opts in) ---
     rda = sub.add_parser("run-docs-advisory",
