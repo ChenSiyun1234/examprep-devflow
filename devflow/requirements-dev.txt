@@ -1,0 +1,11 @@
+# Optional development dependencies for the `devflow` repo-automation tool ONLY.
+#
+# IMPORTANT: this is NOT a product dependency file. The Exam Prep skill/product runtime remains
+# pure Python standard library (no pip install required). devflow also runs with zero third-party
+# packages via its built-in stdlib fallback runner; installing langgraph below merely upgrades the
+# orchestrator to a real LangGraph StateGraph with native interrupt()/checkpointer support.
+#
+# Install (in a venv) only if you want the real LangGraph backend:
+#   pip install -r devflow/requirements-dev.txt
+
+langgraph>=0.2,<0.4
