@@ -345,6 +345,125 @@ def cmd_read_pr(args) -> int:
     return 0
 
 
+# ---- read-only Codex review watcher (no writes; dedupes via a LOCAL seen file) ----
+# The seen file is the tool's OWN state (same temp dir as run checkpoints). It is NOT a GitHub
+# artifact — writing it is not a commit/push/comment and touches nothing on GitHub.
+def _codex_seen_path(override=None) -> str:
+    return override or os.path.join(CKPT_DIR, "codex_seen.json")
+
+
+def _load_codex_seen(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):   # missing or corrupt -> start fresh (never crash the watcher)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    # Tolerate PARTIAL corruption / legacy slices too: keep only dict repo-slices whose per-PR
+    # entries are themselves dicts, so a present-but-non-dict slice/entry can't crash the use sites.
+    return {repo: {pr: entry for pr, entry in slc.items() if isinstance(entry, dict)}
+            for repo, slc in data.items() if isinstance(slc, dict)}
+
+
+def _save_codex_seen(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def cmd_watch_codex_reviews(args) -> int:
+    """Read-only: scan OPEN PRs for NEW trusted-Codex reviews/comments, deduped against a local
+    seen file. Prints ACTIONABLE_CODEX_REVIEWS (with details) if anything is new, else
+    NO_NEW_CODEX_REVIEWS. Never edits code, comments, commits, pushes, or merges."""
+    rc = _require_gh()
+    if rc:
+        return rc
+    gh = ReadOnlyGitHub(args.repo)
+    try:
+        repo = gh.resolve_repo()
+        prs = gh.list_open_prs(limit=args.limit)
+    except GhError as e:
+        print(f"[devflow] gh error: {e}")
+        return 1
+
+    seen_path = _codex_seen_path(args.seen_file)
+    seen = _load_codex_seen(seen_path)
+    # --reset / --init start THIS repo's slice fresh, but never clobber other repos in the file.
+    repo_seen = {} if (args.reset or args.init) else dict(seen.get(repo, {}))
+    actionable, checked, errors = [], [], []
+
+    for pr in prs:
+        num = pr.get("number")
+        if num is None:
+            continue
+        checked.append(num)
+        try:
+            review = gh.find_latest_codex_review(num)   # latest TRUSTED-Codex signal, or None
+        except GhError as e:                            # one PR failing must not abort the sweep
+            errors.append((num, str(e)))
+            continue
+        if not review:
+            continue
+        # dedupe key = the latest Codex item's (created_at, url). New iff it differs from last seen.
+        key = f"{review.get('created_at') or ''}|{review.get('url') or ''}"
+        entry = {"key": key, "created_at": review.get("created_at"),
+                 "url": review.get("url"), "blocking": review.get("blocking")}
+        if args.init:                       # baseline: record current state, do not alert
+            repo_seen[str(num)] = entry
+        elif key != (repo_seen.get(str(num)) or {}).get("key"):
+            actionable.append({"pr": num, "title": pr.get("title"), "review": review})
+            repo_seen[str(num)] = entry
+
+    seen[repo] = repo_seen
+    _save_codex_seen(seen_path, seen)         # local tool state only — no GitHub mutation
+
+    # --init records a baseline and emits NEITHER marker, so the first real run isn't a flood of
+    # pre-existing reviews.
+    if args.init:
+        print(f"[watch-codex] baseline recorded for {len(checked)} open PR(s) in {repo}; "
+              f"no markers emitted (seen={seen_path})")
+        return 0
+
+    # Marker FIRST (a bare line) so strict consumers can match it; human details + optional JSON
+    # follow. ACTIONABLE/NO_NEW is carried by this string, NOT the exit code (exit stays 0 like
+    # read-pr, unless --exit-actionable is requested).
+    marker = "ACTIONABLE_CODEX_REVIEWS" if actionable else "NO_NEW_CODEX_REVIEWS"
+    print(marker)
+    print(f"[watch-codex] repo={repo} open_prs={len(prs)} checked={len(checked)} "
+          f"new={len(actionable)} (read-only; seen={seen_path})")
+    for e_num, e_msg in errors:
+        print(f"  ! PR #{e_num}: gh error: {e_msg}")
+    if actionable:
+        print("PRs with new Codex feedback: " + ", ".join(f"#{a['pr']}" for a in actionable))
+        for a in actionable:
+            r = a["review"]
+            print(f"\n=== PR #{a['pr']}: {a['title']} ===")
+            print(f"   NEW Codex {r['source']} by {r['author']} @ {r.get('created_at')} "
+                  f"blocking={r.get('blocking')}")
+            if r.get("url"):
+                print(f"   url: {r['url']}")
+            for it in (r.get("items") or [])[:20]:
+                print(f"   - {it}")
+            body = (r.get("body") or "").strip()
+            if body:
+                print(f"   body: {body[:args.body_chars]}")
+    if args.json:
+        print(json.dumps({
+            "repo": repo, "open_prs": len(prs), "checked": checked,
+            "actionable": [{"pr": a["pr"], "title": a["title"], "source": a["review"]["source"],
+                            "author": a["review"]["author"],
+                            "created_at": a["review"].get("created_at"),
+                            "url": a["review"].get("url"),
+                            "blocking": a["review"].get("blocking")} for a in actionable],
+            "errors": [{"pr": n, "error": m} for n, m in errors],
+            "marker": marker,
+        }, ensure_ascii=False, indent=2))
+    if args.exit_actionable and actionable:
+        return 10   # opt-in: a distinct nonzero so shells can branch; default stays 0
+    return 0
+
+
 def cmd_run_docs_advisory(args) -> int:
     """Advisory flow up to the human-approval gate. Real mode does the issue + @codex writes, then
     bounded-polls for the advisory, summarizes, and PAUSES for approval before any repo edits."""
@@ -380,6 +499,14 @@ def _nonneg_int(v: str) -> int:
     iv = int(v)
     if iv < 0:
         raise argparse.ArgumentTypeError(f"must be >= 0 (got {iv})")
+    return iv
+
+
+def _pos_int(v: str) -> int:
+    """argparse type: reject integers < 1 (used where 0 is meaningless, e.g. a PR-list limit)."""
+    iv = int(v)
+    if iv < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1 (got {iv})")
     return iv
 
 
@@ -426,6 +553,26 @@ def build_parser() -> argparse.ArgumentParser:
     rp.add_argument("--pr", type=int, required=True)
     rp.add_argument("--repo", default=None, help="owner/name (default: current repo)")
     rp.set_defaults(func=cmd_read_pr)
+
+    wc = sub.add_parser("watch-codex-reviews",
+                        help="read-only: scan open PRs for NEW trusted-Codex reviews/comments (deduped)")
+    wc.add_argument("--repo", default=None, help="owner/name (default: current repo)")
+    wc.add_argument("--seen-file", default=None,
+                    help="local dedupe state file (default: <tmp>/devflow_runs/codex_seen.json)")
+    wc.add_argument("--limit", type=_pos_int, default=50,
+                    help="max open PRs to inspect (must be >= 1)")
+    wc.add_argument("--reset", action="store_true",
+                    help="ignore prior seen state for this repo (treat all current feedback as new)")
+    wc.add_argument("--init", action="store_true",
+                    help="baseline: record current Codex state as seen WITHOUT alerting (avoids a "
+                         "first-run flood); emits neither marker")
+    wc.add_argument("--json", action="store_true",
+                    help="also print a machine-readable JSON summary")
+    wc.add_argument("--exit-actionable", action="store_true",
+                    help="return exit code 10 (not 0) when there is new Codex feedback")
+    wc.add_argument("--body-chars", type=_nonneg_int, default=600,
+                    help="truncate each Codex item body preview to N chars (default 600)")
+    wc.set_defaults(func=cmd_watch_codex_reviews)
 
     # --- advisory flow up to human approval (dry-run by default; --real-github opts in) ---
     rda = sub.add_parser("run-docs-advisory",

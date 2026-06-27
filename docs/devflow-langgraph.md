@@ -245,6 +245,44 @@ python -m devflow.cli read-pr    --pr 456     [--repo owner/name]
 advisory/review is detected/parsed from sample comments/reviews, and that gh-unavailable errors
 are clear.
 
+## Read-only Codex review watcher (`watch-codex-reviews`)
+
+A polling-friendly, **strictly read-only** command that scans a repo's **open** PRs for **new**
+trusted-Codex reviews/comments and reports a machine-greppable marker.
+
+```bash
+python -m devflow.cli watch-codex-reviews --repo owner/name --init   # baseline once (no alert flood)
+python -m devflow.cli watch-codex-reviews --repo owner/name          # then poll
+```
+
+How it works:
+
+* lists open PRs with `gh pr list --state open` (`ReadOnlyGitHub.list_open_prs`, an allow-listed read);
+* for each PR, takes the **latest trusted-Codex signal** via `find_latest_codex_review` (so a
+  spoofed `codex-fan` login is ignored — same exact-login allowlist as the rest of the read layer);
+* **dedupes** against a local seen file: per repo, per PR, it stores the latest item's
+  `created_at|url` key; a PR is *new* iff that key changed since last run.
+
+Output contract (the **marker is the first line**, so `grep`/`startswith` both work):
+
+* `ACTIONABLE_CODEX_REVIEWS` — ≥1 open PR has new Codex feedback (followed by per-PR details);
+* `NO_NEW_CODEX_REVIEWS` — nothing new (also when there are zero open PRs);
+* `--init` records the current state as the baseline and prints **neither** marker (so the first
+  real run isn't a flood of pre-existing reviews).
+
+Flags: `--repo` (default: current repo), `--seen-file` (default `<tmp>/devflow_runs/codex_seen.json`),
+`--limit` (max open PRs, clamped ≥1), `--reset` (re-alert this repo's current feedback; other repos
+in a shared seen file are untouched), `--init`, `--json` (machine-readable summary in addition to the
+marker), `--exit-actionable` (opt-in: exit `10` instead of `0` when actionable), `--body-chars`.
+
+Safety: the command constructs only `ReadOnlyGitHub` (never a writer), every `gh` call passes the
+`_assert_read_only` chokepoint, and the **only** filesystem write is the local seen file under the
+temp dir — it is the tool's own state, **not** a GitHub artifact (no comment/commit/push/merge).
+Exit codes follow the read-command convention (0 success — for both markers; 1 gh error; 2/3
+gh unavailable/unauthenticated). Tests mock `gh` entirely
+(`tests/test_devflow_watch_codex.py`): actionable/none/dedupe/spoof/per-PR-error/init/json/
+exit-actionable plus an assertion that **every** spawned `gh` command is read-only.
+
 ## GitHub write mode (guarded, opt-in)
 
 `GitHubWriter` adds the only *write* path devflow has. It is **off by default** and limited to four
