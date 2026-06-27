@@ -69,6 +69,24 @@ def _fmt_comment(c) -> str:
     return str(c)
 
 
+def _fmt_comment_task(c) -> str:
+    """Format a review comment for a TASK / approved-scope line — like :func:`_fmt_comment` but it
+    NEVER surfaces an unsafe (absolute / ``..``) path as an edit target. An unsafe path is dropped
+    (the note is kept) so a task can't direct Claude Code outside the repo."""
+    if isinstance(c, dict):
+        path = c.get("path")
+        note = c.get("note") or c.get("body") or c.get("summary")
+        safe = isinstance(path, str) and _is_safe_rel_path(path)
+        if safe and note:
+            return f"{path}: {note}"
+        if note:
+            return str(note)                      # drop the unsafe/missing path, keep the finding
+        if safe:
+            return path
+        return "(review comment)"                 # no safe path, no note -> never echo a bad path
+    return str(c)
+
+
 def _as_list(v) -> list:
     """Coerce a checkpoint field to a list — defensively, since the checkpoint is on-disk state
     that may be hand-edited/legacy/corrupt. Only real sequences pass through; anything else -> []."""
@@ -78,15 +96,20 @@ def _as_list(v) -> list:
 def _is_safe_rel_path(p) -> bool:
     """True only for a repo-relative path with no traversal. Rejects absolute paths (POSIX, UNC, or
     Windows-drive) and any ``..`` segment, so an untrusted advisory/review can't point edits outside
-    the repo. Used to filter ``files_likely_touched`` (which comes from untrusted Codex content)."""
-    if not isinstance(p, str) or not p.strip():
+    the repo. Used to filter ``files_likely_touched`` (which comes from untrusted Codex content).
+
+    The path is stripped FIRST so leading/embedded whitespace can't smuggle an absolute path or
+    ``..`` past the checks (e.g. ``" /etc/passwd"`` or ``".. /x"``)."""
+    if not isinstance(p, str):
         return False
-    q = p.replace("\\", "/")
+    q = p.strip().replace("\\", "/")
+    if not q:
+        return False
     if q.startswith("/"):                         # POSIX absolute or UNC (//server)
         return False
     if len(q) >= 2 and q[1] == ":":               # Windows drive, e.g. C:/...
         return False
-    return not any(seg == ".." for seg in q.split("/"))
+    return not any(seg.strip() == ".." for seg in q.split("/"))
 
 
 def _md_safe(s) -> str:
@@ -113,27 +136,36 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
     steps = _as_list(advisory.get("recommended_steps"))
     summary = advisory.get("summary") if isinstance(advisory.get("summary"), str) else None
 
+    # Blocking comments are actionable ONLY at the blocking-fix gate. At the merge gate they are
+    # already-resolved history, and at the advisory gate they don't exist yet — turning them into
+    # tasks there would tell Claude Code to (re-)edit resolved/irrelevant findings (scope creep).
+    is_fix_gate = gate == "blocking_fix"
+
     # Approved scope: advisory steps (or, for a REAL advisory that only has a summary, the summary)
-    # at the advisory gate, plus any blocking fixes.
+    # at the advisory gate, plus the blocking fixes at the fix gate.
     approved_scope = []
     if gate == "advisory_implementation":
         approved_scope += steps or ([summary] if summary else [])
-    approved_scope += [f"fix: {_fmt_comment(c)}" for c in blocking]
+    if is_fix_gate:
+        approved_scope += [f"fix: {_fmt_comment_task(c)}" for c in blocking]
 
-    # Concrete tasks for Claude Code.
+    # Concrete tasks for Claude Code (unsafe paths are dropped from the task text by _fmt_comment_task).
     tasks = []
     if gate == "advisory_implementation":
         tasks += steps
-    tasks += [f"Address blocking review comment — {_fmt_comment(c)}" for c in blocking]
+    if is_fix_gate:
+        tasks += [f"Address blocking review comment — {_fmt_comment_task(c)}" for c in blocking]
     if not tasks and summary:
         tasks = [summary]
 
-    # Best-effort: only file-scoped comments contribute paths (real Codex comments are often not
-    # file-scoped, so this list can legitimately be empty). These paths come from UNTRUSTED Codex
-    # content, so absolute paths and `..` traversal are rejected — the packet must never direct
-    # edits outside the repo. Rejected paths are surfaced in out-of-scope, not silently dropped.
-    raw_files = [c["path"] for c in (blocking + non_blocking)
-                 if isinstance(c, dict) and isinstance(c.get("path"), str)]
+    # files_likely_touched = edit targets. Only the (fix-gate) blocking comments + an advisory's own
+    # file list contribute — NOT non-blocking comments (those are optional/out-of-scope). These paths
+    # come from UNTRUSTED Codex content, so absolute paths and `..` traversal are rejected; rejected
+    # paths are surfaced in out-of-scope, not silently dropped.
+    raw_files = []
+    if is_fix_gate:
+        raw_files += [c["path"] for c in blocking
+                      if isinstance(c, dict) and isinstance(c.get("path"), str)]
     raw_files += [str(f) for f in _as_list(advisory.get("files"))]
     files = sorted({p for p in raw_files if _is_safe_rel_path(p)})
     unsafe_files = sorted({p for p in raw_files if not _is_safe_rel_path(p)})
@@ -147,7 +179,9 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
         "Unrelated refactors or formatting churn.",
     ]
 
-    tests = _as_list(state.get("checks_not_run")) or ["python -m unittest discover -s tests"]
+    # The runnable validation command — NOT the dry-run `checks_not_run` labels (e.g. "unit tests
+    # (dry-run: not executed)"), which are descriptive, not executable.
+    tests = ["python -m unittest discover -s tests"]
 
     rejected_or_deferred = [_fmt_comment(c) for c in deferred]
     for field, label in (("human_approval", "advisory"), ("fix_approval", "fix"),
@@ -278,7 +312,7 @@ def write_packet(base_dir: str, thread_id: str, packet: dict,
     """
     slug = safe_thread_slug(thread_id)
     pkt_dir = os.path.join(base_dir, slug)
-    # Refuse a pre-existing symlinked packet dir (or output base): os.makedirs(exist_ok=True) would
+    # Refuse a pre-existing symlinked output base or packet dir: os.makedirs(exist_ok=True) would
     # happily follow it and write the packet outside the intended tool-state location.
     for p in (base_dir, pkt_dir):
         if os.path.islink(p):
@@ -286,6 +320,11 @@ def write_packet(base_dir: str, thread_id: str, packet: dict,
     os.makedirs(pkt_dir, exist_ok=True)
     json_path = os.path.join(pkt_dir, PACKET_JSON_NAME)
     md_path = os.path.join(pkt_dir, PACKET_MD_NAME)
+    # ...and refuse if either packet FILE is itself a symlink — open(..., "w") would follow it and
+    # could overwrite a tracked repo file (or any writable path) on a repeated export.
+    for p in (json_path, md_path):
+        if os.path.islink(p):
+            raise PacketError(f"refusing to overwrite a symlinked packet file: {p}")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(packet, f, ensure_ascii=False, indent=2)
     with open(md_path, "w", encoding="utf-8") as f:

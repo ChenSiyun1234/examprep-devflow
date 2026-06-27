@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from devflow import cli
-from devflow.state import GATE_ADVISORY, GATE_FIX
+from devflow.state import GATE_ADVISORY, GATE_FIX, GATE_MERGE
 from devflow.tools import github_cli as G
 from devflow.tools.packet_writer import (
     build_packet, render_markdown, safe_thread_slug, write_packet, PacketError,
@@ -139,6 +139,51 @@ class TestBuildPacket(unittest.TestCase):
         self.assertIn("../other/x.py", oos)
         self.assertIn("do NOT touch", oos)
 
+    def test_fix_gate_tasks_drop_unsafe_paths(self):
+        # a blocking comment with an unsafe path must NOT appear as an out-of-repo edit target in
+        # tasks/approved_scope — the note is kept, the path dropped (Codex re-review #1)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [{"path": "/etc/passwd", "note": "rotate the creds"}]}
+        ii = build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]
+        joined = " ".join(ii["tasks"])
+        self.assertIn("rotate the creds", joined)            # finding preserved
+        self.assertNotIn("/etc/passwd", joined)              # but not the unsafe path
+        self.assertEqual(ii["files_likely_touched"], [])     # and never an edit target
+
+    def test_leading_whitespace_absolute_path_rejected(self):
+        # whitespace must not smuggle an absolute/`..` path past the filter (Codex re-review #4)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [{"path": " /etc/passwd", "note": "a"},
+                                    {"path": "\t../escape.py", "note": "b"},
+                                    {"path": "devflow/ok.py", "note": "c"}]}
+        ii = build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]
+        self.assertEqual(ii["files_likely_touched"], ["devflow/ok.py"])
+
+    def test_blocking_not_actionable_at_merge_gate(self):
+        # at the merge gate, already-resolved blocking comments must NOT become tasks (Codex #3)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_MERGE,
+              "blocking_comments": [{"path": "devflow/ok.py", "note": "resolved earlier"}]}
+        ii = build_packet(st, GATE_MERGE, "approved", "T0")["implementation_instructions"]
+        self.assertEqual(ii["tasks"], [])
+        self.assertEqual(ii["files_likely_touched"], [])
+
+    def test_non_blocking_paths_not_in_files(self):
+        # non-blocking (optional) comment paths must not become edit targets (Codex #5)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [{"path": "devflow/ok.py", "note": "fix"}],
+              "non_blocking_comments": [{"path": "docs/nice.md", "note": "optional"}]}
+        ii = build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]
+        self.assertIn("devflow/ok.py", ii["files_likely_touched"])
+        self.assertNotIn("docs/nice.md", ii["files_likely_touched"])
+
+    def test_tests_to_run_is_runnable_command(self):
+        # the fix packet must emit the runnable command, not dry-run labels (Codex #6)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "checks_not_run": ["unit tests (dry-run: not executed)"]}
+        ii = build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]
+        self.assertEqual(ii["tests_to_run"], ["python -m unittest discover -s tests"])
+        self.assertNotIn("dry-run", " ".join(ii["tests_to_run"]))
+
     def test_markdown_injection_is_neutralized(self):
         # untrusted content with newlines must not forge a Markdown heading/section (Codex #7)
         st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_ADVISORY,
@@ -211,6 +256,17 @@ class TestSafeThreadSlug(unittest.TestCase):
             with self.assertRaises(PacketError):
                 write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
         self.assertFalse(os.path.exists(os.path.join(link, "implementation-packet.json")))
+
+    def test_write_refuses_symlinked_packet_file(self):
+        # even if the dir is fine, a symlinked packet FILE must be refused (open(w) would follow it)
+        from devflow.tools import packet_writer as P
+        base = tempfile.mkdtemp(prefix="pkt-")
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        json_path = os.path.join(base, safe_thread_slug("demo"), "implementation-packet.json")
+        with mock.patch.object(P.os.path, "islink", side_effect=lambda p: p == json_path):
+            with self.assertRaises(PacketError):
+                write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
+        self.assertFalse(os.path.exists(json_path))          # nothing written through the symlink
 
 
 class TestExportCli(unittest.TestCase):
