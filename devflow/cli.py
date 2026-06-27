@@ -69,6 +69,15 @@ def _load_ckpt(thread_id: str) -> dict:
         return json.load(f)
 
 
+def _clear_fallback_ckpt(thread_id: str) -> None:
+    """Best-effort remove the stdlib-fallback JSON checkpoint for a thread, so a later non-langgraph
+    `resume` can't load obsolete state after a langgraph run/resume has completed. Never raises."""
+    try:
+        os.remove(_ckpt_path(thread_id))
+    except OSError:
+        pass
+
+
 def _approvals_from_args(args) -> dict:
     approvals = {g: APPROVED for g in APPROVAL_GATES}
     for g in (args.reject or []):
@@ -196,6 +205,7 @@ def _run_langgraph(args) -> int:
             _print_lg_pause(nxt, payloads, args.thread_id)
             return 0
         _print_outcome(app.get_state(cfg).values)
+        _clear_fallback_ckpt(args.thread_id)   # completed -> drop any stale stdlib checkpoint
     return 0
 
 
@@ -213,11 +223,19 @@ def _resume_langgraph(args) -> int:
     cfg = {"configurable": {"thread_id": args.thread_id}}
     with cm as saver:
         app = _build_state_graph().compile(checkpointer=saver)
-        nxt, _ = _lg_pending(app, cfg)
+        nxt, payloads = _lg_pending(app, cfg)
         if not nxt:
             print(f"[devflow] no paused LangGraph thread '{args.thread_id}'. Start one with:\n"
                   f"  python -m devflow.cli run --task <t> --thread-id {args.thread_id} "
                   f"--langgraph --pause-at <gate>")
+            return 1
+        # Validate the operator-supplied --gate against where the thread is ACTUALLY paused, so a
+        # resume can't approve a different gate than intended (args.gate was previously only logged).
+        paused_gate = (payloads[0] or {}).get("gate") if payloads else None
+        paused_alias = next((a for a, full in _GATE_ALIASES.items() if full == paused_gate), None)
+        if paused_alias and args.gate and args.gate != paused_alias:
+            print(f"[devflow] refusing to resume: thread '{args.thread_id}' is paused at the "
+                  f"'{paused_alias}' gate, not '{args.gate}'. Re-run with --gate {paused_alias}.")
             return 1
         print(f"[devflow] resume(langgraph) thread={args.thread_id} gate={args.gate} "
               f"decision={decision}")
@@ -227,6 +245,7 @@ def _resume_langgraph(args) -> int:
             _print_lg_pause(nxt2, payloads2, args.thread_id)
             return 0
         _print_outcome(app.get_state(cfg).values)   # rejected -> safe-stop report; approved -> done
+        _clear_fallback_ckpt(args.thread_id)        # completed -> drop any stale stdlib checkpoint
     return 0
 
 
