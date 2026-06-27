@@ -88,6 +88,11 @@ def _strip_unsafe_path_prefix(text: str) -> str:
                               or "$" in h or "%" in h or (len(h) >= 2 and h[1] == ":"))
                 if looks_path and not _is_safe_rel_path(h):
                     return rest.strip()
+    # no "PATH: detail" shape, but the WHOLE text may itself be a bare unsafe path ('/etc/passwd',
+    # '../x.py', 'C:\\...') with no separator -> never surface it as an edit target. (Prose and safe
+    # relative paths pass _is_safe_rel_path and are returned unchanged.)
+    if text.strip() and not _is_safe_rel_path(text.strip()):
+        return "(unsafe path omitted)"
     return text
 
 
@@ -136,6 +141,8 @@ def _is_safe_rel_path(p) -> bool:
         return False
     if "$" in q or "%" in q:                      # env-rooted, e.g. $HOME/.gitconfig, %APPDATA%\...
         return False
+    if q.split("/")[0].lower() == ".git":         # never edit Git control files (.git/...) —
+        return False                              # .gitignore / .github/ stay fine (exact first segment)
     # reject ``..`` (traversal), ``.`` (current dir / whole repo), and empty (``//``) segments
     return not any(seg.strip() in ("", "..", ".") for seg in q.split("/"))
 
@@ -167,6 +174,11 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
     summary = advisory.get("summary") if isinstance(advisory.get("summary"), str) else None
     if summary:
         summary = _strip_unsafe_path_prefix(summary)
+    # SCOPE/TASKS fallback prefers the FULL advisory body — summarize_advisory truncates `summary` to
+    # ~200 chars, which would hand Claude Code an incomplete scope. The human-facing advisory_summary
+    # still uses the short summary.
+    body_full = _strip_unsafe_path_prefix(str(advisory.get("body"))) if isinstance(advisory.get("body"), str) else None
+    scope_fallback = body_full or summary
 
     # Blocking comments are actionable ONLY at the blocking-fix gate. At the merge gate they are
     # already-resolved history, and at the advisory gate they don't exist yet — turning them into
@@ -177,7 +189,7 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
     # at the advisory gate, plus the blocking fixes at the fix gate.
     approved_scope = []
     if gate == "advisory_implementation":
-        approved_scope += steps or ([summary] if summary else [])
+        approved_scope += steps or ([scope_fallback] if scope_fallback else [])
     if is_fix_gate:
         approved_scope += [f"fix: {_fmt_comment_task(c)}" for c in blocking]
 
@@ -189,8 +201,8 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
         tasks += [f"Address blocking review comment — {_fmt_comment_task(c)}" for c in blocking]
     # Summary fallback ONLY at the advisory gate — a merge-gate (or fix-gate-with-no-blocking) packet
     # must not turn the carried advisory summary into "go implement this" (merge approves no new work).
-    if gate == "advisory_implementation" and not tasks and summary:
-        tasks = [summary]
+    if gate == "advisory_implementation" and not tasks and scope_fallback:
+        tasks = [scope_fallback]
 
     # files_likely_touched = edit targets. Only the (fix-gate) blocking comments + an advisory's own
     # file list contribute — NOT non-blocking comments (those are optional/out-of-scope). These paths
@@ -200,6 +212,14 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
     if is_fix_gate:
         raw_files += [c["path"] for c in blocking
                       if isinstance(c, dict) and isinstance(c.get("path"), str)]
+        # real review bullets carry the file inside the note text ('src/foo.py: fix …'), not a
+        # structured `path` field — recover a leading SAFE path so files_likely_touched isn't empty.
+        for c in blocking:
+            note = c.get("note") if isinstance(c, dict) else (c if isinstance(c, str) else None)
+            if isinstance(note, str) and ":" in note:
+                head = note.split(":", 1)[0].strip()
+                if _is_safe_rel_path(head):
+                    raw_files.append(head)
     # advisory's own file list belongs ONLY to the advisory gate — at the merge gate (which approves
     # no new work) it would wrongly present edit targets. Only accept STRING entries (no str()-coerce).
     if gate == "advisory_implementation":
