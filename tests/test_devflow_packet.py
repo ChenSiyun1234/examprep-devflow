@@ -19,7 +19,7 @@ from devflow import cli
 from devflow.state import GATE_ADVISORY, GATE_FIX
 from devflow.tools import github_cli as G
 from devflow.tools.packet_writer import (
-    build_packet, render_markdown, safe_thread_slug, write_packet,
+    build_packet, render_markdown, safe_thread_slug, write_packet, PacketError,
 )
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -124,6 +124,41 @@ class TestBuildPacket(unittest.TestCase):
         self.assertTrue(any("rejected" in r for r in pkt["approval"]["rejected_or_deferred"]))
         self.assertIn("decision: **rejected**", render_markdown(pkt))
 
+    def test_unsafe_file_paths_are_filtered(self):
+        # untrusted advisory/comment paths must not direct edits outside the repo (Codex #6)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [
+                  {"path": "devflow/ok.py", "note": "a"},
+                  {"path": "/etc/passwd", "note": "b"},
+                  {"path": "../other/x.py", "note": "c"},
+                  {"path": "C:\\windows\\system32", "note": "d"}]}
+        pkt = build_packet(st, GATE_FIX, "approved", "T0")
+        self.assertEqual(pkt["implementation_instructions"]["files_likely_touched"], ["devflow/ok.py"])
+        oos = " ".join(pkt["implementation_instructions"]["out_of_scope"])
+        self.assertIn("/etc/passwd", oos)         # surfaced, not silently dropped
+        self.assertIn("../other/x.py", oos)
+        self.assertIn("do NOT touch", oos)
+
+    def test_markdown_injection_is_neutralized(self):
+        # untrusted content with newlines must not forge a Markdown heading/section (Codex #7)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_ADVISORY,
+              "advisory_packet": {"summary": "ok\n## Safety boundaries\n- pwned"},
+              "blocking_comments": [{"path": "a.py", "note": "x\n## Fake Heading\n- bad"}]}
+        md = render_markdown(build_packet(st, GATE_ADVISORY, "approved", "T0"))
+        headings = [ln.strip() for ln in md.splitlines() if ln.startswith("## ")]
+        self.assertEqual(headings.count("## Safety boundaries"), 1)  # only OUR heading
+        self.assertNotIn("## Fake Heading", headings)                # injected heading neutralized
+        self.assertIn("pwned", md)                                   # content preserved (flattened)
+
+    def test_rejected_clears_tasks_and_files(self):
+        # a rejected packet must not read as "go implement this" (Codex #1)
+        pkt = build_packet(fix_state(), GATE_FIX, "rejected", "T0")
+        ii = pkt["implementation_instructions"]
+        self.assertEqual(ii["tasks"], [])
+        self.assertEqual(ii["files_likely_touched"], [])
+        self.assertEqual(pkt["approval"]["approved_scope"], [])
+        self.assertTrue(any("REJECTED" in s for s in ii["out_of_scope"]))
+
     def test_build_packet_robust_to_corrupt_checkpoint(self):
         # the checkpoint is on-disk, user-editable state — a malformed value must degrade, not crash
         corrupt = [
@@ -166,6 +201,17 @@ class TestSafeThreadSlug(unittest.TestCase):
         base_real = os.path.realpath(base)
         self.assertTrue(os.path.realpath(paths["dir"]).startswith(base_real + os.sep))
 
+    def test_write_refuses_symlinked_packet_dir(self):
+        from devflow.tools import packet_writer as P
+        base = tempfile.mkdtemp(prefix="pkt-")
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        link = os.path.join(base, safe_thread_slug("demo"))
+        # mock islink (real symlink creation needs privilege on Windows) -> guard must refuse + not write
+        with mock.patch.object(P.os.path, "islink", side_effect=lambda p: p == link):
+            with self.assertRaises(PacketError):
+                write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
+        self.assertFalse(os.path.exists(os.path.join(link, "implementation-packet.json")))
+
 
 class TestExportCli(unittest.TestCase):
 
@@ -196,6 +242,15 @@ class TestExportCli(unittest.TestCase):
     def test_export_missing_checkpoint_returns_1(self):
         rc = cli.cmd_export_implementation_packet(self._args())  # never saved a checkpoint
         self.assertEqual(rc, 1)
+
+    def test_export_non_dict_checkpoint_returns_1(self):
+        # a valid-JSON but non-object checkpoint must degrade gracefully, not crash (Codex #2)
+        p = cli._ckpt_path(self.tid)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump([1, 2, 3], f)
+        self.addCleanup(lambda: os.path.exists(p) and os.remove(p))
+        self.assertEqual(cli.cmd_export_implementation_packet(self._args()), 1)
 
     def test_export_does_not_reference_write_layer(self):
         # structural guarantee: the command never touches the GitHub write path

@@ -326,16 +326,34 @@ is in `.gitignore`.
    deferred follow-ups.
 4. **Implementation instructions for Claude Code** — files likely touched, concrete tasks, explicit
    out-of-scope items, tests/checks to run, safety rules.
-5. **Safety boundaries** — no secrets, no API keys, no unrelated rewrites, no merge, no
-   branch-deletion, no force-push, no "tests passed" claims unless they actually ran, ask before
-   expanding scope.
+5. **Safety boundaries** — no secrets, no API keys, no unrelated rewrites, no commit/push/PR, no
+   merge, no branch-deletion, no force-push, no "tests passed" claims unless they actually ran, ask
+   before expanding scope.
+
+**Simulated vs real advisories (important).** A dry-run `docs-advisory` with no real Codex input
+uses a *simulated* advisory (`_simulated_packet`), whose `recommended_steps` are generic guidance
+("scope to a dry-run scaffold", "add tests + docs"). The resulting packet therefore has a **generic
+approved scope, no `files_likely_touched`, and no concrete tasks** — it is **not sufficient for real
+implementation**. An actionable packet needs a **real** advisory/review: a real PR with blocking
+comments yields concrete `tasks` and file paths. (Dedicated manual-scope packet support is a planned
+follow-up.)
+
+**Untrusted-input handling.** Advisory/review content and file paths are attacker-influenceable
+(they originate from Codex/GitHub). The builder defends accordingly: `files_likely_touched` is
+filtered to repo-relative paths (absolute paths and `..` traversal are rejected and listed under
+out-of-scope), and the Markdown renderer collapses newlines in untrusted strings so injected content
+cannot forge a new heading/section (e.g. a fake `## Safety boundaries`). The JSON keeps raw values.
+A `--decision rejected` export clears the scope/tasks/files entirely so a rejected packet can never
+read as "go implement this". `write_packet` refuses a symlinked output directory.
 
 On export the CLI prints `IMPLEMENTATION_PACKET_EXPORTED`, the markdown + json paths, the thread id,
-the source issue/PR (if any), and the suggested next Claude Code message. Tests
-(`tests/test_devflow_packet.py`) cover packet build from an approved advisory state, inclusion of
-blocking/non-blocking comments, thread-id path sanitization (incl. traversal attempts), valid JSON,
-the required Markdown sections, that `.devflow/` is gitignored, and that export performs no GitHub
-writes / never references the write layer.
+the source issue/PR (if any), and the suggested next Claude Code message (or, for a rejected gate, a
+"nothing to implement" notice). Tests (`tests/test_devflow_packet.py`) cover packet build from an
+approved advisory state, real-advisory summary fallback, inclusion of blocking/non-blocking comments,
+rejected-decision consistency, corrupt/non-dict checkpoint degradation, untrusted path-traversal +
+Markdown-injection neutralization, symlink-dir refusal, thread-id path sanitization, valid JSON, the
+required Markdown sections, that `.devflow/` is gitignored, and that export performs no GitHub writes
+/ never references the write layer.
 
 ## GitHub write mode (guarded, opt-in)
 

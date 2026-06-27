@@ -90,6 +90,13 @@ checkpoint and writes the two packet files. devflow does not implement code; the
 Code what to implement, within scope. On export it prints `IMPLEMENTATION_PACKET_EXPORTED`, the two
 paths, the thread id, source issue/PR, and the suggested next Claude Code message.
 
+> ⚠️ **Dry-run / simulated advisories produce a *generic* packet.** A `docs-advisory` run without
+> real Codex input uses a simulated advisory, so the packet's approved scope is generic guidance
+> ("scope to a dry-run scaffold", "add tests + docs") with **no `files likely touched` and no
+> concrete tasks** — it is **not enough for real implementation**. For an actionable packet, export
+> from a thread backed by a **real** Codex advisory/review (a real PR with blocking comments yields
+> concrete tasks + file paths). Manual-scope packet support is planned as a follow-up.
+
 ## LangGraph Studio (`langgraph dev`)
 
 The graph is Studio-loadable: `langgraph.json` (repo root) points Studio at the

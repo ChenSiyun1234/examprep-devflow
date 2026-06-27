@@ -20,11 +20,17 @@ PACKET_JSON_NAME = "implementation-packet.json"
 PACKET_MD_NAME = "implementation-packet.md"
 SCHEMA_VERSION = 1
 
-# Fixed safety boundaries embedded in every packet — Claude Code must obey these.
+
+class PacketError(RuntimeError):
+    """Raised when a packet cannot be written safely (e.g. into a symlinked output directory)."""
+
+# Fixed safety boundaries embedded in every packet — Claude Code must obey these. The packet is
+# read on its own (without the terminal handoff), so the git/PR prohibitions live here too.
 SAFETY_BOUNDARIES = [
     "Do not commit or expose secrets.",
     "Do not add or hardcode API keys.",
     "Do not perform unrelated rewrites/refactors outside the listed scope.",
+    "Do not commit, push, or open pull requests — the human drives git and the PR.",
     "Do not merge any pull request.",
     "Do not delete branches.",
     "Do not force-push.",
@@ -69,6 +75,27 @@ def _as_list(v) -> list:
     return list(v) if isinstance(v, (list, tuple)) else []
 
 
+def _is_safe_rel_path(p) -> bool:
+    """True only for a repo-relative path with no traversal. Rejects absolute paths (POSIX, UNC, or
+    Windows-drive) and any ``..`` segment, so an untrusted advisory/review can't point edits outside
+    the repo. Used to filter ``files_likely_touched`` (which comes from untrusted Codex content)."""
+    if not isinstance(p, str) or not p.strip():
+        return False
+    q = p.replace("\\", "/")
+    if q.startswith("/"):                         # POSIX absolute or UNC (//server)
+        return False
+    if len(q) >= 2 and q[1] == ":":               # Windows drive, e.g. C:/...
+        return False
+    return not any(seg == ".." for seg in q.split("/"))
+
+
+def _md_safe(s) -> str:
+    """Neutralize untrusted text for Markdown rendering: collapse newlines so the content can't
+    start a new block (e.g. a forged ``## Safety boundaries`` heading) and trim. The JSON packet
+    keeps the raw, faithful value — only the human-readable Markdown is sanitized."""
+    return str(s).replace("\r", " ").replace("\n", " ").strip()
+
+
 def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> dict:
     """Build the structured Implementation Packet (a plain dict) from a devflow state snapshot.
 
@@ -102,14 +129,18 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
         tasks = [summary]
 
     # Best-effort: only file-scoped comments contribute paths (real Codex comments are often not
-    # file-scoped, so this list can legitimately be empty).
-    files = [c["path"] for c in (blocking + non_blocking)
-             if isinstance(c, dict) and isinstance(c.get("path"), str)]
-    files += _as_list(advisory.get("files"))
-    files = sorted({str(f) for f in files})
+    # file-scoped, so this list can legitimately be empty). These paths come from UNTRUSTED Codex
+    # content, so absolute paths and `..` traversal are rejected — the packet must never direct
+    # edits outside the repo. Rejected paths are surfaced in out-of-scope, not silently dropped.
+    raw_files = [c["path"] for c in (blocking + non_blocking)
+                 if isinstance(c, dict) and isinstance(c.get("path"), str)]
+    raw_files += [str(f) for f in _as_list(advisory.get("files"))]
+    files = sorted({p for p in raw_files if _is_safe_rel_path(p)})
+    unsafe_files = sorted({p for p in raw_files if not _is_safe_rel_path(p)})
 
     out_of_scope = [f"(deferred) {_fmt_comment(c)}" for c in deferred]
     out_of_scope += [f"(non-blocking / optional) {_fmt_comment(c)}" for c in non_blocking]
+    out_of_scope += [f"(ignored unsafe path — outside repo, do NOT touch) {p}" for p in unsafe_files]
     out_of_scope += [
         "Anything not explicitly listed in the tasks above.",
         "Product/runtime features of the exam-prep skill.",
@@ -123,9 +154,14 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
                          ("merge_approval", "merge")):
         if str(state.get(field) or "").lower() == "rejected":
             rejected_or_deferred.append(f"{label} gate: rejected")
-    # Keep the recorded decision consistent: a rejected export approves nothing and is surfaced.
+    # Keep a rejected export internally consistent: nothing is approved and there is NOTHING to
+    # implement — clear scope/tasks/files so the packet can't be (mis)read as "go implement this",
+    # even if it is opened without the terminal handoff message.
     if is_rejection:
         approved_scope = []
+        tasks = []
+        files = []
+        out_of_scope = ["REJECTED: do not implement anything from this packet."] + out_of_scope
         entry = f"{GATE_LABELS.get(gate, gate)} gate: rejected"
         if entry not in rejected_or_deferred:
             rejected_or_deferred.append(entry)
@@ -168,7 +204,7 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
 
 
 def _md_list(items, empty="_(none)_") -> str:
-    items = [str(i) for i in (items or [])]
+    items = [_md_safe(i) for i in (items or [])]   # sanitize: untrusted content can't inject blocks
     return "\n".join(f"- {i}" for i in items) if items else empty
 
 
@@ -186,15 +222,15 @@ def render_markdown(packet: dict) -> str:
         "the scope and safety boundaries below.",
         "",
         "## Metadata",
-        f"- thread_id: `{m.get('thread_id')}`",
-        f"- task_type: {m.get('task_type')}",
-        f"- repo: {m.get('repo')}",
-        f"- generated_at: {m.get('generated_at')}",
+        f"- thread_id: `{_md_safe(m.get('thread_id'))}`",
+        f"- task_type: {_md_safe(m.get('task_type'))}",
+        f"- repo: {_md_safe(m.get('repo'))}",
+        f"- generated_at: {_md_safe(m.get('generated_at'))}",
     ]
     if m.get("issue_number"):
-        out.append(f"- source issue: #{m['issue_number']} {m.get('issue_url') or ''}".rstrip())
+        out.append(f"- source issue: #{m['issue_number']} {_md_safe(m.get('issue_url') or '')}".rstrip())
     if m.get("pr_number"):
-        out.append(f"- source PR: #{m['pr_number']} {m.get('pr_url') or ''}".rstrip())
+        out.append(f"- source PR: #{m['pr_number']} {_md_safe(m.get('pr_url') or '')}".rstrip())
     out += [
         "",
         "## Approval",
@@ -206,7 +242,8 @@ def render_markdown(packet: dict) -> str:
         _md_list(a.get("rejected_or_deferred")),
         "",
         "## Advisory / Review",
-        f"- advisory summary: {ar.get('advisory_summary') or '_(none)_'}",
+        "- advisory summary: " + (_md_safe(ar.get("advisory_summary"))
+                                  if ar.get("advisory_summary") else "_(none)_"),
         "- review summary: " + (json.dumps(ar.get("review_summary"), ensure_ascii=False)
                                 if ar.get("review_summary") else "_(none)_"),
         "- blocking comments:",
@@ -241,6 +278,11 @@ def write_packet(base_dir: str, thread_id: str, packet: dict,
     """
     slug = safe_thread_slug(thread_id)
     pkt_dir = os.path.join(base_dir, slug)
+    # Refuse a pre-existing symlinked packet dir (or output base): os.makedirs(exist_ok=True) would
+    # happily follow it and write the packet outside the intended tool-state location.
+    for p in (base_dir, pkt_dir):
+        if os.path.islink(p):
+            raise PacketError(f"refusing to write into a symlinked path: {p}")
     os.makedirs(pkt_dir, exist_ok=True)
     json_path = os.path.join(pkt_dir, PACKET_JSON_NAME)
     md_path = os.path.join(pkt_dir, PACKET_MD_NAME)

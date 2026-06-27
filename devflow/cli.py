@@ -32,7 +32,7 @@ from devflow.state import (
     GATE_ADVISORY, GATE_FIX, GATE_MERGE,
 )
 from devflow.tools.github_cli import ReadOnlyGitHub, check_gh_available, GhError
-from devflow.tools.packet_writer import build_packet, write_packet
+from devflow.tools.packet_writer import build_packet, write_packet, PacketError
 from devflow._compat import HAS_LANGGRAPH
 
 # Windows GBK consoles otherwise mangle the report box-drawing / CJK text.
@@ -484,14 +484,24 @@ def cmd_export_implementation_packet(args) -> int:
               f"  python -m devflow.cli run --task <task> --thread-id {args.thread_id} "
               f"--pause-at advisory")
         return 1
+    if not isinstance(state, dict):
+        # a valid-JSON but non-object checkpoint (e.g. a stale/hand-edited `[]`) — degrade, don't crash
+        print(f"[devflow] checkpoint for thread '{args.thread_id}' is not a devflow state object "
+              f"(got {type(state).__name__}); re-run a paused workflow to regenerate it.")
+        return 1
 
     gate = _GATE_ALIASES.get(args.gate) if args.gate else (state.get("paused_at_gate") or GATE_ADVISORY)
     generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     packet = build_packet(state, gate=gate, decision=args.decision, generated_at=generated_at)
     out_dir = args.out_dir or PACKETS_DIR
-    paths = write_packet(out_dir, args.thread_id, packet)
+    try:
+        paths = write_packet(out_dir, args.thread_id, packet)
+    except PacketError as e:
+        print(f"[devflow] {e}")
+        return 1
 
     m = packet["metadata"]
+    rejected = packet["approval"]["decision"] == REJECTED
     print("IMPLEMENTATION_PACKET_EXPORTED")
     print(f"  markdown:  {paths['md_path']}")
     print(f"  json:      {paths['json_path']}")
@@ -501,9 +511,12 @@ def cmd_export_implementation_packet(args) -> int:
         print(f"  source issue: #{m['issue_number']} {m.get('issue_url') or ''}".rstrip())
     if m.get("pr_number"):
         print(f"  source PR:    #{m['pr_number']} {m.get('pr_url') or ''}".rstrip())
-    print("\nNext (hand off to Claude Code):")
-    print(f"  Implement ONLY the scoped tasks in {paths['md_path']}; run the listed checks; do not "
-          f"merge/push/commit; ask before expanding scope.")
+    if rejected:
+        print("\nGate REJECTED — nothing to implement; no handoff. The packet records the rejection.")
+    else:
+        print("\nNext (hand off to Claude Code):")
+        print(f"  Implement ONLY the scoped tasks in {paths['md_path']}; run the listed checks; do "
+              f"not commit/push/merge; ask before expanding scope.")
     return 0
 
 
