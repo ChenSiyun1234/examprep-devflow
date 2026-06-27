@@ -36,6 +36,16 @@ def codex_comment(created_at, url, body="Note:\n- consider X", login=CODEX):
     return {"user": {"login": login}, "body": body, "created_at": created_at, "html_url": url}
 
 
+QUOTA_BODY = ("You have reached your Codex usage limits for code reviews. "
+              "You can see your limits in the Codex usage dashboard. "
+              "To continue using code reviews, you can upgrade your account or add credits.")
+
+
+def codex_quota(created_at, url, login=CODEX):
+    # the trusted-Codex "rate-limited" notice — NOT a review (must not be flagged as actionable)
+    return {"user": {"login": login}, "body": QUOTA_BODY, "created_at": created_at, "html_url": url}
+
+
 def make_fake_gh(open_prs, reviews_by_pr=None, comments_by_pr=None, review_comments_by_pr=None,
                  error_prs=(), auth_ok=True, recorder=None):
     reviews_by_pr = reviews_by_pr or {}
@@ -108,6 +118,11 @@ class WatchCodexBase(unittest.TestCase):
     def assertNoNew(self, out):
         self.assertIn("NO_NEW_CODEX_REVIEWS", out)
         self.assertNotIn("ACTIONABLE_CODEX_REVIEWS", out)
+
+    def assertQuota(self, out):
+        self.assertIn("CODEX_QUOTA_LIMITED", out)
+        self.assertNotIn("ACTIONABLE_CODEX_REVIEWS", out)
+        self.assertNotIn("NO_NEW_CODEX_REVIEWS", out)
 
 
 class TestWatchCodexBehavior(WatchCodexBase):
@@ -257,6 +272,56 @@ class TestWatchCodexBehavior(WatchCodexBase):
                                             state="CHANGES_REQUESTED")]})
         self.assertActionable(out2, 1)        # new same-second review is not swallowed
         self.assertIn("blocking=True", out2)
+
+    def test_quota_notice_emits_quota_marker_not_actionable(self):
+        # a bare Codex usage-limits notice must NOT be flagged as actionable -> CODEX_QUOTA_LIMITED
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        rc, out, _ = self.run_watch(prs, comments_by_pr={1: [codex_quota("2026-01-03T00:00:00Z", "p1#q1")]})
+        self.assertEqual(rc, 0)
+        self.assertQuota(out)
+        self.assertEqual(out.splitlines()[0], "CODEX_QUOTA_LIMITED")   # strict-consumer marker first
+        self.assertIn("rate-limited", out)
+        self.assertIn("quota_limited=1", out)
+
+    def test_real_review_with_newer_quota_is_still_actionable(self):
+        # a genuine review followed by a NEWER quota notice must not be hidden -> still actionable,
+        # and quota is still signalled so a scheduler knows Codex is now rate-limited.
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        _, out, _ = self.run_watch(
+            prs,
+            reviews_by_pr={1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]},
+            comments_by_pr={1: [codex_quota("2026-01-04T00:00:00Z", "p1#q1")]})
+        self.assertActionable(out, 1)
+        self.assertIn("rate-limited", out)
+
+    def test_quota_then_real_review_becomes_actionable(self):
+        # the quota notice is never recorded as 'seen', so a later real review is detected as new
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        _, out1, _ = self.run_watch(prs, comments_by_pr={1: [codex_quota("2026-01-03T00:00:00Z", "p1#q1")]})
+        self.assertQuota(out1)
+        _, out2, _ = self.run_watch(
+            prs,
+            comments_by_pr={1: [codex_quota("2026-01-03T00:00:00Z", "p1#q1")]},
+            reviews_by_pr={1: [codex_review("2026-01-05T00:00:00Z", "p1#r1")]})
+        self.assertActionable(out2, 1)
+
+    def test_spoofy_quota_author_ignored(self):
+        # a non-trusted login posting the quota text is ignored entirely (not even a quota signal)
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        _, out, _ = self.run_watch(
+            prs, comments_by_pr={1: [codex_quota("2026-01-03T00:00:00Z", "p1#q1", login="codex-fan")]})
+        self.assertNoNew(out)
+
+    def test_json_includes_quota_limited(self):
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        _, out, _ = self.run_watch(prs, comments_by_pr={1: [codex_quota("2026-01-03T00:00:00Z", "p1#q1")]},
+                                   as_json=True)
+        lines = out.splitlines()
+        start = max(i for i, ln in enumerate(lines) if ln == "{")
+        data = json.loads("\n".join(lines[start:]))
+        self.assertEqual(data["marker"], "CODEX_QUOTA_LIMITED")
+        self.assertEqual(data["quota_limited"], [1])
+        self.assertEqual(data["actionable"], [])
 
     def test_corrupt_nested_seen_file_degrades_without_crashing(self):
         # spec: a corrupt seen file degrades to {} (never crashes) — including PARTIAL/legacy slices

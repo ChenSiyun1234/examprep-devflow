@@ -197,6 +197,16 @@ def is_codex_author(login: Optional[str]) -> bool:
     return bool(login) and login.strip().lower() in _TRUSTED_CODEX_LOGINS
 
 
+def is_codex_quota_notice(body: Optional[str]) -> bool:
+    """True if a trusted-Codex message is the "you've hit your usage limits" rate-limit notice
+    (e.g. "You have reached your Codex usage limits for code reviews."). This is NOT a review:
+    callers must not treat it as actionable, and can use it to back off. Matched precisely (the
+    limit phrase AND a code-review/codex context) so a real finding that merely mentions a "usage
+    limit" in the code under review isn't misread as rate-limiting."""
+    t = (body or "").lower()
+    return "usage limit" in t and ("code review" in t or "codex" in t)
+
+
 # Tie-break for "latest" when GitHub's 1-second timestamps collide (Codex posts a review plus
 # several review-comments in the same second). A higher rank + url makes a *new* same-second signal
 # win the tie so dedupe keys advance and the new feedback is not silently swallowed.
@@ -351,15 +361,37 @@ class ReadOnlyGitHub:
             return None
         # tie-break same-second signals by (timestamp, source rank, url) so a brand-new review
         # posted in the same second as a seen comment is still picked as "latest" (see watcher dedupe)
-        latest = max(candidates, key=lambda c: (c.get("created_at") or "",
-                                                _CODEX_SOURCE_RANK.get(c.get("source"), 0),
-                                                c.get("url") or ""))
+        def _key(c):
+            return (c.get("created_at") or "",
+                    _CODEX_SOURCE_RANK.get(c.get("source"), 0),
+                    c.get("url") or "")
+        # A Codex "usage limits" notice is rate-limiting, NOT a review. Detect whether the OVERALL
+        # latest signal is that notice (so callers can back off), but base the actual review verdict
+        # on the latest NON-quota signal — so a freshly-posted-then-rate-limited review isn't hidden,
+        # and a bare quota notice is never mis-parsed as a verdict.
+        quota_active = is_codex_quota_notice(max(candidates, key=_key).get("body"))
+        real = [c for c in candidates if not is_codex_quota_notice(c.get("body"))]
+        if not real:
+            overall = max(candidates, key=_key)   # only quota notices from Codex -> signal, no review
+            return {
+                "source": overall["source"],
+                "pr_number": int(pr_number),
+                "author": overall["author"],
+                "created_at": overall["created_at"],
+                "url": overall.get("url"),
+                "quota_limited": True,
+                "has_review": False,
+                "blocking": None,
+                "items": [],
+                "body": overall.get("body") or "",
+            }
+        latest = max(real, key=_key)
         packet = parse_review_packet(latest["body"], latest.get("state"))  # default: latest item's verdict
         # Reconcile with terminal review states:
         #  - a CHANGES_REQUESTED review stays in effect until a *newer* APPROVED clears it;
         #  - an APPROVED clears blocking only if it's the most recent signal — a newer plain comment
         #    with blocking language still counts (don't let an old approval hide it).
-        stateful = [c for c in candidates if (c.get("state") or "").upper() in
+        stateful = [c for c in real if (c.get("state") or "").upper() in
                     ("CHANGES_REQUESTED", "APPROVED")]
         if stateful:
             newest_sf = max(stateful, key=lambda c: c.get("created_at") or "")
@@ -375,6 +407,8 @@ class ReadOnlyGitHub:
             "author": latest["author"],
             "created_at": latest["created_at"],
             "url": latest.get("url"),
+            "quota_limited": quota_active,
+            "has_review": True,
             **packet,
         }
 

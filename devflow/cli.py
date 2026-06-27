@@ -375,7 +375,8 @@ def _save_codex_seen(path: str, data: dict) -> None:
 def cmd_watch_codex_reviews(args) -> int:
     """Read-only: scan OPEN PRs for NEW trusted-Codex reviews/comments, deduped against a local
     seen file. Prints ACTIONABLE_CODEX_REVIEWS (with details) if anything is new, else
-    NO_NEW_CODEX_REVIEWS. Never edits code, comments, commits, pushes, or merges."""
+    CODEX_QUOTA_LIMITED if Codex is only returning rate-limit notices (so a scheduler can back off),
+    else NO_NEW_CODEX_REVIEWS. Never edits code, comments, commits, pushes, or merges."""
     rc = _require_gh()
     if rc:
         return rc
@@ -391,7 +392,7 @@ def cmd_watch_codex_reviews(args) -> int:
     seen = _load_codex_seen(seen_path)
     # --reset / --init start THIS repo's slice fresh, but never clobber other repos in the file.
     repo_seen = {} if (args.reset or args.init) else dict(seen.get(repo, {}))
-    actionable, checked, errors = [], [], []
+    actionable, checked, errors, quota_prs = [], [], [], []
 
     for pr in prs:
         num = pr.get("number")
@@ -405,6 +406,10 @@ def cmd_watch_codex_reviews(args) -> int:
             continue
         if not review:
             continue
+        if review.get("quota_limited"):                 # Codex code review is rate-limited on this PR
+            quota_prs.append(num)
+        if not review.get("has_review", True):
+            continue                                    # a bare quota notice is not an actionable review
         # dedupe key = the latest Codex item's (created_at, url). New iff it differs from last seen.
         key = f"{review.get('created_at') or ''}|{review.get('url') or ''}"
         entry = {"key": key, "created_at": review.get("created_at"),
@@ -428,12 +433,18 @@ def cmd_watch_codex_reviews(args) -> int:
     # Marker FIRST (a bare line) so strict consumers can match it; human details + optional JSON
     # follow. ACTIONABLE/NO_NEW is carried by this string, NOT the exit code (exit stays 0 like
     # read-pr, unless --exit-actionable is requested).
-    marker = "ACTIONABLE_CODEX_REVIEWS" if actionable else "NO_NEW_CODEX_REVIEWS"
+    # Precedence: real new feedback to act on > rate-limited (back off) > nothing new.
+    marker = ("ACTIONABLE_CODEX_REVIEWS" if actionable
+              else "CODEX_QUOTA_LIMITED" if quota_prs
+              else "NO_NEW_CODEX_REVIEWS")
     print(marker)
     print(f"[watch-codex] repo={repo} open_prs={len(prs)} checked={len(checked)} "
-          f"new={len(actionable)} (read-only; seen={seen_path})")
+          f"new={len(actionable)} quota_limited={len(quota_prs)} (read-only; seen={seen_path})")
     for e_num, e_msg in errors:
         print(f"  ! PR #{e_num}: gh error: {e_msg}")
+    if quota_prs:
+        print("Codex code review is rate-limited (usage limits) on PR(s): "
+              + ", ".join(f"#{n}" for n in quota_prs) + " — back off and retry later.")
     if actionable:
         print("PRs with new Codex feedback: " + ", ".join(f"#{a['pr']}" for a in actionable))
         for a in actionable:
@@ -456,6 +467,7 @@ def cmd_watch_codex_reviews(args) -> int:
                             "created_at": a["review"].get("created_at"),
                             "url": a["review"].get("url"),
                             "blocking": a["review"].get("blocking")} for a in actionable],
+            "quota_limited": quota_prs,
             "errors": [{"pr": n, "error": m} for n, m in errors],
             "marker": marker,
         }, ensure_ascii=False, indent=2))
