@@ -226,6 +226,18 @@ class TestBuildManualPacket(unittest.TestCase):
         self.assertNotIn("PRs are allowed here", p["safety_boundaries"])
         self.assertTrue(any("PRs are allowed here" in s for s in p["implementation_instructions"]["out_of_scope"]))
 
+    def test_inflected_permissive_rules_quarantined(self):
+        # inflected/plural protected verbs must be caught ('commits/pushes/merging'), not just bare forms (Codex r3)
+        for rule in ("commits are allowed", "you can push changes", "merging is fine", "deletes are ok to do"):
+            p = build_manual_packet("t", "x", "o/r", "T0", {"approved_scope": ["do x"], "safety": [rule]})
+            self.assertNotIn(rule, p["safety_boundaries"], rule)
+            self.assertTrue(any(rule in s for s in p["implementation_instructions"]["out_of_scope"]), rule)
+        # ...but a legit RESTRICTION mentioning the same words is kept (no permissive verb)
+        keep = build_manual_packet("t", "x", "o/r", "T0",
+                                   {"approved_scope": ["do x"], "safety": ["no branch deletion", "no secrets"]})
+        self.assertIn("no branch deletion", keep["safety_boundaries"])
+        self.assertIn("no secrets", keep["safety_boundaries"])
+
     def test_repo_root_dot_path_rejected(self):
         # '.' / './' (whole-repo) targets must be quarantined, not just '..' (Codex r2)
         ii = build_manual_packet("t", "x", "o/r", "T0",

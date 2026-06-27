@@ -393,21 +393,23 @@ _SAFETY_PERMISSIVE = (
     "enable", "permit", "permitted", "ignore", "skip", "disable", "override", "no need",
     "feel free", "you can", "it's ok", "without restriction", "go ahead",
 )
-_SAFETY_PROTECTED = (
-    "commit", "push", "merge", "branch", "force-push", "force push", "secret", "api key", "token",
-    "destructive", "shell", "delete", "pr", "prs", "pull request", "pull-request",
-    "pull requests", "pull-requests",
-)
+# Protected git/PR/secret actions, with common INFLECTIONS (commit/commits/committed/committing,
+# push/pushes, merge/merging, PR/PRs, …) — a permissive rule mentioning any of these would weaken a
+# hard boundary. Inflection-aware so "commits are allowed" / "pushes are fine" are caught, not just
+# the bare singular.
+_SAFETY_PROTECTED_RE = re.compile(
+    r"\b(commit(s|ted|ting)?|push(es|ed|ing)?|merg(e|es|ed|ing)|branch(es)?|delet(e|es|ed|ing)|"
+    r"force[-\s]?push(es|ed|ing)?|secrets?|api[-\s]?keys?|tokens?|destructive|shell|"
+    r"prs?|pull[-\s]?requests?)\b", re.I)
 
 
 def _scope_safety_rule_conflicts(rule) -> bool:
     """True if a scope-file safety rule appears to PERMIT/relax a hard prohibition (so it must not be
     appended to the canonical boundaries). Conservative: a borderline rule is quarantined, not admitted.
-    Protected tokens match on WORD BOUNDARIES so plural/punctuated forms ('PRs', 'PRs.') are caught."""
+    Protected actions match common inflections ('commit/commits/committing', 'push/pushes', 'PRs'…)."""
     low = str(rule).lower()
     permissive = any(w in (" " + low + " ") for w in _SAFETY_PERMISSIVE)
-    protected = any(re.search(r"\b" + re.escape(x) + r"\b", low) for x in _SAFETY_PROTECTED)
-    return permissive and protected
+    return permissive and bool(_SAFETY_PROTECTED_RE.search(low))
 
 
 # A task line that IS itself a prohibited git/PR action (e.g. "merge the PR", "git push",
