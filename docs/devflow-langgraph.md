@@ -298,14 +298,15 @@ Codex advisory/review → devflow summarizes → human approves → devflow expo
 
 ```bash
 python -m devflow.cli run    --task docs-advisory --thread-id demo --pause-at advisory  # writes a checkpoint
-python -m devflow.cli export-implementation-packet --thread-id demo [--gate advisory] [--decision approved]
+python -m devflow.cli export-implementation-packet --thread-id demo --decision <approved|rejected> [--gate advisory]
 ```
 
 `export-implementation-packet` loads the thread's **checkpoint** (which exists precisely when the run
 is paused at a gate), builds the packet from that state, and writes two files. It deliberately does
 **not** run the graph, add a graph node, call `gh`, or edit code — so the handoff is fully decoupled
 from the workflow and has no side effects beyond the two local files. The gate defaults to the
-thread's `paused_at_gate`; `--decision` defaults to `approved`.
+thread's `paused_at_gate`; `--decision` is **required** (`approved` or `rejected`) — there is no
+silent default, so an approval is never inferred.
 
 **Output (local tool-state, gitignored — never tracked):**
 

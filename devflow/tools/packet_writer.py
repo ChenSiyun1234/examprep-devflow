@@ -70,6 +70,47 @@ def _fmt_comment(c) -> str:
     return str(c)
 
 
+def _strip_unsafe_path_prefix(text: str) -> str:
+    """Real Codex bullets often carry the location inside the note text as ``PATH: detail``. If that
+    leading PATH is unsafe (absolute / drive / ``..`` / ``~`` / env / ``.``), drop it so the task
+    text can't direct edits outside the repo; a benign or safe-path note is returned unchanged."""
+    # A Windows drive path has a colon at index 1 ("C:\dir") that is NOT the "PATH: detail" delimiter
+    # — skip it so the bare-colon fallback doesn't split the head down to just "C".
+    drive = len(text) >= 3 and text[0].isalpha() and text[1] == ":" and text[2] in "\\/"
+    # Try ": " (colon-space) FIRST, then a bare ":" for the "PATH:detail" (no-space) shape.
+    for sep_str in (": ", ":"):
+        start = 2 if (drive and sep_str == ":") else 0
+        idx = text.find(sep_str, start)
+        if idx != -1:
+            head, rest = text[:idx], text[idx + len(sep_str):]
+            if rest.strip():
+                h = head.strip()
+                looks_path = ("/" in h or "\\" in h or h.startswith(("~", ".", "$", "%"))
+                              or "$" in h or "%" in h or (len(h) >= 2 and h[1] == ":"))
+                if looks_path and not _is_safe_rel_path(h):
+                    return rest.strip()
+    return text
+
+
+def _fmt_comment_task(c) -> str:
+    """Format a review comment for a TASK / approved-scope line — like :func:`_fmt_comment` but it
+    NEVER surfaces an unsafe (absolute / ``..`` / ``~`` / ``.``) path as an edit target, whether the
+    path is in the structured ``path`` field OR embedded as a ``PATH: detail`` prefix in the note."""
+    if isinstance(c, dict):
+        path = c.get("path")
+        note = c.get("note") or c.get("body") or c.get("summary")
+        safe = isinstance(path, str) and _is_safe_rel_path(path)
+        if safe and note:
+            # sanitize the note too — an unsafe "PATH: detail" can be smuggled inside a safe-path note
+            return f"{path}: {_strip_unsafe_path_prefix(str(note))}"
+        if note:
+            return _strip_unsafe_path_prefix(str(note))   # drop an unsafe path embedded in the note
+        if safe:
+            return path
+        return "(review comment)"                 # no safe path, no note -> never echo a bad path
+    return _strip_unsafe_path_prefix(str(c))       # string item -> same unsafe-prefix stripping
+
+
 def _as_list(v) -> list:
     """Coerce a checkpoint field to a list — defensively, since the checkpoint is on-disk state
     that may be hand-edited/legacy/corrupt. Only real sequences pass through; anything else -> []."""
@@ -126,31 +167,49 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
     deferred = _as_list(state.get("deferred_followups"))
     is_rejection = str(decision).lower() == "rejected"
 
-    steps = _as_list(advisory.get("recommended_steps"))
+    # advisory steps/summary are UNTRUSTED checkpoint content too — sanitize any embedded unsafe path
+    # prefix here, at the source, so every downstream use (approved_scope/tasks/fallback) is clean.
+    steps = [_strip_unsafe_path_prefix(str(s)) for s in _as_list(advisory.get("recommended_steps"))]
     summary = advisory.get("summary") if isinstance(advisory.get("summary"), str) else None
+    if summary:
+        summary = _strip_unsafe_path_prefix(summary)
+
+    # Blocking comments are actionable ONLY at the blocking-fix gate. At the merge gate they are
+    # already-resolved history, and at the advisory gate they don't exist yet — turning them into
+    # tasks there would tell Claude Code to (re-)edit resolved/irrelevant findings (scope creep).
+    is_fix_gate = gate == "blocking_fix"
 
     # Approved scope: advisory steps (or, for a REAL advisory that only has a summary, the summary)
-    # at the advisory gate, plus any blocking fixes.
+    # at the advisory gate, plus the blocking fixes at the fix gate.
     approved_scope = []
     if gate == "advisory_implementation":
         approved_scope += steps or ([summary] if summary else [])
-    approved_scope += [f"fix: {_fmt_comment(c)}" for c in blocking]
+    if is_fix_gate:
+        approved_scope += [f"fix: {_fmt_comment_task(c)}" for c in blocking]
 
-    # Concrete tasks for Claude Code.
+    # Concrete tasks for Claude Code (unsafe paths are dropped from the task text by _fmt_comment_task).
     tasks = []
     if gate == "advisory_implementation":
         tasks += steps
-    tasks += [f"Address blocking review comment — {_fmt_comment(c)}" for c in blocking]
-    if not tasks and summary:
+    if is_fix_gate:
+        tasks += [f"Address blocking review comment — {_fmt_comment_task(c)}" for c in blocking]
+    # Summary fallback ONLY at the advisory gate — a merge-gate (or fix-gate-with-no-blocking) packet
+    # must not turn the carried advisory summary into "go implement this" (merge approves no new work).
+    if gate == "advisory_implementation" and not tasks and summary:
         tasks = [summary]
 
-    # Best-effort: only file-scoped comments contribute paths (real Codex comments are often not
-    # file-scoped, so this list can legitimately be empty). These paths come from UNTRUSTED Codex
-    # content, so absolute paths and `..` traversal are rejected — the packet must never direct
-    # edits outside the repo. Rejected paths are surfaced in out-of-scope, not silently dropped.
-    raw_files = [c["path"] for c in (blocking + non_blocking)
-                 if isinstance(c, dict) and isinstance(c.get("path"), str)]
-    raw_files += [str(f) for f in _as_list(advisory.get("files"))]
+    # files_likely_touched = edit targets. Only the (fix-gate) blocking comments + an advisory's own
+    # file list contribute — NOT non-blocking comments (those are optional/out-of-scope). These paths
+    # come from UNTRUSTED Codex content, so absolute paths and `..` traversal are rejected; rejected
+    # paths are surfaced in out-of-scope, not silently dropped.
+    raw_files = []
+    if is_fix_gate:
+        raw_files += [c["path"] for c in blocking
+                      if isinstance(c, dict) and isinstance(c.get("path"), str)]
+    # advisory's own file list belongs ONLY to the advisory gate — at the merge gate (which approves
+    # no new work) it would wrongly present edit targets. Only accept STRING entries (no str()-coerce).
+    if gate == "advisory_implementation":
+        raw_files += [f for f in _as_list(advisory.get("files")) if isinstance(f, str)]
     files = sorted({p for p in raw_files if _is_safe_rel_path(p)})
     unsafe_files = sorted({p for p in raw_files if not _is_safe_rel_path(p)})
 
@@ -163,7 +222,9 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
         "Unrelated refactors or formatting churn.",
     ]
 
-    tests = _as_list(state.get("checks_not_run")) or ["python -m unittest discover -s tests"]
+    # The runnable validation command — NOT the dry-run `checks_not_run` labels (e.g. "unit tests
+    # (dry-run: not executed)"), which are descriptive, not executable.
+    tests = ["python -m unittest discover -s tests"]
 
     rejected_or_deferred = [_fmt_comment(c) for c in deferred]
     for field, label in (("human_approval", "advisory"), ("fix_approval", "fix"),
@@ -294,14 +355,40 @@ def write_packet(base_dir: str, thread_id: str, packet: dict,
     """
     slug = safe_thread_slug(thread_id)
     pkt_dir = os.path.join(base_dir, slug)
-    # Refuse a pre-existing symlinked packet dir (or output base): os.makedirs(exist_ok=True) would
-    # happily follow it and write the packet outside the intended tool-state location.
-    for p in (base_dir, pkt_dir):
-        if os.path.islink(p):
-            raise PacketError(f"refusing to write into a symlinked path: {p}")
-    os.makedirs(pkt_dir, exist_ok=True)
+    # Refuse a symlinked packet dir, output base, OR any ANCESTOR component of a relative base (e.g. a
+    # stale `.devflow -> .`): os.makedirs(exist_ok=True) would follow such a symlink and write the
+    # packet outside the intended tool-state location. For a relative base we walk its ancestors up to
+    # the cwd; for an explicit absolute --out-dir we trust the user's chosen location (check it + slug).
+    # Refuse a symlink at the packet dir, the output base, OR any ancestor — relative (up to its top
+    # component, e.g. a stale `.devflow -> .`) AND absolute (up to the filesystem anchor, e.g. a
+    # symlinked parent of an explicit --out-dir). os.makedirs(exist_ok=True) would follow such a
+    # symlink and write the packet outside the intended tool-state location.
+    anc = pkt_dir
+    while anc:
+        if os.path.islink(anc):
+            raise PacketError(f"refusing to write under a symlinked path component: {anc}")
+        parent = os.path.dirname(anc)
+        if parent == anc:        # reached an absolute anchor ("/" or "C:\\")
+            break
+        anc = parent
+    # a regular file at the packet dir (or a file as an ancestor) makes os.makedirs raise
+    # FileExistsError/NotADirectoryError — which cmd_export only catches as PacketError. Surface the
+    # clean refusal instead of an uncaught traceback.
+    try:
+        os.makedirs(pkt_dir, exist_ok=True)
+    except (FileExistsError, NotADirectoryError) as e:
+        raise PacketError(f"refusing to write: a path component is a regular file, not a directory: {pkt_dir}") from e
     json_path = os.path.join(pkt_dir, PACKET_JSON_NAME)
     md_path = os.path.join(pkt_dir, PACKET_MD_NAME)
+    # ...and refuse if either packet FILE is itself a symlink — open(..., "w") would follow it and
+    # could overwrite a tracked repo file (or any writable path) on a repeated export.
+    for p in (json_path, md_path):
+        if os.path.islink(p):
+            raise PacketError(f"refusing to overwrite a symlinked packet file: {p}")
+        # refuse a hard-linked or non-regular existing target — open(w) would truncate the shared
+        # inode (e.g. a hard link to a tracked file), writing through to it.
+        if os.path.exists(p) and (not os.path.isfile(p) or os.stat(p).st_nlink > 1):
+            raise PacketError(f"refusing to overwrite a hard-linked or non-regular packet file: {p}")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(packet, f, ensure_ascii=False, indent=2)
     with open(md_path, "w", encoding="utf-8") as f:
