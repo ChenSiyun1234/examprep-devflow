@@ -47,7 +47,7 @@ def codex_quota(created_at, url, login=CODEX):
 
 
 def make_fake_gh(open_prs, reviews_by_pr=None, comments_by_pr=None, review_comments_by_pr=None,
-                 error_prs=(), auth_ok=True, recorder=None):
+                 error_prs=(), auth_ok=True, recorder=None, repo_name="o/r"):
     reviews_by_pr = reviews_by_pr or {}
     comments_by_pr = comments_by_pr or {}
     review_comments_by_pr = review_comments_by_pr or {}
@@ -62,7 +62,7 @@ def make_fake_gh(open_prs, reviews_by_pr=None, comments_by_pr=None, review_comme
                                    stdout="Logged in to github.com account TESTER" if auth_ok else "",
                                    stderr="" if auth_ok else "You are not logged into any GitHub hosts.")
         if args[:2] == ["repo", "view"]:
-            return SimpleNamespace(returncode=0, stdout=json.dumps({"nameWithOwner": "o/r"}), stderr="")
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"nameWithOwner": repo_name}), stderr="")
         if args[:2] == ["pr", "list"]:
             return SimpleNamespace(returncode=0, stdout=json.dumps(open_prs), stderr="")
         if args and args[0] == "api":
@@ -95,10 +95,10 @@ class WatchCodexBase(unittest.TestCase):
 
     def run_watch(self, open_prs, reviews_by_pr=None, comments_by_pr=None, review_comments_by_pr=None,
                   error_prs=(), reset=False, init=False, as_json=False, exit_actionable=False,
-                  limit=50, auth_ok=True, repo="o/r"):
+                  limit=50, auth_ok=True, repo="o/r", repo_name="o/r"):
         recorder = []
         fake = make_fake_gh(open_prs, reviews_by_pr, comments_by_pr, review_comments_by_pr,
-                            error_prs=error_prs, auth_ok=auth_ok, recorder=recorder)
+                            error_prs=error_prs, auth_ok=auth_ok, recorder=recorder, repo_name=repo_name)
         args = SimpleNamespace(repo=repo, seen_file=self.seen, limit=limit, reset=reset,
                                init=init, json=as_json, exit_actionable=exit_actionable,
                                body_chars=600)
@@ -204,6 +204,52 @@ class TestWatchCodexBehavior(WatchCodexBase):
         _, out, _ = self.run_watch(prs, reviews_by_pr=reviews, error_prs={1})
         self.assertIn("! PR #1", out)        # PR 1 errored but was reported, not fatal
         self.assertActionable(out, 2)        # PR 2 still processed
+
+    def test_incomplete_marker_on_partial_failure(self):
+        # a read failure with no actionable feedback must NOT surface as a clean NO_NEW (Codex r1 #3)
+        prs = [{"number": 1, "title": "A", "updatedAt": "z", "url": "p1"}]
+        rc, out, _ = self.run_watch(prs, error_prs={1})
+        self.assertIn("CODEX_WATCH_INCOMPLETE", out)
+        self.assertNotIn("NO_NEW_CODEX_REVIEWS", out)
+        self.assertEqual(out.splitlines()[0], "CODEX_WATCH_INCOMPLETE")
+        self.assertIn("! PR #1", out)
+
+    def test_init_surfaces_errored_prs_not_baselined(self):
+        # --init must report PRs it could NOT baseline (else the next poll re-alerts on them) (Codex r1 #3)
+        prs = [{"number": 1, "title": "A", "updatedAt": "z", "url": "p1"},
+               {"number": 2, "title": "B", "updatedAt": "z", "url": "p2"}]
+        rc, out, _ = self.run_watch(prs, reviews_by_pr={2: [codex_review("2026-01-03T00:00:00Z", "p2#r1")]},
+                                    error_prs={1}, init=True)
+        self.assertEqual(rc, 0)
+        self.assertIn("! PR #1", out)
+        self.assertIn("NOT baselined", out)
+
+    def test_same_second_lower_ranked_comment_re_alerts(self):
+        # a newly-visible inline comment sharing the review's 1s timestamp changes the dedupe key (Codex r1 #3)
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        T = "2026-01-03T00:00:00Z"
+        self.run_watch(prs, reviews_by_pr={1: [codex_review(T, "p1#r1")]})              # baseline: review only
+        _, out, _ = self.run_watch(                                                      # +inline comment, same second
+            prs, reviews_by_pr={1: [codex_review(T, "p1#r1")]},
+            review_comments_by_pr={1: [codex_comment(T, "p1#rc1")]})
+        self.assertActionable(out, 1)        # the same-second lower-ranked comment is not swallowed
+
+    def test_seen_key_is_case_normalized(self):
+        # different --repo casings map to ONE seen slice (GitHub repos are case-insensitive) (Codex r1 #3)
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        reviews = {1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]}
+        self.run_watch(prs, reviews_by_pr=reviews, repo="Owner/Repo")                   # prime under mixed case
+        with open(self.seen, encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertIn("owner/repo", saved)   # stored lowercased
+        _, out2, _ = self.run_watch(prs, reviews_by_pr=reviews, repo="owner/repo")       # other casing
+        self.assertNoNew(out2)               # already-seen under the normalized key, not re-alerted
+
+    def test_save_seen_is_atomic_no_tmp_leftover(self):
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        self.run_watch(prs, reviews_by_pr={1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]})
+        leftovers = [f for f in os.listdir(self.dir) if f.endswith(".tmp")]
+        self.assertEqual(leftovers, [])      # temp file was os.replace'd into place, none left behind
 
     def test_gh_unauthenticated_returns_nonzero(self):
         rc, out, _ = self.run_watch([{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}],

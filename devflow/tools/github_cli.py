@@ -408,6 +408,12 @@ class ReadOnlyGitHub:
             return (c.get("created_at") or "",
                     _CODEX_SOURCE_RANK.get(c.get("source"), 0),
                     c.get("url") or "")
+        # Dedupe key for the watcher: cover ALL Codex signals sharing the latest timestamp (not just
+        # the single highest-ranked one), so a newly-visible same-second lower-ranked comment changes
+        # the key and is not silently swallowed under GitHub's eventual consistency.
+        _max_ts = max((c.get("created_at") or "") for c in candidates)
+        dedupe_key = _max_ts + "|" + ",".join(sorted(
+            (c.get("url") or "") for c in candidates if (c.get("created_at") or "") == _max_ts))
         # A Codex "usage limits" notice is rate-limiting, NOT a review. Detect whether the OVERALL
         # latest signal is that notice (so callers can back off), but base the actual review verdict
         # on the latest NON-quota signal — so a freshly-posted-then-rate-limited review isn't hidden,
@@ -422,6 +428,7 @@ class ReadOnlyGitHub:
                 "author": overall["author"],
                 "created_at": overall["created_at"],
                 "url": overall.get("url"),
+                "dedupe_key": dedupe_key,
                 "quota_limited": True,
                 "has_review": False,
                 "blocking": None,
@@ -450,6 +457,7 @@ class ReadOnlyGitHub:
             "author": latest["author"],
             "created_at": latest["created_at"],
             "url": latest.get("url"),
+            "dedupe_key": dedupe_key,
             "quota_limited": quota_active,
             "has_review": True,
             **packet,
