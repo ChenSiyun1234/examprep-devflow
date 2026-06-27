@@ -31,7 +31,8 @@ NODE_FUNCS: dict[str, Callable] = {
     "request_codex_advisory": N.request_codex_advisory,
     "wait_for_codex_advisory": N.wait_for_codex_advisory,
     "summarize_advisory": N.summarize_advisory,
-    "human_approval": N.human_approval,
+    # node name must differ from the state key "human_approval" (LangGraph forbids node==channel)
+    "human_approval_gate": N.human_approval,
     "apply_approved_changes": N.apply_approved_changes,
     "run_checks": N.run_checks,
     "commit_push_branch": N.commit_push_branch,
@@ -55,7 +56,7 @@ LINEAR_NEXT: dict[str, str] = {
     "check_environment": "create_advisory_issue",
     "create_advisory_issue": "request_codex_advisory",
     "request_codex_advisory": "wait_for_codex_advisory",
-    "summarize_advisory": "human_approval",
+    "summarize_advisory": "human_approval_gate",
     "apply_approved_changes": "run_checks",
     "run_checks": "commit_push_branch",
     "commit_push_branch": "create_draft_pr",
@@ -100,7 +101,7 @@ def route_after_merge_approval(s: DevflowState) -> str:
 
 ROUTERS: dict[str, Callable[[DevflowState], str]] = {
     "wait_for_codex_advisory": route_after_advisory_wait,
-    "human_approval": route_after_human_approval,
+    "human_approval_gate": route_after_human_approval,
     "wait_for_codex_review": route_after_review_wait,
     "summarize_review": route_after_summarize_review,
     "human_fix_approval": route_after_fix_approval,
@@ -109,7 +110,7 @@ ROUTERS: dict[str, Callable[[DevflowState], str]] = {
 }
 
 GATE_TO_NODE = {
-    GATE_ADVISORY: "human_approval",
+    GATE_ADVISORY: "human_approval_gate",
     GATE_FIX: "human_fix_approval",
     GATE_MERGE: "human_merge_approval",
 }
@@ -171,9 +172,13 @@ class FallbackApp:
 # ======================================================================================
 # LangGraph backend (used only if langgraph is installed)
 # ======================================================================================
-def _build_langgraph_app():  # pragma: no cover - exercised only when langgraph is installed
+def _build_state_graph():  # pragma: no cover - needs langgraph installed
+    """Construct the devflow ``StateGraph`` (nodes + edges) WITHOUT compiling it.
+
+    Shared by the CLI's compiled app and the Studio entry point. Importing this module never calls
+    this — langgraph is imported lazily here, so the stdlib fallback path has no dependency on it.
+    """
     from langgraph.graph import StateGraph, START, END as LG_END
-    from langgraph.checkpoint.memory import MemorySaver
 
     g = StateGraph(DevflowState)
     for name, func in NODE_FUNCS.items():
@@ -185,14 +190,21 @@ def _build_langgraph_app():  # pragma: no cover - exercised only when langgraph 
         # map router outputs to themselves; END handled via post_merge_report -> LG_END edge
         targets = sorted({router_target for router_target in _router_targets(src)})
         g.add_conditional_edges(src, router, {t: t for t in targets})
-    return g.compile(checkpointer=MemorySaver())
+    return g
+
+
+def _build_langgraph_app():  # pragma: no cover - exercised only when langgraph is installed
+    """Compile the StateGraph for the CLI's own use (with an in-process MemorySaver)."""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    return _build_state_graph().compile(checkpointer=MemorySaver())
 
 
 def _router_targets(src: str) -> list[str]:
     # the set of nodes a router can return (kept explicit for the conditional-edge map)
     return {
         "wait_for_codex_advisory": ["summarize_advisory", "post_merge_report"],
-        "human_approval": ["apply_approved_changes", "post_merge_report"],
+        "human_approval_gate": ["apply_approved_changes", "post_merge_report"],
         "wait_for_codex_review": ["summarize_review", "post_merge_report"],
         "summarize_review": ["human_fix_approval", "merge_readiness"],
         "human_fix_approval": ["fix_blocking_comments", "post_merge_report"],
@@ -209,6 +221,24 @@ def build_graph(prefer_fallback: bool = False):
     """
     if HAS_LANGGRAPH and not prefer_fallback:  # pragma: no cover
         app = _build_langgraph_app()
-        app.backend = "langgraph"
+        try:
+            app.backend = "langgraph"
+        except (AttributeError, TypeError):  # compiled graph may disallow ad-hoc attributes
+            pass
         return app
     return FallbackApp()
+
+
+def make_graph():  # pragma: no cover - invoked by langgraph-cli / LangGraph Studio
+    """LangGraph Studio / ``langgraph dev`` entry point (declared in ``langgraph.json``).
+
+    Returns the **uncompiled** ``StateGraph`` so the LangGraph platform supplies its own
+    persistence — that is what lets Studio drive threads and surface the human-approval gates as
+    interrupts. The CLI is unaffected: it keeps using :func:`build_graph` / the stdlib fallback.
+
+    Importing :mod:`devflow.graph` never builds a graph or imports langgraph; only *calling* this
+    function does. (A module-level ``graph = build_graph(...)`` was deliberately NOT used: without
+    langgraph it would be the stdlib ``FallbackApp`` — not Studio-loadable — and it would build at
+    import time. A factory is the idiomatic, safe choice.)
+    """
+    return _build_state_graph()

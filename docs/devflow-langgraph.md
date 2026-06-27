@@ -75,6 +75,36 @@ real `StateGraph` does not drop them. An explicit `pause_at` always pauses its g
 approval was seeded. `merge_readiness` requires a **completed** (re-)review — never merge-ready while
 a re-review is only "requested".
 
+## LangGraph Studio
+
+`langgraph.json` (repo root) makes the graph loadable by `langgraph dev` / LangGraph Studio:
+
+```json
+{ "dependencies": ["."], "graphs": { "devflow": "./devflow/graph.py:make_graph" } }
+```
+
+`make_graph()` returns the **uncompiled** `StateGraph` (built by the shared `_build_state_graph()`),
+so the LangGraph platform attaches its own checkpointer — that's what lets Studio drive threads and
+render the approval gates as interrupts. Importing `devflow.graph` never builds a graph or imports
+langgraph (it's imported lazily inside the builder), so the stdlib fallback path is unaffected.
+
+Run it:
+
+```bash
+pip install -U "langgraph-cli[inmem]"
+pip install -r devflow/requirements-dev.txt   # or: pip install -e ".[studio]"
+langgraph dev
+```
+
+In Studio: the graph shows as `devflow`; all 20 nodes are inspectable; a thread can be run from an
+input state; unseeded human-approval gates pause as resumable interrupts (`human_approval_gate`,
+`human_fix_approval`, `human_merge_approval`); and the state channels are visible. It stays dry-run
+(no real GitHub writes) unless `real_github` is set.
+
+> **Node vs state-key naming.** LangGraph forbids a node name that equals a state channel, so the
+> advisory-approval node is registered as **`human_approval_gate`** (the state field stays
+> `human_approval`). This is asserted by a test so the graph keeps building under LangGraph/Studio.
+
 ## How human approval gates work
 
 There are three gates, each calling `request_human_decision(...)` **exactly once per node
