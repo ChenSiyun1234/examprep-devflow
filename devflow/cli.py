@@ -25,7 +25,7 @@ import os
 import sys
 import tempfile
 
-from devflow.graph import build_graph, GATE_TO_NODE
+from devflow.graph import build_graph, GATE_TO_NODE, NODE_FUNCS
 from devflow.state import (
     new_state, APPROVED, REJECTED, APPROVAL_GATES,
     GATE_ADVISORY, GATE_FIX, GATE_MERGE,
@@ -280,6 +280,8 @@ def cmd_resume(args) -> int:
             return 1
     state["real_github"] = want_live
     start = state.get("paused_at_node") or GATE_TO_NODE.get(gate)
+    if start not in NODE_FUNCS:        # a checkpoint written before a node was renamed stores a stale
+        start = GATE_TO_NODE.get(gate)  # node name -> fall back to the gate's canonical node (no KeyError)
     state["status"] = "running"
     app = build_graph(prefer_fallback=True)  # resume uses the stdlib runner's start_node support
     print(f"[devflow] resume thread={args.thread_id} gate={args.gate} decision={decision} "

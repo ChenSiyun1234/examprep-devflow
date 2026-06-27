@@ -80,6 +80,20 @@ class TestDevflowGraph(unittest.TestCase):
         self.assertEqual(resumed["status"], "done")
         self.assertIn("devflow dry-run report", resumed["final_report"])
 
+    def test_resume_tolerates_legacy_renamed_node(self):
+        # a checkpoint written before a node rename stores a stale paused_at_node -> stdlib resume
+        # must fall back to the gate's canonical node, not KeyError (Codex review on PR #1)
+        from devflow import cli
+        paused = run(approvals={})                        # real pause at the advisory gate
+        self.assertEqual(paused["status"], "paused")
+        paused["paused_at_node"] = "human_approval"        # the OLD (pre-rename) node name
+        paused["approvals"] = {}
+        cli._save_ckpt(paused)
+        args = cli.build_parser().parse_args(
+            ["resume", "--thread-id", paused["thread_id"], "--gate", "advisory", "--decision", "approved"])
+        rc = cli.cmd_resume(args)                           # must not raise KeyError
+        self.assertEqual(rc, 0)
+
     def test_advisory_timeout_safe_stop(self):
         s = run(simulate={"advisory": "timeout", "review": "blocking"})
         self.assertEqual(s["codex_advisory_status"], "timeout")
