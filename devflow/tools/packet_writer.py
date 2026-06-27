@@ -69,10 +69,24 @@ def _fmt_comment(c) -> str:
     return str(c)
 
 
+def _strip_unsafe_path_prefix(text: str) -> str:
+    """Real Codex bullets often carry the location inside the note text as ``PATH: detail``. If that
+    leading PATH is unsafe (absolute / drive / ``..`` / ``~`` / env / ``.``), drop it so the task
+    text can't direct edits outside the repo; a benign or safe-path note is returned unchanged."""
+    head, sep, rest = text.partition(": ")
+    if sep and rest.strip():
+        h = head.strip()
+        looks_path = ("/" in h or "\\" in h or h.startswith(("~", "."))
+                      or (len(h) >= 2 and h[1] == ":"))
+        if looks_path and not _is_safe_rel_path(h):
+            return rest.strip()
+    return text
+
+
 def _fmt_comment_task(c) -> str:
     """Format a review comment for a TASK / approved-scope line — like :func:`_fmt_comment` but it
-    NEVER surfaces an unsafe (absolute / ``..``) path as an edit target. An unsafe path is dropped
-    (the note is kept) so a task can't direct Claude Code outside the repo."""
+    NEVER surfaces an unsafe (absolute / ``..`` / ``~`` / ``.``) path as an edit target, whether the
+    path is in the structured ``path`` field OR embedded as a ``PATH: detail`` prefix in the note."""
     if isinstance(c, dict):
         path = c.get("path")
         note = c.get("note") or c.get("body") or c.get("summary")
@@ -80,7 +94,7 @@ def _fmt_comment_task(c) -> str:
         if safe and note:
             return f"{path}: {note}"
         if note:
-            return str(note)                      # drop the unsafe/missing path, keep the finding
+            return _strip_unsafe_path_prefix(str(note))   # drop an unsafe path embedded in the note
         if safe:
             return path
         return "(review comment)"                 # no safe path, no note -> never echo a bad path
@@ -109,7 +123,12 @@ def _is_safe_rel_path(p) -> bool:
         return False
     if len(q) >= 2 and q[1] == ":":               # Windows drive, e.g. C:/...
         return False
-    return not any(seg.strip() == ".." for seg in q.split("/"))
+    if q.startswith("~"):                         # home-relative, e.g. ~/.ssh/config
+        return False
+    if "$" in q or "%" in q:                      # env-rooted, e.g. $HOME/.gitconfig, %APPDATA%\...
+        return False
+    # reject ``..`` (traversal), ``.`` (current dir / whole repo), and empty (``//``) segments
+    return not any(seg.strip() in ("", "..", ".") for seg in q.split("/"))
 
 
 def _md_safe(s) -> str:
@@ -155,7 +174,9 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
         tasks += steps
     if is_fix_gate:
         tasks += [f"Address blocking review comment — {_fmt_comment_task(c)}" for c in blocking]
-    if not tasks and summary:
+    # Summary fallback ONLY at the advisory gate — a merge-gate (or fix-gate-with-no-blocking) packet
+    # must not turn the carried advisory summary into "go implement this" (merge approves no new work).
+    if gate == "advisory_implementation" and not tasks and summary:
         tasks = [summary]
 
     # files_likely_touched = edit targets. Only the (fix-gate) blocking comments + an advisory's own
@@ -166,7 +187,8 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
     if is_fix_gate:
         raw_files += [c["path"] for c in blocking
                       if isinstance(c, dict) and isinstance(c.get("path"), str)]
-    raw_files += [str(f) for f in _as_list(advisory.get("files"))]
+    # only accept STRING advisory files — never str()-coerce None/numbers/objects into fake paths
+    raw_files += [f for f in _as_list(advisory.get("files")) if isinstance(f, str)]
     files = sorted({p for p in raw_files if _is_safe_rel_path(p)})
     unsafe_files = sorted({p for p in raw_files if not _is_safe_rel_path(p)})
 
@@ -312,11 +334,19 @@ def write_packet(base_dir: str, thread_id: str, packet: dict,
     """
     slug = safe_thread_slug(thread_id)
     pkt_dir = os.path.join(base_dir, slug)
-    # Refuse a pre-existing symlinked output base or packet dir: os.makedirs(exist_ok=True) would
-    # happily follow it and write the packet outside the intended tool-state location.
-    for p in (base_dir, pkt_dir):
-        if os.path.islink(p):
-            raise PacketError(f"refusing to write into a symlinked path: {p}")
+    # Refuse a symlinked packet dir, output base, OR any ANCESTOR component of a relative base (e.g. a
+    # stale `.devflow -> .`): os.makedirs(exist_ok=True) would follow such a symlink and write the
+    # packet outside the intended tool-state location. For a relative base we walk its ancestors up to
+    # the cwd; for an explicit absolute --out-dir we trust the user's chosen location (check it + slug).
+    to_check = [pkt_dir, base_dir]
+    if not os.path.isabs(base_dir):
+        anc = os.path.dirname(os.path.normpath(base_dir))
+        while anc and anc != ".":
+            to_check.append(anc)
+            anc = os.path.dirname(anc)
+    for p in to_check:
+        if p and os.path.islink(p):
+            raise PacketError(f"refusing to write under a symlinked path component: {p}")
     os.makedirs(pkt_dir, exist_ok=True)
     json_path = os.path.join(pkt_dir, PACKET_JSON_NAME)
     md_path = os.path.join(pkt_dir, PACKET_MD_NAME)

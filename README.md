@@ -55,7 +55,7 @@ python -m devflow.cli run-docs-advisory --thread-id demo [--real-github --max-po
 
 # after approving a gate, export an Implementation Packet to hand off to Claude Code (local files only)
 python -m devflow.cli run --task docs-advisory --thread-id demo --pause-at advisory
-python -m devflow.cli export-implementation-packet --thread-id demo   # --gate/--decision optional
+python -m devflow.cli export-implementation-packet --thread-id demo --decision approved  # --gate optional
 ```
 
 ## Implementation Packet (handoff to Claude Code)
@@ -68,9 +68,9 @@ advisory/review is summarized and you approve a gate, devflow can export a struc
 > Claude Code implements the scoped changes → you review → PR / Codex review continues.
 
 ```bash
-# pause at a gate (writes a checkpoint), then export the packet
+# pause at a gate (writes a checkpoint), then export the packet (--decision is required)
 python -m devflow.cli run --task docs-advisory --thread-id demo --pause-at advisory
-python -m devflow.cli export-implementation-packet --thread-id demo
+python -m devflow.cli export-implementation-packet --thread-id demo --decision approved
 ```
 
 It writes two local files under a gitignored tool-state dir:

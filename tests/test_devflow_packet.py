@@ -167,6 +167,43 @@ class TestBuildPacket(unittest.TestCase):
         self.assertEqual(ii["tasks"], [])
         self.assertEqual(ii["files_likely_touched"], [])
 
+    def test_advisory_summary_not_a_task_at_merge_gate(self):
+        # the summary fallback must be advisory-gate only — a merge-gate packet authorizes no new work
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_MERGE,
+              "advisory_packet": {"summary": "Advisory: do a big refactor"}}
+        ii = build_packet(st, GATE_MERGE, "approved", "T0")["implementation_instructions"]
+        self.assertEqual(ii["tasks"], [])                      # NOT [summary]
+        # but at the advisory gate the same summary IS a task
+        ii2 = build_packet(st, GATE_ADVISORY, "approved", "T0")["implementation_instructions"]
+        self.assertIn("Advisory: do a big refactor", ii2["tasks"])
+
+    def test_note_embedded_unsafe_path_is_stripped(self):
+        # a Codex bullet stored entirely in `note` as "PATH: detail" must not leak an unsafe path
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [{"note": "/etc/passwd: rotate the creds"},
+                                    {"note": "../outside.py: patch it"},
+                                    {"note": "just fix the parser"}]}
+        joined = " ".join(build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]["tasks"])
+        self.assertIn("rotate the creds", joined)
+        self.assertNotIn("/etc/passwd", joined)
+        self.assertNotIn("../outside.py", joined)
+        self.assertIn("just fix the parser", joined)          # plain note untouched
+
+    def test_non_string_advisory_files_dropped(self):
+        # advisory_packet.files with non-string entries must not be str()-coerced into fake paths
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_ADVISORY,
+              "advisory_packet": {"summary": "s", "files": [None, 123, {"x": 1}, "devflow/ok.py"]}}
+        files = build_packet(st, GATE_ADVISORY, "approved", "T0")["implementation_instructions"]["files_likely_touched"]
+        self.assertEqual(files, ["devflow/ok.py"])
+
+    def test_pseudo_paths_rejected_from_files(self):
+        # '.', '~', and env-rooted paths must never be edit targets (Codex)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [{"path": ".", "note": "a"}, {"path": "~/.ssh/config", "note": "b"},
+                                    {"path": "$HOME/x", "note": "c"}, {"path": "devflow/ok.py", "note": "d"}]}
+        files = build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]["files_likely_touched"]
+        self.assertEqual(files, ["devflow/ok.py"])
+
     def test_non_blocking_paths_not_in_files(self):
         # non-blocking (optional) comment paths must not become edit targets (Codex #5)
         st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
@@ -268,6 +305,15 @@ class TestSafeThreadSlug(unittest.TestCase):
                 write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
         self.assertFalse(os.path.exists(json_path))          # nothing written through the symlink
 
+    def test_write_refuses_symlinked_ancestor(self):
+        # a symlinked ANCESTOR of a relative base (e.g. a stale `.devflow -> .`) must be refused too
+        from devflow.tools import packet_writer as P
+        base = os.path.join(".devflow", "packets")           # relative -> ancestors are walked
+        self.addCleanup(shutil.rmtree, ".devflow", ignore_errors=True)
+        with mock.patch.object(P.os.path, "islink", side_effect=lambda p: p == ".devflow"):
+            with self.assertRaises(PacketError):
+                write_packet(base, "demo", build_packet({}, GATE_ADVISORY, "approved", "T0"))
+
 
 class TestExportCli(unittest.TestCase):
 
@@ -326,6 +372,19 @@ class TestExportCli(unittest.TestCase):
     def test_parser_requires_thread_id(self):
         with self.assertRaises(SystemExit):
             cli.build_parser().parse_args(["export-implementation-packet"])
+
+    def test_parser_requires_decision(self):
+        # --decision has no silent default — it must be supplied explicitly (Codex)
+        with self.assertRaises(SystemExit):
+            cli.build_parser().parse_args(["export-implementation-packet", "--thread-id", "x"])
+
+    def test_gate_override_conflicting_with_checkpoint_returns_1(self):
+        # exporting with --gate that contradicts the thread's paused gate must be refused (Codex)
+        cli._save_ckpt(advisory_state(self.tid))  # paused_at_gate = advisory
+        self.addCleanup(lambda: os.path.exists(cli._ckpt_path(self.tid)) and os.remove(cli._ckpt_path(self.tid)))
+        rc = cli.cmd_export_implementation_packet(self._args(gate="fix"))  # conflict
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.out, safe_thread_slug(self.tid))))
 
     def test_cli_export_records_rejection(self):
         cli._save_ckpt(advisory_state(self.tid))

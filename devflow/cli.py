@@ -490,7 +490,19 @@ def cmd_export_implementation_packet(args) -> int:
               f"(got {type(state).__name__}); re-run a paused workflow to regenerate it.")
         return 1
 
-    gate = _GATE_ALIASES.get(args.gate) if args.gate else (state.get("paused_at_gate") or GATE_ADVISORY)
+    # If --gate is given, it must not contradict the gate the thread is actually paused at — otherwise
+    # a script/typo could mark fix/merge scope "approved" for a thread that only reached the advisory
+    # gate. Trust the checkpoint's paused_at_gate; refuse a conflicting override.
+    paused_gate = state.get("paused_at_gate")
+    if args.gate:
+        gate = _GATE_ALIASES[args.gate]
+        if paused_gate and gate != paused_gate:
+            alias = next((a for a, full in _GATE_ALIASES.items() if full == paused_gate), paused_gate)
+            print(f"[devflow] --gate {args.gate} conflicts with the thread's paused gate "
+                  f"'{paused_gate}' (it is paused at '{alias}'). Refusing; omit --gate or pass --gate {alias}.")
+            return 1
+    else:
+        gate = paused_gate or GATE_ADVISORY
     generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     packet = build_packet(state, gate=gate, decision=args.decision, generated_at=generated_at)
     out_dir = args.out_dir or PACKETS_DIR
@@ -636,8 +648,8 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--thread-id", required=True, help="thread id of a paused (checkpointed) run")
     ep.add_argument("--gate", choices=list(_GATE_ALIASES), default=None,
                     help="gate being approved (default: the thread's paused gate, else advisory)")
-    ep.add_argument("--decision", choices=[APPROVED, REJECTED], default=APPROVED,
-                    help="approval decision recorded in the packet (default: approved)")
+    ep.add_argument("--decision", choices=[APPROVED, REJECTED], required=True,
+                    help="REQUIRED — the human's decision recorded in the packet (no silent default)")
     ep.add_argument("--out-dir", default=None,
                     help="output base dir (default: .devflow/packets, which is gitignored)")
     ep.set_defaults(func=cmd_export_implementation_packet)
