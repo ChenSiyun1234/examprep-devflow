@@ -9,3 +9,7 @@
 #   pip install -r devflow/requirements-dev.txt
 
 langgraph>=0.2,<0.4
+# enables the LangGraph backend's durable, cross-process pause/resume
+# (`run --langgraph --pause-at ...` then `resume --langgraph`); without it the stdlib fallback
+# resume still works and the langgraph CLI prints an install hint.
+langgraph-checkpoint-sqlite>=2.0
