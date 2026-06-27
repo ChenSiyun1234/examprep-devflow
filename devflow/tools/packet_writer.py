@@ -92,6 +92,10 @@ def _is_safe_rel_path(p) -> bool:
         return False
     if len(q) >= 2 and q[1] == ":":               # Windows drive, e.g. C:/...
         return False
+    if q.startswith("~"):                         # home-relative, e.g. ~/.ssh/config
+        return False
+    if "$" in q or "%" in q:                      # env-rooted, e.g. $HOME/.gitconfig, %APPDATA%\...
+        return False
     return not any(seg.strip() == ".." for seg in q.split("/"))
 
 
@@ -358,6 +362,43 @@ def parse_scope_markdown(text: str) -> dict:
     return out
 
 
+# Allow-list of safe check-command prefixes. A manual scope's "# Checks to run" is promoted into the
+# packet's runnable instructions, so only well-known *validation* commands pass through verbatim; an
+# out-of-policy/destructive command (rm -rf, gh pr merge, git push, curl|sh, ...) is quarantined.
+_SAFE_CHECK_PREFIXES = (
+    "python -m ", "python3 -m ", "py -m ", "pytest", "py.test", "unittest",
+    "npm test", "npm run ", "yarn ", "pnpm ", "make ", "tox", "nox",
+    "ruff", "flake8", "pylint", "mypy", "black --check", "isort --check",
+    "pre-commit run", "cargo test", "cargo check", "go test", "go vet",
+)
+
+
+def _check_is_allowlisted(cmd) -> bool:
+    c = str(cmd).strip().lower()
+    return any(c.startswith(pfx) for pfx in _SAFE_CHECK_PREFIXES)
+
+
+# Words that PERMIT/override an action paired with a protected action = a scope rule trying to weaken
+# a hard boundary (e.g. "commits are allowed", "ignore the no-push rule"). Such rules are quarantined.
+_SAFETY_PERMISSIVE = (
+    "allow", "allowed", "ok to", "okay to", "fine to", "is fine", "are fine", "can ", "may ",
+    "enable", "permit", "permitted", "ignore", "skip", "disable", "override", "no need",
+    "feel free", "you can", "it's ok", "without restriction", "go ahead",
+)
+_SAFETY_PROTECTED = (
+    "commit", "push", "pull request", " pr ", "merge", "branch", "force-push", "force push",
+    "secret", "api key", "token", "destructive", "shell", "delete",
+)
+
+
+def _scope_safety_rule_conflicts(rule) -> bool:
+    """True if a scope-file safety rule appears to PERMIT/relax a hard prohibition (so it must not be
+    appended to the canonical boundaries). Conservative: a borderline rule is quarantined, not admitted."""
+    low = " " + str(rule).lower() + " "
+    return (any(w in low for w in _SAFETY_PERMISSIVE)
+            and any(x in low for x in _SAFETY_PROTECTED))
+
+
 def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
                         scope_file: Optional[str] = None) -> dict:
     """Build an Implementation Packet from explicit human-provided scope (source = manual_human_scope).
@@ -376,18 +417,36 @@ def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
     out_of_scope = [str(s) for s in _as_list(scope.get("out_of_scope")) if str(s).strip()]
     out_of_scope += [f"(ignored unsafe path — outside repo, do NOT touch) {p}" for p in unsafe]
 
-    tests = [str(c) for c in _as_list(scope.get("checks")) if str(c).strip()] or \
-        ["python -m unittest discover -s tests"]
+    # Checks: only allow-listed validation commands are promoted into runnable instructions; an
+    # out-of-policy/destructive command is quarantined (kept visible, but NOT a runnable instruction).
+    raw_checks = [str(c).strip() for c in _as_list(scope.get("checks")) if str(c).strip()]
+    safe_checks = [c for c in raw_checks if _check_is_allowlisted(c)]
+    rejected_checks = [c for c in raw_checks if not _check_is_allowlisted(c)]
+    tests = safe_checks or ["python -m unittest discover -s tests"]
+    out_of_scope += [f"(ignored check — not auto-run; needs human approval) {c}" for c in rejected_checks]
 
-    safety = list(SAFETY_BOUNDARIES)                      # hard boundaries — never removable
+    # Safety: canonical boundaries are never removable; a scope rule that tries to PERMIT a hard
+    # prohibition is quarantined (it cannot weaken the boundaries), only genuine *extra* rules are added.
+    safety = list(SAFETY_BOUNDARIES)
+    rejected_rules = []
     for r in _as_list(scope.get("safety")):
         r = str(r).strip()
-        if r and r not in safety:
+        if not r:
+            continue
+        if _scope_safety_rule_conflicts(r):
+            rejected_rules.append(r)
+        elif r not in safety:
             safety.append(r)
+    out_of_scope += [f"(ignored scope safety rule — cannot weaken hard boundaries) {r}"
+                     for r in rejected_rules]
 
+    # Relax the file clause when no safe files are listed, so an otherwise valid packet (tasks but no
+    # files, or all files filtered) isn't made impossible by "touch only the listed files".
+    file_clause = ("touch only the listed files, " if files
+                   else "keep changes minimal and scoped to the tasks, ")
     suggested = (f"Implement the manual-scope Implementation Packet for task \"{task}\" "
-                 f"(thread {thread_id}). Do ONLY the listed tasks, touch only the listed files, run "
-                 f"the listed checks and paste the real output; do not commit/push/merge; ask before "
+                 f"(thread {thread_id}). Do ONLY the listed tasks, {file_clause}run the listed "
+                 f"checks and paste the real output; do not commit/push/merge; ask before "
                  f"expanding scope.")
 
     return {

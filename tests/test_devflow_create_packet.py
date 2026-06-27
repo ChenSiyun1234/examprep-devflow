@@ -170,6 +170,53 @@ class TestBuildManualPacket(unittest.TestCase):
             json.dumps(p)
             render_manual_markdown(p)
 
+    def test_conflicting_safety_rule_is_quarantined(self):
+        # a scope rule that PERMITS a hard prohibition must not weaken the boundaries (Codex #5 P1)
+        scope = {"approved_scope": ["do x"],
+                 "safety": ["You can commit and push freely", "always add a docstring"]}
+        p = build_manual_packet("t", "x", "o/r", "T0", scope)
+        sb = p["safety_boundaries"]
+        self.assertNotIn("You can commit and push freely", sb)        # permission -> quarantined
+        self.assertIn("always add a docstring", sb)                   # genuine extra rule -> kept
+        self.assertTrue(any("Do not commit, push" in s for s in sb))  # canonical intact
+        oos = " ".join(p["implementation_instructions"]["out_of_scope"])
+        self.assertIn("cannot weaken hard boundaries", oos)
+        self.assertIn("commit and push freely", oos)
+
+    def test_home_and_env_rooted_paths_rejected(self):
+        # ~/... and $VAR/%VAR% paths expand outside the repo -> must not be edit targets (Codex #5)
+        p = build_manual_packet("t", "x", "o/r", "T0",
+                                {"files": ["~/.ssh/config", "$HOME/.gitconfig", "%APPDATA%/x",
+                                           "devflow/ok.py"]})
+        self.assertEqual(p["implementation_instructions"]["files_likely_touched"], ["devflow/ok.py"])
+        oos = " ".join(p["implementation_instructions"]["out_of_scope"])
+        self.assertIn("~/.ssh/config", oos)
+
+    def test_out_of_policy_checks_are_quarantined(self):
+        # destructive/out-of-policy check commands must NOT be promoted into runnable instructions (Codex)
+        scope = {"approved_scope": ["x"],
+                 "checks": ["python -m unittest discover -s tests", "rm -rf .", "gh pr merge 5"]}
+        ii = build_manual_packet("t", "x", "o/r", "T0", scope)["implementation_instructions"]
+        self.assertEqual(ii["tests_to_run"], ["python -m unittest discover -s tests"])
+        oos = " ".join(ii["out_of_scope"])
+        self.assertIn("rm -rf .", oos)
+        self.assertIn("gh pr merge 5", oos)
+        self.assertIn("needs human approval", oos)
+
+    def test_no_safe_checks_falls_back_to_default(self):
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"approved_scope": ["x"], "checks": ["rm -rf ."]})["implementation_instructions"]
+        self.assertEqual(ii["tests_to_run"], ["python -m unittest discover -s tests"])
+
+    def test_prompt_relaxes_when_no_files_listed(self):
+        # a valid packet with tasks but no files must not say "touch only the listed files" (Codex)
+        no_files = build_manual_packet("t", "x", "o/r", "T0", {"approved_scope": ["do x"]})
+        self.assertNotIn("touch only the listed files", no_files["suggested_prompt"])
+        self.assertIn("scoped to the tasks", no_files["suggested_prompt"])
+        with_files = build_manual_packet("t", "x", "o/r", "T0",
+                                         {"approved_scope": ["do x"], "files": ["devflow/ok.py"]})
+        self.assertIn("touch only the listed files", with_files["suggested_prompt"])
+
 
 class TestCreateCli(unittest.TestCase):
 
@@ -211,6 +258,20 @@ class TestCreateCli(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("could not read scope file", out)   # clear, specific message...
         self.assertIn("nope.md", out)                     # ...naming the offending path
+
+    def test_empty_scope_is_rejected(self):
+        # an empty / contentless scope must NOT write a generic packet (Codex #5 P2)
+        import io
+        import contextlib
+        empty = os.path.join(self.tmp, "empty.md")
+        with open(empty, "w", encoding="utf-8") as f:
+            f.write("# Notes\njust musings, no recognized sections\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_create_implementation_packet(self._args(scope_file=empty))
+        self.assertEqual(rc, 1)
+        self.assertIn("no concrete implementation work", buf.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.out, safe_thread_slug(self.tid))))  # nothing written
 
     def test_writes_only_under_out_dir(self):
         # the command must write ONLY under the given out dir (no scattered/repo-source writes)
