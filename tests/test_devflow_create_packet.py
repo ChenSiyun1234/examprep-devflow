@@ -208,6 +208,43 @@ class TestBuildManualPacket(unittest.TestCase):
                                  {"approved_scope": ["x"], "checks": ["rm -rf ."]})["implementation_instructions"]
         self.assertEqual(ii["tests_to_run"], ["python -m unittest discover -s tests"])
 
+    def test_chained_command_in_check_is_rejected(self):
+        # an allow-listed prefix must not smuggle a second command via shell chaining (Codex r2 P1)
+        scope = {"approved_scope": ["x"],
+                 "checks": ["python -m unittest discover -s tests && gh pr merge 5",
+                            "pytest; rm -rf .", "make test | tee out"]}
+        ii = build_manual_packet("t", "x", "o/r", "T0", scope)["implementation_instructions"]
+        self.assertEqual(ii["tests_to_run"], ["python -m unittest discover -s tests"])  # fell back
+        oos = " ".join(ii["out_of_scope"])
+        self.assertIn("gh pr merge 5", oos)
+        self.assertIn("rm -rf .", oos)
+
+    def test_pr_plural_permissive_rule_quarantined(self):
+        # word-boundary match: "PRs are allowed" must be caught (plural), not just " pr " (Codex r2)
+        p = build_manual_packet("t", "x", "o/r", "T0",
+                                {"approved_scope": ["do x"], "safety": ["PRs are allowed here"]})
+        self.assertNotIn("PRs are allowed here", p["safety_boundaries"])
+        self.assertTrue(any("PRs are allowed here" in s for s in p["implementation_instructions"]["out_of_scope"]))
+
+    def test_repo_root_dot_path_rejected(self):
+        # '.' / './' (whole-repo) targets must be quarantined, not just '..' (Codex r2)
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"approved_scope": ["x"], "files": [".", "./", "devflow/ok.py"]})["implementation_instructions"]
+        self.assertEqual(ii["files_likely_touched"], ["devflow/ok.py"])
+
+    def test_prohibited_action_task_quarantined(self):
+        # a scope TASK that is itself a prohibited git/PR action must be quarantined, not handed off
+        scope = {"tasks": ["fix the parser", "merge the PR after fixing", "git push to origin",
+                           "open a pull request"]}
+        ii = build_manual_packet("t", "x", "o/r", "T0", scope)["implementation_instructions"]
+        self.assertIn("fix the parser", ii["tasks"])
+        self.assertNotIn("merge the PR after fixing", ii["tasks"])
+        joined = " ".join(ii["tasks"])
+        self.assertNotIn("git push", joined)
+        self.assertNotIn("open a pull request", joined)
+        oos = " ".join(ii["out_of_scope"])
+        self.assertIn("prohibited git/PR action", oos)
+
     def test_prompt_relaxes_when_no_files_listed(self):
         # a valid packet with tasks but no files must not say "touch only the listed files" (Codex)
         no_files = build_manual_packet("t", "x", "o/r", "T0", {"approved_scope": ["do x"]})
@@ -272,6 +309,20 @@ class TestCreateCli(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("no concrete implementation work", buf.getvalue())
         self.assertFalse(os.path.exists(os.path.join(self.out, safe_thread_slug(self.tid))))  # nothing written
+
+    def test_files_only_scope_is_rejected(self):
+        # a scope with files but NO approved-scope/tasks is not concrete work -> rejected (Codex r2)
+        import io
+        import contextlib
+        files_only = os.path.join(self.tmp, "files_only.md")
+        with open(files_only, "w", encoding="utf-8") as f:
+            f.write("# Files likely touched\n- devflow/cli.py\n- devflow/x.py\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_create_implementation_packet(self._args(scope_file=files_only, task=None))
+        self.assertEqual(rc, 1)
+        self.assertIn("no concrete implementation work", buf.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.out, safe_thread_slug(self.tid))))
 
     def test_writes_only_under_out_dir(self):
         # the command must write ONLY under the given out dir (no scattered/repo-source writes)

@@ -96,7 +96,8 @@ def _is_safe_rel_path(p) -> bool:
         return False
     if "$" in q or "%" in q:                      # env-rooted, e.g. $HOME/.gitconfig, %APPDATA%\...
         return False
-    return not any(seg.strip() == ".." for seg in q.split("/"))
+    # reject ``..`` (traversal), ``.`` (current dir / whole repo), and empty (``//``) segments
+    return not any(seg.strip() in ("", "..", ".") for seg in q.split("/"))
 
 
 # Collapses the FULL set of line/paragraph separators that Python treats as line breaks (str.split-
@@ -373,8 +374,15 @@ _SAFE_CHECK_PREFIXES = (
 )
 
 
+_SHELL_META = ("&&", "||", ";", "|", "&", "`", "$(", "${", ">", "<", "\n", "\r")
+
+
 def _check_is_allowlisted(cmd) -> bool:
     c = str(cmd).strip().lower()
+    # reject shell chaining/redirection/substitution so an allow-listed prefix can't smuggle a second
+    # command (e.g. "pytest && gh pr merge", "python -m x; rm -rf .", "make $(curl ...)").
+    if any(meta in c for meta in _SHELL_META):
+        return False
     return any(c.startswith(pfx) for pfx in _SAFE_CHECK_PREFIXES)
 
 
@@ -386,17 +394,33 @@ _SAFETY_PERMISSIVE = (
     "feel free", "you can", "it's ok", "without restriction", "go ahead",
 )
 _SAFETY_PROTECTED = (
-    "commit", "push", "pull request", " pr ", "merge", "branch", "force-push", "force push",
-    "secret", "api key", "token", "destructive", "shell", "delete",
+    "commit", "push", "merge", "branch", "force-push", "force push", "secret", "api key", "token",
+    "destructive", "shell", "delete", "pr", "prs", "pull request", "pull-request",
+    "pull requests", "pull-requests",
 )
 
 
 def _scope_safety_rule_conflicts(rule) -> bool:
     """True if a scope-file safety rule appears to PERMIT/relax a hard prohibition (so it must not be
-    appended to the canonical boundaries). Conservative: a borderline rule is quarantined, not admitted."""
-    low = " " + str(rule).lower() + " "
-    return (any(w in low for w in _SAFETY_PERMISSIVE)
-            and any(x in low for x in _SAFETY_PROTECTED))
+    appended to the canonical boundaries). Conservative: a borderline rule is quarantined, not admitted.
+    Protected tokens match on WORD BOUNDARIES so plural/punctuated forms ('PRs', 'PRs.') are caught."""
+    low = str(rule).lower()
+    permissive = any(w in (" " + low + " ") for w in _SAFETY_PERMISSIVE)
+    protected = any(re.search(r"\b" + re.escape(x) + r"\b", low) for x in _SAFETY_PROTECTED)
+    return permissive and protected
+
+
+# A task line that IS itself a prohibited git/PR action (e.g. "merge the PR", "git push",
+# "open a pull request") must not be handed to Claude Code as work — it's quarantined to out-of-scope.
+_PROHIBITED_TASK_RE = re.compile(
+    r"\b(git\s+push|push\s+to\b|force[-\s]?push|commit\s+and\s+push|commit\s+to\b|"
+    r"merge\s+(the\s+|this\s+)?(pr|pull[-\s]request|branch)|"
+    r"(open|create|raise|submit)\s+(a\s+|the\s+)?(pr|pull[-\s]request)|"
+    r"delete\s+(the\s+)?branch)\b", re.I)
+
+
+def _task_is_prohibited(t) -> bool:
+    return bool(_PROHIBITED_TASK_RE.search(str(t)))
 
 
 def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
@@ -409,6 +433,10 @@ def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
     # coerce every section to a list (a hand-written/foreign scope dict may carry None or a bare str)
     approved_scope = [s for s in _as_list(scope.get("approved_scope")) if str(s).strip()]
     tasks = [t for t in _as_list(scope.get("tasks")) if str(t).strip()] or list(approved_scope)
+    # quarantine any scope item that IS a prohibited git/PR action — it must never be handed off as work
+    prohibited = [t for t in (tasks + approved_scope) if _task_is_prohibited(t)]
+    tasks = [t for t in tasks if not _task_is_prohibited(t)]
+    approved_scope = [s for s in approved_scope if not _task_is_prohibited(s)]
 
     raw_files = [str(f) for f in _as_list(scope.get("files")) if str(f).strip()]
     files = sorted({p for p in raw_files if _is_safe_rel_path(p)})
@@ -416,6 +444,7 @@ def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
 
     out_of_scope = [str(s) for s in _as_list(scope.get("out_of_scope")) if str(s).strip()]
     out_of_scope += [f"(ignored unsafe path — outside repo, do NOT touch) {p}" for p in unsafe]
+    out_of_scope += [f"(ignored task — prohibited git/PR action, do NOT perform) {t}" for t in prohibited]
 
     # Checks: only allow-listed validation commands are promoted into runnable instructions; an
     # out-of-policy/destructive command is quarantined (kept visible, but NOT a runnable instruction).

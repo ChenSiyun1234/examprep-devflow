@@ -546,12 +546,13 @@ def cmd_create_implementation_packet(args) -> int:
     generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     packet = build_manual_packet(thread_id=args.thread_id, task=task, repo=args.repo,
                                  generated_at=generated_at, scope=scope, scope_file=args.scope_file)
-    # Refuse an empty/contentless scope: writing an "(untitled task)" packet with no scope/tasks/files
-    # would recreate the unusable generic-packet failure mode this command exists to avoid.
+    # Refuse a scope with no concrete WORK: a files-only scope (paths but no approved scope/tasks) is
+    # not enough — it would recreate the unusable generic-packet failure mode this command exists to
+    # avoid. Require an approved scope or tasks (files alone, or only quarantined items, don't count).
     ii = packet["implementation_instructions"]
-    if not (packet["approval"]["approved_scope"] or ii["tasks"] or ii["files_likely_touched"]):
+    if not (packet["approval"]["approved_scope"] or ii["tasks"]):
         print(f"[devflow] scope file '{args.scope_file}' has no concrete implementation work "
-              f"(no '# Approved scope' / '# Tasks' / '# Files likely touched'). Not writing a packet.")
+              f"(needs a '# Approved scope' or '# Tasks' section, not just files). Not writing a packet.")
         return 1
     out_dir = args.out_dir or PACKETS_DIR
     try:
