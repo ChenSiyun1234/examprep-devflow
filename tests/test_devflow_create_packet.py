@@ -85,6 +85,13 @@ class TestParseScope(unittest.TestCase):
         self.assertEqual(s["files"], ["a.py"])
         self.assertEqual(s["checks"], ["run"])
 
+    def test_subheading_is_content_not_a_section_break(self):
+        # a "## sub" line inside a section is CONTENT, not a new section (only top-level # breaks) (Codex r4)
+        s = parse_scope_markdown("# Approved scope\n- do x\n## a sub-note\n- do y")
+        self.assertNotIn("a sub-note", s["unknown_headings"])   # not treated as an (unknown) section
+        self.assertIn("a sub-note", s["approved_scope"])        # kept as content of the section
+        self.assertIn("do y", s["approved_scope"])              # content after it still belongs here
+
 
 class TestBuildManualPacket(unittest.TestCase):
 
@@ -208,6 +215,25 @@ class TestBuildManualPacket(unittest.TestCase):
                                  {"approved_scope": ["x"], "checks": ["rm -rf ."]})["implementation_instructions"]
         self.assertEqual(ii["tests_to_run"], ["python -m unittest discover -s tests"])
 
+    def test_check_allowlist_word_boundary_and_side_effects(self):
+        # "pytestfoo" (no boundary) and side-effectful "npm run deploy"/"ruff --fix" must be rejected (Codex r4)
+        scope = {"approved_scope": ["x"],
+                 "checks": ["pytest", "pytestfoo --evil", "npm run deploy", "ruff --fix", "make build"]}
+        ii = build_manual_packet("t", "x", "o/r", "T0", scope)["implementation_instructions"]
+        self.assertEqual(ii["tests_to_run"], ["pytest", "make build"])   # only the genuine checks
+        oos = " ".join(ii["out_of_scope"])
+        for bad in ("pytestfoo --evil", "npm run deploy", "ruff --fix"):
+            self.assertIn(bad, oos)
+
+    def test_workflow_file_target_quarantined(self):
+        # a GitHub Actions workflow file must not be an edit target (devflow never adds Actions) (Codex r4)
+        scope = {"approved_scope": ["x"],
+                 "files": ["devflow/ok.py", ".github/workflows/ci.yml"]}
+        ii = build_manual_packet("t", "x", "o/r", "T0", scope)["implementation_instructions"]
+        self.assertIn("devflow/ok.py", ii["files_likely_touched"])
+        self.assertNotIn(".github/workflows/ci.yml", ii["files_likely_touched"])
+        self.assertTrue(any(".github/workflows/ci.yml" in s for s in ii["out_of_scope"]))
+
     def test_chained_command_in_check_is_rejected(self):
         # an allow-listed prefix must not smuggle a second command via shell chaining (Codex r2 P1)
         scope = {"approved_scope": ["x"],
@@ -256,6 +282,16 @@ class TestBuildManualPacket(unittest.TestCase):
         self.assertNotIn("open a pull request", joined)
         oos = " ".join(ii["out_of_scope"])
         self.assertIn("prohibited git/PR action", oos)
+
+    def test_prohibited_task_bare_verb_forms_quarantined(self):
+        # broadened detection: bare-verb phrasings must also be quarantined (Codex r4)
+        bad = ["push the changes", "commit the code", "rebase onto main", "cherry-pick the fix"]
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"tasks": bad + ["refactor the parser"]})["implementation_instructions"]
+        self.assertEqual(ii["tasks"], ["refactor the parser"])    # only the legit task remains
+        oos = " ".join(ii["out_of_scope"])
+        for b in bad:
+            self.assertIn(b, oos)
 
     def test_prompt_relaxes_when_no_files_listed(self):
         # a valid packet with tasks but no files must not say "touch only the listed files" (Codex)

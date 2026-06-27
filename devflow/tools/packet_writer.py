@@ -342,13 +342,17 @@ def parse_scope_markdown(text: str) -> dict:
     for raw in (text or "").splitlines():
         stripped = raw.strip()
         if stripped.startswith("#"):
-            heading = stripped.lstrip("#").strip()
-            current = _SCOPE_SECTION_ALIASES.get(heading.lower())
-            if current:
-                sections.setdefault(current, [])
-            elif heading:
-                unknown_headings.append(heading)   # surfaced (CLI warns) so its body isn't lost silently
-            continue
+            level = len(stripped) - len(stripped.lstrip("#"))
+            if level == 1:                         # only a top-level "# Heading" starts a section
+                heading = stripped.lstrip("#").strip()
+                current = _SCOPE_SECTION_ALIASES.get(heading.lower())
+                if current:
+                    sections.setdefault(current, [])
+                elif heading:
+                    unknown_headings.append(heading)   # surfaced (CLI warns) so its body isn't lost silently
+                continue
+            # a sub-heading ("## …") inside a section is CONTENT, not a section break — keep its text
+            stripped = stripped.lstrip("#").strip()
         if current and stripped:
             # strip a leading bullet marker: - , * , + , or •
             item = (stripped[2:].strip()
@@ -375,6 +379,9 @@ _SAFE_CHECK_PREFIXES = (
 
 
 _SHELL_META = ("&&", "||", ";", "|", "&", "`", "$(", "${", ">", "<", "\n", "\r")
+# mutating / network sub-actions that must never be promoted into a "check" instruction, even under
+# an allow-listed prefix (e.g. "npm run deploy", "pip install …", "ruff --fix").
+_SIDE_EFFECT_TOKENS = ("install", "deploy", "publish", "release", "upgrade", "--write", "--fix")
 
 
 def _check_is_allowlisted(cmd) -> bool:
@@ -383,7 +390,11 @@ def _check_is_allowlisted(cmd) -> bool:
     # command (e.g. "pytest && gh pr merge", "python -m x; rm -rf .", "make $(curl ...)").
     if any(meta in c for meta in _SHELL_META):
         return False
-    return any(c.startswith(pfx) for pfx in _SAFE_CHECK_PREFIXES)
+    if any(tok in c for tok in _SIDE_EFFECT_TOKENS):   # mutating/network sub-action -> not a check
+        return False
+    # exact match OR prefix followed by a space — a bare-word boundary so "pytestfoo" / "makefile…"
+    # can't sneak through a startswith on "pytest" / "make".
+    return any(c == p.strip() or c.startswith(p.strip() + " ") for p in _SAFE_CHECK_PREFIXES)
 
 
 # Words that PERMIT/override an action paired with a protected action = a scope rule trying to weaken
@@ -415,10 +426,12 @@ def _scope_safety_rule_conflicts(rule) -> bool:
 # A task line that IS itself a prohibited git/PR action (e.g. "merge the PR", "git push",
 # "open a pull request") must not be handed to Claude Code as work — it's quarantined to out-of-scope.
 _PROHIBITED_TASK_RE = re.compile(
-    r"\b(git\s+push|push\s+to\b|force[-\s]?push|commit\s+and\s+push|commit\s+to\b|"
-    r"merge\s+(the\s+|this\s+)?(pr|pull[-\s]request|branch)|"
+    r"\b(git\s+push|push(es|ing)?\s+(the\s+|to\s+)?(branch|changes|commits?|code|origin|remote)|"
+    r"force[-\s]?push(es|ing)?|"
+    r"commit(s|ting)?\s+(and\s+push|the\s+(changes|code|files)|changes|code)|"
+    r"merg(e|es|ing)\s+(the\s+|this\s+)?(pr|pull[-\s]request|branch)|"
     r"(open|create|raise|submit)\s+(a\s+|the\s+)?(pr|pull[-\s]request)|"
-    r"delete\s+(the\s+)?branch)\b", re.I)
+    r"delete\s+(the\s+)?branch|rebase|cherry[-\s]?pick)\b", re.I)
 
 
 def _task_is_prohibited(t) -> bool:
@@ -441,11 +454,17 @@ def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
     approved_scope = [s for s in approved_scope if not _task_is_prohibited(s)]
 
     raw_files = [str(f) for f in _as_list(scope.get("files")) if str(f).strip()]
-    files = sorted({p for p in raw_files if _is_safe_rel_path(p)})
+    # devflow must never add/modify GitHub Actions — a workflow file is repo-relative (passes the
+    # path filter) but is quarantined as an edit target.
+    def _is_workflow(p):
+        return ".github/workflows/" in p.replace("\\", "/").lower()
+    files = sorted({p for p in raw_files if _is_safe_rel_path(p) and not _is_workflow(p)})
     unsafe = sorted({p for p in raw_files if not _is_safe_rel_path(p)})
+    workflows = sorted({p for p in raw_files if _is_safe_rel_path(p) and _is_workflow(p)})
 
     out_of_scope = [str(s) for s in _as_list(scope.get("out_of_scope")) if str(s).strip()]
     out_of_scope += [f"(ignored unsafe path — outside repo, do NOT touch) {p}" for p in unsafe]
+    out_of_scope += [f"(ignored target — GitHub Actions workflow, do NOT touch) {p}" for p in workflows]
     out_of_scope += [f"(ignored task — prohibited git/PR action, do NOT perform) {t}" for t in prohibited]
 
     # Checks: only allow-listed validation commands are promoted into runnable instructions; an
