@@ -315,6 +315,43 @@ class TestBuildManualPacket(unittest.TestCase):
         self.assertNotIn(".github/workflows", ii["files_likely_touched"])
         self.assertTrue(any(".github/workflows" in s for s in ii["out_of_scope"]))
 
+    def test_non_git_safety_overrides_quarantined(self):
+        # permissive overrides of NON-git hard boundaries (tests/checks/refactor) also quarantined (Codex r6)
+        for rule in ("no need to run tests", "you can skip checks", "refactors are allowed"):
+            p = build_manual_packet("t", "x", "o/r", "T0", {"approved_scope": ["do x"], "safety": [rule]})
+            self.assertNotIn(rule, p["safety_boundaries"], rule)
+            self.assertTrue(any(rule in s for s in p["implementation_instructions"]["out_of_scope"]), rule)
+
+    def test_pip_uninstall_rejected_as_check(self):
+        # 'python -m pip uninstall' is destructive, not a validation check (Codex r6)
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"approved_scope": ["x"],
+                                  "checks": ["python -m pip uninstall -y pytest", "python -m pytest"]})["implementation_instructions"]
+        self.assertEqual(ii["tests_to_run"], ["python -m pytest"])
+        self.assertTrue(any("uninstall" in s for s in ii["out_of_scope"]))
+
+    def test_pre_commit_task_not_quarantined(self):
+        # 'pre-commit' is a tool, not a git commit -> must NOT be quarantined (Codex r6)
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"tasks": ["update pre-commit configuration"]})["implementation_instructions"]
+        self.assertIn("update pre-commit configuration", ii["tasks"])
+
+    def test_broader_push_wording_and_git_branch_delete_quarantined(self):
+        bad = ["push your branch upstream", "git branch -D feature"]
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"tasks": bad + ["fix the bug"]})["implementation_instructions"]
+        self.assertEqual(ii["tasks"], ["fix the bug"])
+        oos = " ".join(ii["out_of_scope"])
+        self.assertIn("push your branch", oos)
+        self.assertIn("git branch -D", oos)
+
+    def test_bare_workflow_path_as_task_quarantined(self):
+        # a bare '.github/workflows/...' path in a TASK line is quarantined (Codex r6)
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"tasks": ["edit .github/workflows/ci.yml", "fix the parser"]})["implementation_instructions"]
+        self.assertEqual(ii["tasks"], ["fix the parser"])
+        self.assertTrue(any(".github/workflows" in s for s in ii["out_of_scope"]))
+
     def test_repo_root_dot_path_rejected(self):
         # '.' / './' (whole-repo) targets must be quarantined, not just '..' (Codex r2)
         ii = build_manual_packet("t", "x", "o/r", "T0",

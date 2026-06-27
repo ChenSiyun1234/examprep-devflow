@@ -472,7 +472,8 @@ _SHELL_META = ("&&", "||", ";", "|", "&", "`", "$(", "${", ">", "<", "\n", "\r")
 # an allow-listed prefix (e.g. "make push", "npm run deploy", "make clean", "npm start", "ruff --fix").
 # Word-bounded so a benign substring (e.g. "clean" in a test path "test_cleanup") doesn't trip it.
 _SIDE_EFFECT_RE = re.compile(
-    r"\b(install|deploy|publish|release|upgrade|push|clean|delete|merge|start|serve)\b", re.I)
+    r"\b(install|uninstall|deploy|publish|release|upgrade|push|clean|delete|remove|merge|start|serve)\b",
+    re.I)
 _SIDE_EFFECT_FLAGS = ("--write", "--fix", "--apply")
 
 
@@ -510,6 +511,7 @@ _SAFETY_PROHIBITIVE_RE = re.compile(
 _SAFETY_PROTECTED_RE = re.compile(
     r"\b(commit(s|ted|ting)?|push(es|ed|ing)?|merg(e|es|ed|ing)|branch(es)?|delet(e|es|ed|ing)|"
     r"force[-\s]?push(es|ed|ing)?|secrets?|api[-\s]?keys?|tokens?|destructive|shell|"
+    r"tests?|checks?|refactor(s|ing|ed)?|rewrite(s|ing)?|scope|"          # non-git hard boundaries too
     r"prs?|pull[-\s]?requests?)\b", re.I)
 
 
@@ -535,21 +537,28 @@ def _scope_safety_rule_conflicts(rule) -> bool:
 _PROHIBITED_TASK_RE = re.compile(
     r"\b("
     r"git\s+(commit|push|merge|rebase|cherry-?pick)"                       # git <subcommand> (command form)
+    r"|git\s+branch\s+(-[dD]\b|--delete\b)"                                # git branch -D / -d / --delete
     r"|gh\s+pr\s+(merge|create|ready|review|close)"                        # gh pr <subcommand>
     r"|gh\s+(release|workflow|run|api)\b"                                  # gh release/workflow/run/api
-    r"|push(es|ing)?\s+(the\s+|to\s+)?(branch|changes|commits?|code|origin|remote)"
+    r"|push(es|ing)?\s+(\w+\s+){0,2}(branch|changes|commits?|code|origin|remote|upstream)"
     r"|force[-\s]?push(es|ing)?"
-    r"|commit(s|ting)?\b"                                                  # bare 'commit' (+ inflections)
+    r"|(?<!pre-)commit(s|ting)?\b"                                         # bare 'commit' (NOT 'pre-commit')
     r"|merg(e|es|ing)\s+(the\s+|this\s+)?(pr|pull[-\s]request|branch)"
     r"|(open|create|raise|submit)\s+(a\s+|the\s+)?(pr|pull[-\s]request)"
     r"|delete\s+(the\s+)?branch|rebase|cherry[-\s]?pick"
     r"|github\s*actions|actions?\s+workflow|workflow\s+(file|yaml|yml)"    # GitHub Actions (boundary: never add)
-    r"|\.github[/\\]workflows|ci\s+(workflow|pipeline)"
+    r"|ci\s+(workflow|pipeline)"
     r")", re.I)
 
 
+# a workflow path can appear bare in a task (".github/workflows/...") where the leading \b of the
+# alternation above can't anchor (the path starts with '.'); match it independently.
+_WORKFLOW_PATH_RE = re.compile(r"\.github[/\\]workflows", re.I)
+
+
 def _task_is_prohibited(t) -> bool:
-    return bool(_PROHIBITED_TASK_RE.search(str(t)))
+    s = str(t)
+    return bool(_PROHIBITED_TASK_RE.search(s)) or bool(_WORKFLOW_PATH_RE.search(s))
 
 
 def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
