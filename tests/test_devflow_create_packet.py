@@ -317,10 +317,26 @@ class TestBuildManualPacket(unittest.TestCase):
 
     def test_non_git_safety_overrides_quarantined(self):
         # permissive overrides of NON-git hard boundaries (tests/checks/refactor) also quarantined (Codex r6)
-        for rule in ("no need to run tests", "you can skip checks", "refactors are allowed"):
+        for rule in ("no need to run tests", "you can skip checks", "refactors are allowed",
+                     "not required to run tests", "no requirement to run checks"):  # Codex r3 negatives
             p = build_manual_packet("t", "x", "o/r", "T0", {"approved_scope": ["do x"], "safety": [rule]})
             self.assertNotIn(rule, p["safety_boundaries"], rule)
             self.assertTrue(any(rule in s for s in p["implementation_instructions"]["out_of_scope"]), rule)
+
+    def test_all_tasks_quarantined_falls_back_to_approved_scope(self):
+        # if EVERY '# Tasks' entry is quarantined, tasks fall back to approved_scope (not empty) (Codex r3)
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"approved_scope": ["refactor the parser"],
+                                  "tasks": ["git push origin", "gh pr merge 5"]})["implementation_instructions"]
+        self.assertEqual(ii["tasks"], ["refactor the parser"])
+
+    def test_manual_scope_unsafe_path_prefix_sanitized(self):
+        # a 'PATH: detail' unsafe-path prefix in a manual task/scope item is stripped (Codex r3)
+        p = build_manual_packet("t", "x", "o/r", "T0",
+                                {"approved_scope": ["/etc/passwd: update root"],
+                                 "tasks": ["../escape.py: change code"]})
+        self.assertNotIn("/etc/passwd", " ".join(p["approval"]["approved_scope"]))
+        self.assertNotIn("../escape.py", " ".join(p["implementation_instructions"]["tasks"]))
 
     def test_pip_uninstall_rejected_as_check(self):
         # 'python -m pip uninstall' is destructive, not a validation check (Codex r6)

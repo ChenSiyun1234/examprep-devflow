@@ -495,7 +495,8 @@ def _check_is_allowlisted(cmd) -> bool:
 _SAFETY_PERMISSIVE = (
     "allow", "allowed", "ok to", "okay to", "fine to", "is fine", "are fine", "is ok", "is okay",
     "are ok", "can ", "may ", "enable", "permit", "permitted", "ignore", "skip", "disable",
-    "override", "no need", "no restriction", "no limit", "feel free", "you can", "it's ok",
+    "override", "no need", "no restriction", "no limit", "not required", "no requirement",
+    "not necessary", "not mandatory", "optional", "feel free", "you can", "it's ok",
     "without restriction", "go ahead",
 )
 # Verbs/markers that make a protected-action rule a genuine PROHIBITION (it reinforces a boundary)
@@ -571,10 +572,16 @@ def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
     # coerce every section to a list (a hand-written/foreign scope dict may carry None or a bare str)
     approved_scope = [s for s in _as_list(scope.get("approved_scope")) if str(s).strip()]
     tasks = [t for t in _as_list(scope.get("tasks")) if str(t).strip()] or list(approved_scope)
-    # quarantine any scope item that IS a prohibited git/PR action — it must never be handed off as work
+    # quarantine any scope item that IS a prohibited git/PR action — it must never be handed off as work;
+    # sanitize a 'PATH: detail' unsafe-path prefix out of the kept items so a manual scope can't direct
+    # edits outside the repo (mirrors how advisory-derived tasks are sanitized).
     prohibited = [t for t in (tasks + approved_scope) if _task_is_prohibited(t)]
-    tasks = [t for t in tasks if not _task_is_prohibited(t)]
-    approved_scope = [s for s in approved_scope if not _task_is_prohibited(s)]
+    tasks = [_strip_unsafe_path_prefix(str(t)) for t in tasks if not _task_is_prohibited(t)]
+    approved_scope = [_strip_unsafe_path_prefix(str(s)) for s in approved_scope if not _task_is_prohibited(s)]
+    # if an explicit Tasks section existed but EVERY entry was quarantined, fall back to the (filtered)
+    # approved scope as tasks — never emit an empty 'do ONLY the listed tasks' handoff.
+    if not tasks and approved_scope:
+        tasks = list(approved_scope)
 
     raw_files = [str(f) for f in _as_list(scope.get("files")) if str(f).strip()]
     # devflow must never add/modify GitHub Actions — a workflow file is repo-relative (passes the
