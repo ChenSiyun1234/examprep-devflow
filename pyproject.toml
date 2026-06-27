@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devflow"
+version = "0.1.0"
+description = "LangGraph-based development-workflow orchestrator (dry-run scaffold)"
+readme = "README.md"
+requires-python = ">=3.8"
+# No runtime third-party deps: the default path is pure stdlib (the fallback runner).
+dependencies = []
+
+[project.optional-dependencies]
+# the real LangGraph backend + LangGraph Studio (`langgraph dev`)
+langgraph = ["langgraph>=0.2,<0.4"]
+studio = ["langgraph>=0.2,<0.4", "langgraph-cli[inmem]>=0.1.55"]
+
+[tool.setuptools]
+packages = ["devflow", "devflow.nodes", "devflow.tools"]

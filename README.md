@@ -44,6 +44,34 @@ python -m devflow.cli read-pr    --pr 456     --repo owner/name
 python -m devflow.cli run-docs-advisory --thread-id demo [--real-github --max-polls 6 --poll-seconds 30]
 ```
 
+## LangGraph Studio (`langgraph dev`)
+
+The graph is Studio-loadable: `langgraph.json` (repo root) points Studio at the
+`make_graph` factory in `devflow/graph.py`, which returns the **uncompiled** `StateGraph` so the
+LangGraph platform supplies its own persistence (threads + interrupts).
+
+```bash
+pip install -U "langgraph-cli[inmem]"
+pip install -r devflow/requirements-dev.txt
+langgraph dev
+```
+
+Expected behavior in Studio:
+- the graph appears as **`devflow`**;
+- you can inspect all nodes (the 20-node advisory → review → merge workflow);
+- you can run a thread by supplying an input state (e.g. `{"task_type": "docs-advisory",
+  "thread_id": "demo", "approvals": {}}`);
+- the **human-approval gates appear as interrupts** (the run pauses at `human_approval_gate` /
+  `human_fix_approval` / `human_merge_approval`); resume by supplying the gate decision;
+- the current **state fields are visible** in the state panel.
+
+Everything in Studio is still **dry-run by default** (no real GitHub writes) — `real_github` stays
+False unless you explicitly set it.
+
+> Note: `make_graph` is a factory (not a module-level `graph` variable) on purpose — importing
+> `devflow.graph` must not require langgraph or build a graph, and without langgraph a module-level
+> object would be the stdlib fallback, which Studio can't render.
+
 ## Tests
 
 ```bash

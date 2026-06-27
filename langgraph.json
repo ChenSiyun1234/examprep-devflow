@@ -1,0 +1,6 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "devflow": "./devflow/graph.py:make_graph"
+  }
+}
