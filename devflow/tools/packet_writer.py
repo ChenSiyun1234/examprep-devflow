@@ -87,11 +87,16 @@ def _strip_unsafe_path_prefix(text: str) -> str:
                 looks_path = ("/" in h or "\\" in h or h.startswith(("~", ".", "$", "%"))
                               or "$" in h or "%" in h or (len(h) >= 2 and h[1] == ":"))
                 if looks_path and not _is_safe_rel_path(h):
-                    return rest.strip()
+                    return _strip_unsafe_path_prefix(rest.strip())   # re-sanitize a chained 'P1: P2: …'
     # no "PATH: detail" shape, but the WHOLE text may itself be a bare unsafe path ('/etc/passwd',
-    # '../x.py', 'C:\\...') with no separator -> never surface it as an edit target. (Prose and safe
-    # relative paths pass _is_safe_rel_path and are returned unchanged.)
-    if text.strip() and not _is_safe_rel_path(text.strip()):
+    # '../x.py', 'C:\\...') -> never surface it as an edit target. Gate on path-SHAPE first so ordinary
+    # prose ('Increase coverage to 80%', 'A: add tests') — which _is_safe_rel_path also rejects (the
+    # '%'/drive checks) — is NOT mistaken for a path and is returned unchanged.
+    s = text.strip()
+    looks_bare_path = bool(s) and (
+        "/" in s or "\\" in s or s.startswith(("~", "..", "$", "%"))
+        or (len(s) >= 3 and s[0].isalpha() and s[1] == ":" and s[2] in "\\/"))
+    if looks_bare_path and not _is_safe_rel_path(s):
         return "(unsafe path omitted)"
     return text
 
@@ -218,7 +223,9 @@ def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> di
             note = c.get("note") if isinstance(c, dict) else (c if isinstance(c, str) else None)
             if isinstance(note, str) and ":" in note:
                 head = note.split(":", 1)[0].strip()
-                if _is_safe_rel_path(head):
+                # a real file target looks like a path ('/' or a '.ext'); never a bare drive letter 'C'
+                # (from 'C:\\…') or a one-word prose head, both of which _is_safe_rel_path would accept.
+                if ("/" in head or "." in head) and _is_safe_rel_path(head):
                     raw_files.append(head)
     # advisory's own file list belongs ONLY to the advisory gate — at the merge gate (which approves
     # no new work) it would wrongly present edit targets. Only accept STRING entries (no str()-coerce).
@@ -319,9 +326,9 @@ def render_markdown(packet: dict) -> str:
         f"- generated_at: {_md_safe(m.get('generated_at'))}",
     ]
     if m.get("issue_number"):
-        out.append(f"- source issue: #{m['issue_number']} {_md_safe(m.get('issue_url') or '')}".rstrip())
+        out.append(f"- source issue: #{_md_safe(m['issue_number'])} {_md_safe(m.get('issue_url') or '')}".rstrip())
     if m.get("pr_number"):
-        out.append(f"- source PR: #{m['pr_number']} {_md_safe(m.get('pr_url') or '')}".rstrip())
+        out.append(f"- source PR: #{_md_safe(m['pr_number'])} {_md_safe(m.get('pr_url') or '')}".rstrip())
     out += [
         "",
         "## Approval",

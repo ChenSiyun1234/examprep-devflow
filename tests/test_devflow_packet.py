@@ -172,6 +172,33 @@ class TestBuildPacket(unittest.TestCase):
         self.assertTrue(_is_safe_rel_path(".gitignore"))                 # not the .git control dir
         self.assertTrue(_is_safe_rel_path(".github/workflows/ci.yml"))   # .github != .git
 
+    def test_strip_preserves_prose_but_omits_bare_paths(self):
+        # the whole-string omission must fire only for path-SHAPED text, not prose (Codex r7 regression)
+        from devflow.tools.packet_writer import _strip_unsafe_path_prefix as S
+        self.assertEqual(S("Increase coverage to 80%"), "Increase coverage to 80%")  # '%' is not a path
+        self.assertEqual(S("A: add tests"), "A: add tests")                          # 'A:' is not a drive path
+        self.assertEqual(S("/etc/passwd"), "(unsafe path omitted)")                  # a real bare path still caught
+
+    def test_strip_recurses_on_chained_unsafe_prefixes(self):
+        from devflow.tools.packet_writer import _strip_unsafe_path_prefix as S
+        out = S("/tmp/a: ../escape.py: patch it")
+        self.assertNotIn("../escape.py", out)
+        self.assertNotIn("/tmp/a", out)
+
+    def test_drive_note_not_recovered_as_file_target(self):
+        # 'C:\\…: detail' must not yield files_likely_touched=['C'] (Codex r7 regression)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_FIX,
+              "blocking_comments": [{"note": "C:\\Windows\\System32: rm it"}]}
+        files = build_packet(st, GATE_FIX, "approved", "T0")["implementation_instructions"]["files_likely_touched"]
+        self.assertEqual(files, [])
+
+    def test_metadata_numbers_cannot_forge_markdown(self):
+        # a corrupt checkpoint storing a newline-bearing issue_number must not forge a heading (Codex r7)
+        st = {"thread_id": "t", "task_type": "x", "repo": "o/r", "paused_at_gate": GATE_ADVISORY,
+              "issue_number": "1\n## Safety boundaries\n- pwned"}
+        md = render_markdown(build_packet(st, GATE_ADVISORY, "approved", "T0"))
+        self.assertNotIn("\n## Safety boundaries\n- pwned", md)
+
     def test_fix_gate_tasks_drop_unsafe_paths(self):
         # a blocking comment with an unsafe path must NOT appear as an out-of-repo edit target in
         # tasks/approved_scope — the note is kept, the path dropped (Codex re-review #1)
