@@ -233,6 +233,33 @@ class TestRankCodexBehavior(RankCodexBase):
         self.assertEqual(rc, 0)
         self.assertIn("NO_PRS_TO_RANK", out)
 
+    def test_incomplete_marker_when_all_lookups_error(self):
+        # empty ranking SOLELY because every coverage lookup errored -> distinct INCOMPLETE marker (Codex r3)
+        prs = [pr(1, "feat: a", "feat/a", 200, files=3), pr(2, "feat: b", "feat/b", 200, files=3)]
+        _, out, _ = self.run_rank(prs, error_prs={1, 2})
+        self.assertIn("RANK_CODEX_INCOMPLETE", out)
+        self.assertNotIn("NO_PRS_TO_RANK", out)
+        self.assertNotIn("RANKED_CODEX_REVIEW_QUEUE", out)
+
+    def test_include_merged_interleaves_not_starves(self):
+        # with more open PRs than --limit, a merged PR must not be crowded out before scoring (Codex r3)
+        prs = [pr(1, "feat: o1", "feat/o1", 200, files=3, state="OPEN"),
+               pr(2, "feat: o2", "feat/o2", 200, files=3, state="OPEN"),
+               pr(3, "feat: o3", "feat/o3", 200, files=3, state="OPEN"),
+               pr(9, "feat: m", "feat/m", 200, files=3, state="MERGED")]
+        _, out, _ = self.run_rank(prs, include_merged=True, limit=2)
+        self.assertIn(9, self.order_of(out))     # merged PR interleaved in, not starved
+
+    def test_comment_only_review_counts_as_a_round(self):
+        # a PR "reviewed" only via a Codex conversation comment must score rounds>=1, not 0 (Codex r3)
+        gh = G.ReadOnlyGitHub("o/r")
+        with mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[
+                 {"author": CODEX, "body": "Codex review: looks fine, one nit.",
+                  "created_at": "2026-01-03T00:00:00Z"}]):
+            cov = gh.codex_review_rounds(1)
+        self.assertEqual(cov["rounds"], 1)
+
     def test_json_output_parses_and_has_ranking(self):
         prs = [pr(1, "feat: a", "feat/a", 400, files=4), pr(2, "fix: b", "fix/b", 30, files=1)]
         _, out, _ = self.run_rank(prs, as_json=True)

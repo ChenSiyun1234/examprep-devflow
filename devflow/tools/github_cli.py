@@ -362,6 +362,7 @@ class ReadOnlyGitHub:
         OR comment — is a usage-limits notice). Read-only.
         Returns ``{rounds, reviewed_on_head, quota_limited}``."""
         reviews = self.get_pr_reviews(pr_number)
+        comments = self.get_pr_comments(pr_number)
         # a substantive review = non-quota Codex review with a body OR a meaningful state (an
         # empty-body COMMENTED/CHANGES_REQUESTED/APPROVED review whose content is in inline comments
         # still counts as a review round).
@@ -370,15 +371,19 @@ class ReadOnlyGitHub:
                 and not is_codex_quota_notice(r.get("body"))
                 and ((r.get("body") or "").strip()
                      or (r.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"))]
+        # a PR can also be "reviewed" via a Codex CONVERSATION comment (which find_latest_codex_review
+        # treats as a review) — count substantive non-quota ones so such a PR isn't mis-scored rounds=0
+        # and re-recommended as never-reviewed.
+        crevs = [c for c in comments if is_codex_author(c.get("author"))
+                 and not is_codex_quota_notice(c.get("body")) and (c.get("body") or "").strip()]
         on_head = bool(head) and any((r.get("commit_id") or "") == head for r in revs)
         # quota notices arrive as PR COMMENTS (not reviews) — count those too so the ranker won't put a
         # currently rate-limited PR at the front and ask Codex to review what it just declined.
         sigs = [(r.get("created_at"), r.get("body")) for r in reviews if is_codex_author(r.get("author"))]
-        sigs += [(c.get("created_at"), c.get("body"))
-                 for c in self.get_pr_comments(pr_number) if is_codex_author(c.get("author"))]
+        sigs += [(c.get("created_at"), c.get("body")) for c in comments if is_codex_author(c.get("author"))]
         sigs = [(t, b) for t, b in sigs if t]
         quota_limited = is_codex_quota_notice(max(sigs, key=lambda x: x[0])[1]) if sigs else False
-        return {"rounds": len(revs), "reviewed_on_head": on_head, "quota_limited": quota_limited}
+        return {"rounds": len(revs) + len(crevs), "reviewed_on_head": on_head, "quota_limited": quota_limited}
 
     # Codex helpers ---------------------------------------------------------------------
     def find_latest_codex_advisory(self, issue_number: int) -> Optional[dict]:

@@ -510,10 +510,17 @@ def cmd_rank_codex_reviews(args) -> int:
         if args.include_merged:
             # fetch OPEN and MERGED separately so --limit counts ELIGIBLE PRs, not closed-unmerged
             # ones that would consume the limit before filtering (retroactive review of merged work).
-            # cap the COMBINED open+merged union to --limit (gh applies --limit per query, so the
-            # union could otherwise reach 2*limit, exceeding the "max PRs to inspect" window).
-            prs = (gh.list_prs(state="open", limit=args.limit)
-                   + gh.list_prs(state="merged", limit=args.limit))[:args.limit]
+            # INTERLEAVE open+merged before the final --limit cap, so merged candidates aren't all
+            # crowded out behind the open PRs when there are >= limit open ones.
+            opens = gh.list_prs(state="open", limit=args.limit)
+            merged = gh.list_prs(state="merged", limit=args.limit)
+            prs = []
+            for i in range(max(len(opens), len(merged))):
+                if i < len(opens):
+                    prs.append(opens[i])
+                if i < len(merged):
+                    prs.append(merged[i])
+            prs = prs[:args.limit]
         else:
             prs = gh.list_prs(state="open", limit=args.limit)
     except GhError as e:
@@ -543,7 +550,11 @@ def cmd_rank_codex_reviews(args) -> int:
     # review now; such PRs are still shown in the table but kept out of recommend_next.
     top = [r["number"] for r in ranked if not r.get("quota_limited")][:args.top]
 
-    marker = "RANKED_CODEX_REVIEW_QUEUE" if ranked else "NO_PRS_TO_RANK"
+    # distinct marker when the ranking is empty ONLY because every coverage lookup errored, so a driver
+    # treats it as unknown/incomplete (retry/alert) rather than a definitive "nothing to rank".
+    marker = ("RANKED_CODEX_REVIEW_QUEUE" if ranked
+              else "RANK_CODEX_INCOMPLETE" if errors
+              else "NO_PRS_TO_RANK")
     print(marker)
     print(f"[rank-codex] repo={repo} ranked={len(ranked)} recommend_next={top} "
           f"(read-only; top={args.top})")
