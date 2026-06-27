@@ -488,13 +488,16 @@ def cmd_rank_codex_reviews(args) -> int:
     gh = ReadOnlyGitHub(args.repo)
     try:
         repo = gh.resolve_repo()
-        prs = gh.list_prs(state="all" if args.include_merged else "open", limit=args.limit)
+        if args.include_merged:
+            # fetch OPEN and MERGED separately so --limit counts ELIGIBLE PRs, not closed-unmerged
+            # ones that would consume the limit before filtering (retroactive review of merged work).
+            prs = (gh.list_prs(state="open", limit=args.limit)
+                   + gh.list_prs(state="merged", limit=args.limit))
+        else:
+            prs = gh.list_prs(state="open", limit=args.limit)
     except GhError as e:
         print(f"[devflow] gh error: {e}")
         return 1
-    # --include-merged ranks OPEN + MERGED (retroactive review of merged work); never closed-unmerged.
-    if args.include_merged:
-        prs = [p for p in prs if p.get("state") in ("OPEN", "MERGED")]
 
     ranked, errors = [], []
     for pr in prs:
@@ -503,9 +506,9 @@ def cmd_rank_codex_reviews(args) -> int:
             continue
         try:
             cov = gh.codex_review_rounds(num, head=pr.get("head"))
-        except GhError as e:                            # one PR failing must not abort the ranking
-            errors.append((num, str(e)))
-            cov = {"rounds": 0, "reviewed_on_head": False}
+        except GhError as e:                            # a failed lookup must not be ranked as rounds=0
+            errors.append((num, str(e)))                # (which mints MAX priority) — surface, don't rank
+            continue
         s = score_review_priority(
             additions=pr["additions"], deletions=pr["deletions"], changed_files=pr["changed_files"],
             title=pr["title"], branch=pr["branch"], codex_rounds=cov["rounds"],

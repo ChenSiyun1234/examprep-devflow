@@ -46,7 +46,9 @@ def score(additions=0, deletions=0, changed_files=0, title="", branch="",
     needs_review = 10 if rounds == 0 else max(1, 9 - rounds)
     if reviewed_on_head:
         needs_review = max(0, needs_review - 4)
-    churn = max(0, int(additions or 0)) + 30 * max(0, int(changed_files or 0))
+    # deletions count toward blast radius too (a removal-heavy PR still needs review), at half weight.
+    churn = (max(0, int(additions or 0)) + max(0, int(deletions or 0)) // 2
+             + 30 * max(0, int(changed_files or 0)))
     impact = min(10, round(churn / 120))                       # 0..10 rough blast radius
     ptype = classify_type(title, branch, additions)
     type_adjust = {"feature": 1, "mixed": 0, "bugfix": -2}[ptype]

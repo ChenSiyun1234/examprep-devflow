@@ -353,10 +353,14 @@ class ReadOnlyGitHub:
     def codex_review_rounds(self, pr_number: int, head: Optional[str] = None) -> dict:
         """Count SUBSTANTIVE (non-quota) trusted-Codex reviews on a PR, and whether the given
         ``head`` SHA is already reviewed. Read-only. Returns ``{rounds, reviewed_on_head}``."""
+        # a substantive review = non-quota Codex review with a body OR a meaningful state (an
+        # empty-body COMMENTED/CHANGES_REQUESTED/APPROVED review whose content is in inline comments
+        # still counts as a review round).
         revs = [r for r in self.get_pr_reviews(pr_number)
                 if is_codex_author(r.get("author"))
                 and not is_codex_quota_notice(r.get("body"))
-                and (r.get("body") or "").strip()]
+                and ((r.get("body") or "").strip()
+                     or (r.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"))]
         on_head = bool(head) and any((r.get("commit_id") or "") == head for r in revs)
         return {"rounds": len(revs), "reviewed_on_head": on_head}
 

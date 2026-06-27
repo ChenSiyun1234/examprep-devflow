@@ -45,6 +45,12 @@ class TestReviewPriorityScore(unittest.TestCase):
         self.assertGreater(big["impact"], small["impact"])
         self.assertLessEqual(big["impact"], 10)            # capped
 
+    def test_deletions_contribute_to_impact(self):
+        # a removal-heavy PR still has blast radius -> deletions raise impact (Codex r1)
+        no_del = score(additions=100, deletions=0, changed_files=1, title="feat: x", branch="feat/x")
+        big_del = score(additions=100, deletions=2000, changed_files=1, title="feat: x", branch="feat/x")
+        self.assertGreater(big_del["impact"], no_del["impact"])
+
     def test_reviewed_on_head_lowers_need(self):
         not_seen = score(additions=200, changed_files=3, title="feat: x", branch="feat/x", codex_rounds=2)
         seen = score(additions=200, changed_files=3, title="feat: x", branch="feat/x", codex_rounds=2,
@@ -75,8 +81,9 @@ def rev(commit, body="### Codex Review\n- fix the null case", login=CODEX, state
             "submitted_at": "2026-01-03T00:00:00Z", "commit_id": commit, "html_url": "u"}
 
 
-def make_fake_gh(pr_list, reviews_by_pr=None, auth_ok=True, recorder=None):
+def make_fake_gh(pr_list, reviews_by_pr=None, auth_ok=True, recorder=None, error_prs=()):
     reviews_by_pr = reviews_by_pr or {}
+    error_prs = set(error_prs)
 
     def fake_run(cmd, **kw):
         if recorder is not None:
@@ -89,11 +96,16 @@ def make_fake_gh(pr_list, reviews_by_pr=None, auth_ok=True, recorder=None):
         if args[:2] == ["repo", "view"]:
             return SimpleNamespace(returncode=0, stdout=json.dumps({"nameWithOwner": "o/r"}), stderr="")
         if args[:2] == ["pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout=json.dumps(pr_list), stderr="")
+            st = args[args.index("--state") + 1] if "--state" in args else "open"
+            sel = pr_list if st == "all" else [p for p in pr_list
+                                               if (p.get("state") or "OPEN").lower() == st]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(sel), stderr="")
         if args and args[0] == "api":
             path = next((a for a in args[1:] if a.startswith("repos/")), "")
             m = re.search(r"/pulls/(\d+)/reviews", path)
             n = int(m.group(1)) if m else -1
+            if n in error_prs:
+                return SimpleNamespace(returncode=1, stdout="", stderr=f"simulated gh error for PR {n}")
             payload = reviews_by_pr.get(n, [])
             out = [payload] if "--slurp" in args else payload
             return SimpleNamespace(returncode=0, stdout=json.dumps(out), stderr="")
@@ -103,9 +115,10 @@ def make_fake_gh(pr_list, reviews_by_pr=None, auth_ok=True, recorder=None):
 
 class RankCodexBase(unittest.TestCase):
     def run_rank(self, pr_list, reviews_by_pr=None, top=3, include_merged=False, as_json=False,
-                 limit=50, auth_ok=True, repo="o/r"):
+                 limit=50, auth_ok=True, repo="o/r", error_prs=()):
         recorder = []
-        fake = make_fake_gh(pr_list, reviews_by_pr, auth_ok=auth_ok, recorder=recorder)
+        fake = make_fake_gh(pr_list, reviews_by_pr, auth_ok=auth_ok, recorder=recorder,
+                            error_prs=error_prs)
         args = SimpleNamespace(repo=repo, limit=limit, top=top, include_merged=include_merged,
                                json=as_json)
         buf = io.StringIO()
@@ -159,6 +172,29 @@ class TestRankCodexBehavior(RankCodexBase):
         self.assertIn(1, ranked)
         self.assertIn(2, ranked)
         self.assertNotIn(3, ranked)                       # closed-unmerged is excluded
+
+    def test_empty_body_stateful_review_counts_as_a_round(self):
+        # a Codex review with an empty body but a real state (content in inline comments) is a round (Codex r1)
+        prs = [pr(1, "feat: x", "feat/x", 300, files=4)]
+        rc, out, _ = self.run_rank(prs, reviews_by_pr={1: [rev("h1", body="", state="CHANGES_REQUESTED")]})
+        self.assertIn("rounds=1", out)                    # not mis-counted as never-reviewed
+
+    def test_errored_pr_is_excluded_not_ranked_max_priority(self):
+        # a PR whose review lookup fails must NOT be ranked as rounds=0 (which would mint max priority)
+        prs = [pr(1, "feat: a", "feat/a", 200, files=3), pr(2, "feat: b", "feat/b", 200, files=3)]
+        rc, out, _ = self.run_rank(prs, reviews_by_pr={2: [rev("h2")]}, error_prs={1})
+        self.assertEqual(self.order_of(out), [2])         # only the readable PR is ranked
+        self.assertIn("! PR #1", out)                     # the errored PR is surfaced, not silently ranked
+
+    def test_include_merged_uses_separate_state_queries(self):
+        # eligibility filter is pushed into the gh query (open + merged), so --limit counts eligible PRs
+        prs = [pr(1, "feat: o", "feat/o", 200, files=3, state="OPEN"),
+               pr(2, "feat: m", "feat/m", 200, files=3, state="MERGED")]
+        _, _, rec = self.run_rank(prs, include_merged=True)
+        states = [c[c.index("--state") + 1] for c in rec if c[1:3] == ["pr", "list"] and "--state" in c]
+        self.assertIn("open", states)
+        self.assertIn("merged", states)
+        self.assertNotIn("all", states)                   # no longer a broad 'all' fetch then post-filter
 
     def test_no_prs_emits_no_prs_marker(self):
         rc, out, _ = self.run_rank([])
