@@ -65,6 +65,7 @@ class TestReviewPriorityScore(unittest.TestCase):
     def test_classify_type_large_fix_is_not_deprioritized(self):
         self.assertEqual(classify_type("fix: small typo", "fix/typo", 12), "bugfix")
         self.assertNotEqual(classify_type("fix: rewrite engine", "fix/engine", 900), "bugfix")  # big "fix" not deprioritized
+        self.assertNotEqual(classify_type("fix: drop legacy engine", "fix/drop", 0, 2000), "bugfix")  # removal-heavy (Codex r2)
         self.assertEqual(classify_type("feat: new cmd", "feat/cmd", 100), "feature")
         self.assertEqual(classify_type("chore: bump", "chore/bump", 5), "mixed")
 
@@ -81,8 +82,16 @@ def rev(commit, body="### Codex Review\n- fix the null case", login=CODEX, state
             "submitted_at": "2026-01-03T00:00:00Z", "commit_id": commit, "html_url": "u"}
 
 
-def make_fake_gh(pr_list, reviews_by_pr=None, auth_ok=True, recorder=None, error_prs=()):
+def quota_comment(created_at="2026-02-01T00:00:00Z", login=CODEX):
+    return {"user": {"login": login},
+            "body": "You have reached your Codex usage limits for code reviews.",
+            "created_at": created_at, "html_url": "q"}
+
+
+def make_fake_gh(pr_list, reviews_by_pr=None, comments_by_pr=None, auth_ok=True, recorder=None,
+                 error_prs=()):
     reviews_by_pr = reviews_by_pr or {}
+    comments_by_pr = comments_by_pr or {}
     error_prs = set(error_prs)
 
     def fake_run(cmd, **kw):
@@ -102,11 +111,17 @@ def make_fake_gh(pr_list, reviews_by_pr=None, auth_ok=True, recorder=None, error
             return SimpleNamespace(returncode=0, stdout=json.dumps(sel), stderr="")
         if args and args[0] == "api":
             path = next((a for a in args[1:] if a.startswith("repos/")), "")
-            m = re.search(r"/pulls/(\d+)/reviews", path)
-            n = int(m.group(1)) if m else -1
-            if n in error_prs:
-                return SimpleNamespace(returncode=1, stdout="", stderr=f"simulated gh error for PR {n}")
-            payload = reviews_by_pr.get(n, [])
+            mr = re.search(r"/pulls/(\d+)/reviews", path)
+            mc = re.search(r"/issues/(\d+)/comments", path)
+            if mr:
+                n = int(mr.group(1))
+                if n in error_prs:
+                    return SimpleNamespace(returncode=1, stdout="", stderr=f"simulated gh error for PR {n}")
+                payload = reviews_by_pr.get(n, [])
+            elif mc:
+                payload = comments_by_pr.get(int(mc.group(1)), [])
+            else:
+                payload = []
             out = [payload] if "--slurp" in args else payload
             return SimpleNamespace(returncode=0, stdout=json.dumps(out), stderr="")
         return SimpleNamespace(returncode=1, stdout="", stderr="unexpected: " + " ".join(args))
@@ -114,10 +129,10 @@ def make_fake_gh(pr_list, reviews_by_pr=None, auth_ok=True, recorder=None, error
 
 
 class RankCodexBase(unittest.TestCase):
-    def run_rank(self, pr_list, reviews_by_pr=None, top=3, include_merged=False, as_json=False,
-                 limit=50, auth_ok=True, repo="o/r", error_prs=()):
+    def run_rank(self, pr_list, reviews_by_pr=None, comments_by_pr=None, top=3, include_merged=False,
+                 as_json=False, limit=50, auth_ok=True, repo="o/r", error_prs=()):
         recorder = []
-        fake = make_fake_gh(pr_list, reviews_by_pr, auth_ok=auth_ok, recorder=recorder,
+        fake = make_fake_gh(pr_list, reviews_by_pr, comments_by_pr, auth_ok=auth_ok, recorder=recorder,
                             error_prs=error_prs)
         args = SimpleNamespace(repo=repo, limit=limit, top=top, include_merged=include_merged,
                                json=as_json)
@@ -195,6 +210,23 @@ class TestRankCodexBehavior(RankCodexBase):
         self.assertIn("open", states)
         self.assertIn("merged", states)
         self.assertNotIn("all", states)                   # no longer a broad 'all' fetch then post-filter
+
+    def test_limit_caps_combined_open_and_merged(self):
+        # --include-merged with --limit N must cap the COMBINED union to N, not N-per-state (Codex r2)
+        prs = [pr(1, "feat: o", "feat/o", 200, files=3, state="OPEN"),
+               pr(2, "feat: m", "feat/m", 200, files=3, state="MERGED")]
+        rc, out, _ = self.run_rank(prs, include_merged=True, limit=1)
+        self.assertEqual(len(self.order_of(out)), 1)      # only 1 ranked despite 1 open + 1 merged
+
+    def test_quota_limited_pr_kept_out_of_recommend_next(self):
+        # a PR whose latest Codex signal is a usage-limit COMMENT is rate-limited -> not recommended (Codex r2)
+        prs = [pr(1, "feat: big", "feat/big", 600, files=6),     # rate-limited, would otherwise top
+               pr(2, "feat: other", "feat/o", 200, files=3)]
+        rc, out, _ = self.run_rank(prs, comments_by_pr={1: [quota_comment()]}, top=1)
+        self.assertIn("rate-limited", out)
+        m = re.search(r"recommend_next=\[([^\]]*)\]", out)
+        self.assertNotIn("1", m.group(1))                 # the rate-limited PR is NOT recommended
+        self.assertIn("2", m.group(1))                    # the reviewable one is
 
     def test_no_prs_emits_no_prs_marker(self):
         rc, out, _ = self.run_rank([])

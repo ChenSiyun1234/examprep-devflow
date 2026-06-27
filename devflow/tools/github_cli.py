@@ -351,18 +351,28 @@ class ReadOnlyGitHub:
         return out
 
     def codex_review_rounds(self, pr_number: int, head: Optional[str] = None) -> dict:
-        """Count SUBSTANTIVE (non-quota) trusted-Codex reviews on a PR, and whether the given
-        ``head`` SHA is already reviewed. Read-only. Returns ``{rounds, reviewed_on_head}``."""
+        """Count SUBSTANTIVE (non-quota) trusted-Codex reviews on a PR, whether the given ``head`` SHA
+        is already reviewed, and whether the PR is CURRENTLY rate-limited (latest Codex signal — review
+        OR comment — is a usage-limits notice). Read-only.
+        Returns ``{rounds, reviewed_on_head, quota_limited}``."""
+        reviews = self.get_pr_reviews(pr_number)
         # a substantive review = non-quota Codex review with a body OR a meaningful state (an
         # empty-body COMMENTED/CHANGES_REQUESTED/APPROVED review whose content is in inline comments
         # still counts as a review round).
-        revs = [r for r in self.get_pr_reviews(pr_number)
+        revs = [r for r in reviews
                 if is_codex_author(r.get("author"))
                 and not is_codex_quota_notice(r.get("body"))
                 and ((r.get("body") or "").strip()
                      or (r.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"))]
         on_head = bool(head) and any((r.get("commit_id") or "") == head for r in revs)
-        return {"rounds": len(revs), "reviewed_on_head": on_head}
+        # quota notices arrive as PR COMMENTS (not reviews) — count those too so the ranker won't put a
+        # currently rate-limited PR at the front and ask Codex to review what it just declined.
+        sigs = [(r.get("created_at"), r.get("body")) for r in reviews if is_codex_author(r.get("author"))]
+        sigs += [(c.get("created_at"), c.get("body"))
+                 for c in self.get_pr_comments(pr_number) if is_codex_author(c.get("author"))]
+        sigs = [(t, b) for t, b in sigs if t]
+        quota_limited = is_codex_quota_notice(max(sigs, key=lambda x: x[0])[1]) if sigs else False
+        return {"rounds": len(revs), "reviewed_on_head": on_head, "quota_limited": quota_limited}
 
     # Codex helpers ---------------------------------------------------------------------
     def find_latest_codex_advisory(self, issue_number: int) -> Optional[dict]:

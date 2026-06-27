@@ -22,12 +22,14 @@ _FEATURE_RE = re.compile(r"\b(feat|feature|add|adds|implement|support|introduce)
 _BIG_CHANGE = 400   # additions at/above this make a "fix" count as a feature (don't deprioritize)
 
 
-def classify_type(title: str, branch: str, additions: int) -> str:
+def classify_type(title: str, branch: str, additions: int, deletions: int = 0) -> str:
     """'feature' | 'bugfix' | 'mixed' from the title + branch name (and size as a tie-breaker)."""
     text = f"{title or ''} {branch or ''}"
     bug = bool(_BUGFIX_RE.search(text))
     feat = bool(_FEATURE_RE.search(text))
-    if bug and int(additions or 0) < _BIG_CHANGE:
+    # size = additions + deletions so a big REMOVAL-heavy fix (e.g. "fix: drop legacy engine" +0/-2000)
+    # isn't deprioritized as a small bugfix.
+    if bug and (int(additions or 0) + int(deletions or 0)) < _BIG_CHANGE:
         return "bugfix"
     if feat:
         return "feature"
@@ -50,7 +52,7 @@ def score(additions=0, deletions=0, changed_files=0, title="", branch="",
     churn = (max(0, int(additions or 0)) + max(0, int(deletions or 0)) // 2
              + 30 * max(0, int(changed_files or 0)))
     impact = min(10, round(churn / 120))                       # 0..10 rough blast radius
-    ptype = classify_type(title, branch, additions)
+    ptype = classify_type(title, branch, additions, deletions)
     type_adjust = {"feature": 1, "mixed": 0, "bugfix": -2}[ptype]
     priority = max(0, min(100, 6 * needs_review + 4 * impact + type_adjust))
     return {"priority": priority, "needs_review": needs_review, "impact": impact,

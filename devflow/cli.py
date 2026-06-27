@@ -491,8 +491,10 @@ def cmd_rank_codex_reviews(args) -> int:
         if args.include_merged:
             # fetch OPEN and MERGED separately so --limit counts ELIGIBLE PRs, not closed-unmerged
             # ones that would consume the limit before filtering (retroactive review of merged work).
+            # cap the COMBINED open+merged union to --limit (gh applies --limit per query, so the
+            # union could otherwise reach 2*limit, exceeding the "max PRs to inspect" window).
             prs = (gh.list_prs(state="open", limit=args.limit)
-                   + gh.list_prs(state="merged", limit=args.limit))
+                   + gh.list_prs(state="merged", limit=args.limit))[:args.limit]
         else:
             prs = gh.list_prs(state="open", limit=args.limit)
     except GhError as e:
@@ -513,11 +515,14 @@ def cmd_rank_codex_reviews(args) -> int:
             additions=pr["additions"], deletions=pr["deletions"], changed_files=pr["changed_files"],
             title=pr["title"], branch=pr["branch"], codex_rounds=cov["rounds"],
             reviewed_on_head=cov["reviewed_on_head"])
-        ranked.append({**pr, **s, "reviewed_on_head": cov["reviewed_on_head"]})
+        ranked.append({**pr, **s, "reviewed_on_head": cov["reviewed_on_head"],
+                       "quota_limited": cov.get("quota_limited", False)})
 
     # highest priority first; tie-break by need, then PR number (stable + deterministic)
     ranked.sort(key=lambda r: (-r["priority"], -r["needs_review"], r["number"]))
-    top = [r["number"] for r in ranked[:args.top]]
+    # don't recommend requesting review on a CURRENTLY rate-limited PR — Codex just said it can't
+    # review now; such PRs are still shown in the table but kept out of recommend_next.
+    top = [r["number"] for r in ranked if not r.get("quota_limited")][:args.top]
 
     marker = "RANKED_CODEX_REVIEW_QUEUE" if ranked else "NO_PRS_TO_RANK"
     print(marker)
@@ -526,8 +531,9 @@ def cmd_rank_codex_reviews(args) -> int:
     for r in ranked:
         flag = "  <-- request next" if r["number"] in top else ""
         head_note = " head-reviewed" if r["reviewed_on_head"] else ""
+        q_note = " rate-limited" if r.get("quota_limited") else ""
         print(f"  #{r['number']:>3} prio={r['priority']:>3} {r['type']:>7} "
-              f"needs={r['needs_review']} impact={r['impact']} rounds={r['codex_rounds']}{head_note} "
+              f"needs={r['needs_review']} impact={r['impact']} rounds={r['codex_rounds']}{head_note}{q_note} "
               f"+{r['additions']}/-{r['deletions']} {r['state']}{flag}  {(r['title'] or '')[:48]}")
     for e_num, e_msg in errors:
         print(f"  ! PR #{e_num}: gh error: {e_msg}")
@@ -537,6 +543,7 @@ def cmd_rank_codex_reviews(args) -> int:
             "ranked": [{"pr": r["number"], "priority": r["priority"], "type": r["type"],
                         "needs_review": r["needs_review"], "impact": r["impact"],
                         "codex_rounds": r["codex_rounds"], "reviewed_on_head": r["reviewed_on_head"],
+                        "quota_limited": r.get("quota_limited", False),
                         "state": r["state"], "additions": r["additions"], "deletions": r["deletions"],
                         "title": r["title"]} for r in ranked],
             "errors": [{"pr": n, "error": m} for n, m in errors],
