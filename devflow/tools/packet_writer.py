@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from typing import Optional
 
 PACKET_JSON_NAME = "implementation-packet.json"
@@ -78,22 +79,32 @@ def _as_list(v) -> list:
 def _is_safe_rel_path(p) -> bool:
     """True only for a repo-relative path with no traversal. Rejects absolute paths (POSIX, UNC, or
     Windows-drive) and any ``..`` segment, so an untrusted advisory/review can't point edits outside
-    the repo. Used to filter ``files_likely_touched`` (which comes from untrusted Codex content)."""
-    if not isinstance(p, str) or not p.strip():
+    the repo. Used to filter ``files_likely_touched`` (which comes from untrusted Codex content).
+
+    The path is stripped FIRST so leading/embedded whitespace can't smuggle an absolute path or
+    ``..`` past the checks (e.g. ``" /etc/passwd"`` or ``".. /x"``)."""
+    if not isinstance(p, str):
         return False
-    q = p.replace("\\", "/")
+    q = p.strip().replace("\\", "/")
+    if not q:
+        return False
     if q.startswith("/"):                         # POSIX absolute or UNC (//server)
         return False
     if len(q) >= 2 and q[1] == ":":               # Windows drive, e.g. C:/...
         return False
-    return not any(seg == ".." for seg in q.split("/"))
+    return not any(seg.strip() == ".." for seg in q.split("/"))
+
+
+# Collapses the FULL set of line/paragraph separators that Python treats as line breaks (str.split-
+# lines), not just \r\n — so untrusted text can't start a new Markdown block via U+2028/U+2029/NEL/etc.
+_LINE_BREAKS_RE = re.compile("[\r\n\u2028\u2029\x85\x0b\x0c]+")
 
 
 def _md_safe(s) -> str:
-    """Neutralize untrusted text for Markdown rendering: collapse newlines so the content can't
-    start a new block (e.g. a forged ``## Safety boundaries`` heading) and trim. The JSON packet
-    keeps the raw, faithful value — only the human-readable Markdown is sanitized."""
-    return str(s).replace("\r", " ").replace("\n", " ").strip()
+    """Neutralize untrusted text for Markdown rendering: collapse any line/paragraph separator so the
+    content can't start a new block (e.g. a forged ``## Safety boundaries`` heading) and trim. The
+    JSON packet keeps the raw, faithful value — only the human-readable Markdown is sanitized."""
+    return _LINE_BREAKS_RE.sub(" ", str(s)).strip()
 
 
 def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> dict:
@@ -291,3 +302,164 @@ def write_packet(base_dir: str, thread_id: str, packet: dict,
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(markdown if markdown is not None else render_markdown(packet))
     return {"dir": pkt_dir, "slug": slug, "json_path": json_path, "md_path": md_path}
+
+
+# ======================================================================================
+# Manual (human-provided) scope packets — created directly from a Markdown scope file,
+# WITHOUT a prior advisory/checkpoint. Source is marked ``manual_human_scope`` so a generic
+# simulated-advisory packet can never be mistaken for a concrete, human-approved scope.
+# ======================================================================================
+MANUAL_SOURCE = "manual_human_scope"
+
+# Maps a scope-file heading (lower-cased, '#'s stripped) to a canonical section key. Defensive +
+# forgiving: unknown headings are ignored, missing sections default to empty.
+_SCOPE_SECTION_ALIASES = {
+    "task": "task",
+    "approved scope": "approved_scope", "scope": "approved_scope",
+    "tasks": "tasks", "tasks to perform": "tasks",
+    "files likely touched": "files", "files": "files",
+    "out of scope": "out_of_scope", "out-of-scope": "out_of_scope",
+    "checks to run": "checks", "checks": "checks",
+    "tests to run": "checks", "tests": "checks",
+    "tests/checks to run": "checks", "tests / checks to run": "checks",
+    "safety rules": "safety", "safety": "safety", "safety boundaries": "safety",
+}
+
+
+def parse_scope_markdown(text: str) -> dict:
+    """Parse a simple Markdown scope file into section lists. Intentionally tiny + defensive (no
+    Markdown library): top-level ``#`` headings start sections; bullet/plain lines become items;
+    unrecognized headings are ignored. Returns a dict with keys: task (str|None), approved_scope,
+    tasks, files, out_of_scope, checks, safety (all lists)."""
+    sections: dict = {}
+    unknown_headings: list = []
+    current = None
+    for raw in (text or "").splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("#"):
+            heading = stripped.lstrip("#").strip()
+            current = _SCOPE_SECTION_ALIASES.get(heading.lower())
+            if current:
+                sections.setdefault(current, [])
+            elif heading:
+                unknown_headings.append(heading)   # surfaced (CLI warns) so its body isn't lost silently
+            continue
+        if current and stripped:
+            # strip a leading bullet marker: - , * , + , or •
+            item = (stripped[2:].strip()
+                    if len(stripped) > 1 and stripped[0] in "-*+•" and stripped[1] == " "
+                    else stripped)
+            if item:
+                sections.setdefault(current, []).append(item)
+    task_lines = sections.pop("task", [])
+    out = {"task": task_lines[0] if task_lines else None, "unknown_headings": unknown_headings}
+    for key in ("approved_scope", "tasks", "files", "out_of_scope", "checks", "safety"):
+        out[key] = sections.get(key, [])
+    return out
+
+
+def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
+                        scope_file: Optional[str] = None) -> dict:
+    """Build an Implementation Packet from explicit human-provided scope (source = manual_human_scope).
+
+    The canonical SAFETY_BOUNDARIES are ALWAYS enforced — an incomplete scope file can add rules but
+    can never remove them. File paths are filtered (no absolute/``..``) just like the export path."""
+    scope = scope if isinstance(scope, dict) else {}
+    # coerce every section to a list (a hand-written/foreign scope dict may carry None or a bare str)
+    approved_scope = [s for s in _as_list(scope.get("approved_scope")) if str(s).strip()]
+    tasks = [t for t in _as_list(scope.get("tasks")) if str(t).strip()] or list(approved_scope)
+
+    raw_files = [str(f) for f in _as_list(scope.get("files")) if str(f).strip()]
+    files = sorted({p for p in raw_files if _is_safe_rel_path(p)})
+    unsafe = sorted({p for p in raw_files if not _is_safe_rel_path(p)})
+
+    out_of_scope = [str(s) for s in _as_list(scope.get("out_of_scope")) if str(s).strip()]
+    out_of_scope += [f"(ignored unsafe path — outside repo, do NOT touch) {p}" for p in unsafe]
+
+    tests = [str(c) for c in _as_list(scope.get("checks")) if str(c).strip()] or \
+        ["python -m unittest discover -s tests"]
+
+    safety = list(SAFETY_BOUNDARIES)                      # hard boundaries — never removable
+    for r in _as_list(scope.get("safety")):
+        r = str(r).strip()
+        if r and r not in safety:
+            safety.append(r)
+
+    suggested = (f"Implement the manual-scope Implementation Packet for task \"{task}\" "
+                 f"(thread {thread_id}). Do ONLY the listed tasks, touch only the listed files, run "
+                 f"the listed checks and paste the real output; do not commit/push/merge; ask before "
+                 f"expanding scope.")
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source": MANUAL_SOURCE,
+        "metadata": {
+            "thread_id": thread_id,
+            "task": task,
+            "repo": repo,
+            "generated_at": generated_at,
+            "source": MANUAL_SOURCE,
+            "scope_file": scope_file,
+        },
+        "approval": {
+            "source": MANUAL_SOURCE,
+            "approved_scope": approved_scope,
+        },
+        "implementation_instructions": {
+            "tasks": tasks,
+            "files_likely_touched": files,
+            "out_of_scope": out_of_scope,
+            "tests_to_run": tests,
+            "safety_rules": safety,
+        },
+        "safety_boundaries": safety,
+        "suggested_prompt": suggested,
+    }
+
+
+def render_manual_markdown(packet: dict) -> str:
+    """Render a manual-scope packet as Markdown. Untrusted scope text is sanitized via ``_md_safe``."""
+    m = packet.get("metadata", {})
+    ap = packet.get("approval", {})
+    ii = packet.get("implementation_instructions", {})
+    out = [
+        "# Implementation Packet (manual human scope)",
+        "",
+        f"> **Source: `{packet.get('source')}`** — created from a human-provided scope file, NOT a "
+        "Codex advisory. devflow does not edit repository files itself; Claude Code implements within "
+        "the scope and safety boundaries below.",
+        "",
+        "## Metadata",
+        f"- thread_id: `{_md_safe(m.get('thread_id'))}`",
+        f"- task: {_md_safe(m.get('task'))}",
+        f"- repo: {_md_safe(m.get('repo'))}",
+        f"- generated_at: {_md_safe(m.get('generated_at'))}",
+        f"- source: {_md_safe(m.get('source'))}",
+    ]
+    if m.get("scope_file"):
+        out.append(f"- scope_file: {_md_safe(m.get('scope_file'))}")
+    out += [
+        "",
+        "## Approved scope",
+        _md_list(ap.get("approved_scope")),
+        "",
+        "## Tasks",
+        _md_list(ii.get("tasks")),
+        "",
+        "## Files likely touched",
+        _md_list(ii.get("files_likely_touched")),
+        "",
+        "## Out of scope",
+        _md_list(ii.get("out_of_scope")),
+        "",
+        "## Tests / checks to run",
+        _md_list(ii.get("tests_to_run")),
+        "",
+        "## Safety boundaries",
+        _md_list(packet.get("safety_boundaries")),
+        "",
+        "## Suggested Claude Code prompt",
+        _md_safe(packet.get("suggested_prompt")),
+        "",
+    ]
+    return "\n".join(out)

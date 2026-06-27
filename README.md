@@ -93,9 +93,66 @@ paths, the thread id, source issue/PR, and the suggested next Claude Code messag
 > ⚠️ **Dry-run / simulated advisories produce a *generic* packet.** A `docs-advisory` run without
 > real Codex input uses a simulated advisory, so the packet's approved scope is generic guidance
 > ("scope to a dry-run scaffold", "add tests + docs") with **no `files likely touched` and no
-> concrete tasks** — it is **not enough for real implementation**. For an actionable packet, export
-> from a thread backed by a **real** Codex advisory/review (a real PR with blocking comments yields
-> concrete tasks + file paths). Manual-scope packet support is planned as a follow-up.
+> concrete tasks** — it is **not enough for real implementation**. For an actionable packet, either
+> export from a thread backed by a **real** Codex advisory/review (a real PR with blocking comments
+> yields concrete tasks + file paths), or use **`create-implementation-packet`** below to provide a
+> concrete scope yourself.
+
+### `create-implementation-packet` — packet from a human-provided scope
+
+When there is no real advisory (or the simulated one is too generic), the human owner can write the
+scope directly in a Markdown file and generate a packet from it — no checkpoint needed. The packet is
+marked **`source: manual_human_scope`** so it can't be confused with a generic simulated-advisory one.
+
+```bash
+python -m devflow.cli create-implementation-packet \
+  --thread-id check-runner-1 \
+  --task "Add allowlisted check runner" \
+  --scope-file scope.md \
+  --repo ChenSiyun1234/examprep-devflow
+```
+
+**When to use which:**
+- **`export-implementation-packet`** — you already ran the workflow to a paused gate and want to hand
+  off the (real) advisory/review scope.
+- **`create-implementation-packet`** — you want to hand off a concrete scope you wrote yourself,
+  without first running an advisory.
+
+Both write the same `.devflow/packets/<safe-thread-id>/implementation-packet.{md,json}` files, make
+**no GitHub calls, run no shell, and never edit repository code**. The canonical safety boundaries
+(no secrets/keys, no commit/push/PR, no merge, no branch-delete, no force-push, no false "tests
+passed") are always embedded — a scope file may *add* rules but can never remove them. File paths in
+the scope are filtered: absolute paths and `..` traversal are rejected (listed under out-of-scope).
+
+Example `scope.md`:
+
+```markdown
+# Task
+Add allowlisted check runner
+
+# Approved scope
+Implement a safe, allowlisted check runner for devflow.
+
+# Files likely touched
+- devflow/cli.py
+- devflow/tools/check_runner.py
+- tests/test_devflow_check_runner.py
+
+# Out of scope
+- arbitrary shell execution
+- GitHub Actions
+- automatic merge
+
+# Checks to run
+- python -m unittest discover -s tests
+
+# Safety rules
+- no secrets
+- no branch deletion
+```
+
+On success it prints `MANUAL_IMPLEMENTATION_PACKET_CREATED`, the two paths, the thread id, the task,
+and the suggested next Claude Code message.
 
 ## LangGraph Studio (`langgraph dev`)
 
