@@ -195,6 +195,10 @@ def _run_langgraph(args) -> int:
         state["_simulate"] = {"advisory": args.simulate_advisory or "ready",
                               "review": args.simulate_review or "blocking"}
     cfg = {"configurable": {"thread_id": args.thread_id}}
+    # drop any stale stdlib-fallback checkpoint for this thread BEFORE running, so that if the
+    # langgraph run pauses, a stray plain `resume` can't load the obsolete fallback state instead of
+    # being told to resume with --langgraph.
+    _clear_fallback_ckpt(args.thread_id)
     print(f"[devflow] backend=langgraph (sqlite checkpointer)  dry_run=True  "
           f"task={args.task}  thread={args.thread_id}")
     with cm as saver:
@@ -280,8 +284,11 @@ def cmd_resume(args) -> int:
             return 1
     state["real_github"] = want_live
     start = state.get("paused_at_node") or GATE_TO_NODE.get(gate)
-    if start not in NODE_FUNCS:        # a checkpoint written before a node was renamed stores a stale
-        start = GATE_TO_NODE.get(gate)  # node name -> fall back to the gate's canonical node (no KeyError)
+    if start not in NODE_FUNCS:
+        # a checkpoint from before a node rename stores a stale node name -> fall back to the node for
+        # the gate the checkpoint ACTUALLY paused at (state['paused_at_gate']), not the operator's
+        # --gate (which could be wrong for this thread and resume it at the wrong gate).
+        start = GATE_TO_NODE.get(state.get("paused_at_gate")) or GATE_TO_NODE.get(gate)
     state["status"] = "running"
     app = build_graph(prefer_fallback=True)  # resume uses the stdlib runner's start_node support
     print(f"[devflow] resume thread={args.thread_id} gate={args.gate} decision={decision} "

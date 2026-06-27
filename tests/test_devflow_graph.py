@@ -83,14 +83,19 @@ class TestDevflowGraph(unittest.TestCase):
     def test_resume_tolerates_legacy_renamed_node(self):
         # a checkpoint written before a node rename stores a stale paused_at_node -> stdlib resume
         # must fall back to the gate's canonical node, not KeyError (Codex review on PR #1)
+        import os
+        import uuid
         from devflow import cli
         paused = run(approvals={})                        # real pause at the advisory gate
         self.assertEqual(paused["status"], "paused")
+        tid = "legacy-" + uuid.uuid4().hex[:8]             # unique id + cleanup so the resume's new
+        paused["thread_id"] = tid                          # (re-paused) checkpoint never leaks to other tests
+        self.addCleanup(lambda: os.path.exists(cli._ckpt_path(tid)) and os.remove(cli._ckpt_path(tid)))
         paused["paused_at_node"] = "human_approval"        # the OLD (pre-rename) node name
         paused["approvals"] = {}
         cli._save_ckpt(paused)
         args = cli.build_parser().parse_args(
-            ["resume", "--thread-id", paused["thread_id"], "--gate", "advisory", "--decision", "approved"])
+            ["resume", "--thread-id", tid, "--gate", "advisory", "--decision", "approved"])
         rc = cli.cmd_resume(args)                           # must not raise KeyError
         self.assertEqual(rc, 0)
 
