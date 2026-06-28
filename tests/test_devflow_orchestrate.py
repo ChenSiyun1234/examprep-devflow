@@ -74,6 +74,15 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(orch.finding_severity("a P2 issue"), 2)
         self.assertEqual(orch.finding_severity("nit, no badge"), 3)   # untagged -> P3
 
+    def test_p0_and_unknown_badges_are_blocking(self):
+        # Codex r6 P1: P0 (release-blocking) must be severity 0, not fall through to P3; an unknown
+        # P-badge is also treated as blocking
+        self.assertEqual(orch.finding_severity("![P0 Badge] release blocker"), 0)
+        self.assertEqual(orch.finding_severity("![P5 Badge] unknown"), 0)
+        s = signals(reviews=[review("Codex Review", "aaaaaaa", 7, "2026-01-01T00:00:00Z")],
+                    inline_=[inline("![P0 Badge] blocker", 7, "2026-01-01T00:00:00Z")])
+        self.assertEqual(classify(meta(head="aaaaaaa"), s)["max_severity"], 0)   # not force-mergeable
+
     def test_is_quota_keys_off_opener_not_generic_phrase(self):
         self.assertTrue(orch.is_quota("You have reached your Codex usage limits for code reviews."))
         self.assertFalse(orch.is_quota("This review discusses usage limits for code reviews in the diff."))
@@ -130,6 +139,14 @@ class TestClassify(unittest.TestCase):
         self.assertTrue(c["has_head_review"])
         self.assertFalse(c["clean"])
         self.assertTrue(c["review_key"])
+
+    def test_comment_review_response_clears_awaiting(self):
+        # Codex r6 P2: a Codex CONVERSATION COMMENT response (Reviewed commit) clears 'awaiting', not only
+        # review objects — else the answered request stays wrongly in-flight and fills the cap
+        s = signals(comments=[comment("@codex review", "2026-01-01T00:00:00Z", author=ME),
+                              comment("Codex Review: some feedback. Reviewed commit: aaaaaaa",
+                                      "2026-01-02T00:00:00Z")])
+        self.assertFalse(classify(meta(head="aaaaaaa"), s)["awaiting"])
 
     def test_clean_verdict_comment_matching_head(self):
         s = signals(comments=[comment("Codex Review: Didn't find any issues. Reviewed commit: aaaaaaa",
@@ -266,6 +283,12 @@ class TestMergePredicates(unittest.TestCase):
         self.assertFalse(orch.is_inflight(self._c(awaiting=True, head="h2", latest_quota=True), {"5": "h2"}))
         self.assertTrue(orch.is_inflight(self._c(awaiting=True, head="h2", latest_quota=False), {"5": "h2"}))
 
+    def test_force_mergeable_blocked_by_requested_changes(self):
+        # Codex r6 P2: an outstanding CHANGES_REQUESTED blocks force-merge even with only-P3 + enough rounds
+        self.assertFalse(orch.force_mergeable(self._c(findings_on_head=1, max_severity=3, rounds_on_head=3,
+                                                      requested_changes=True)))
+        self.assertTrue(orch.force_mergeable(self._c(findings_on_head=1, max_severity=3, rounds_on_head=3)))
+
 
 class TestBuildPlan(unittest.TestCase):
     def _classified(self, **kw):
@@ -340,6 +363,15 @@ class TestBuildPlan(unittest.TestCase):
                                merged_branches={"feat/parent"})
         self.assertEqual(plan["needs_retarget"], [1])
         self.assertEqual(plan["request_review"], [])       # never request review against a stale base
+
+    def test_retarget_to_merged_parent_base_in_multilevel_stack(self):
+        # Codex r6 P2: a child of a parent merged into a NON-default branch retargets to THAT branch, not
+        # blindly to the default branch (which would drop the still-unmerged grandparent's changes)
+        cs = [self._classified(num=1, base_ref="branch-B")]
+        plan = orch.build_plan(cs, converged={}, requested_head={}, done=[], now=1,
+                               merged_branches={"branch-B": "branch-A"}, default_branch="main")
+        self.assertEqual(plan["needs_retarget"], [1])
+        self.assertEqual(plan["retarget_to"]["1"], "branch-A")   # parent's base, not 'main'
 
     def test_clean_draft_goes_to_ready_then_merge(self):
         # Codex r1 F5 (P2): a clean DRAFT is not directly mergeable — it must be un-drafted first
@@ -680,8 +712,8 @@ class TestOrchestrateCommand(unittest.TestCase):
         state_file = os.path.join(tempfile.mkdtemp(), "orch.json")
         rc, out = _run_orchestrate(["orchestrate-reviews", "--repo", "o/r", "--state-file", state_file], fake)
         self.assertEqual(rc, 0)
-        self.assertIn("RETARGET to master", out)
-        self.assertNotIn("RETARGET to main", out)
+        self.assertIn("#7->master", out)        # retarget target = the merged parent's base (here, master)
+        self.assertNotIn("->main", out)
 
 
 if __name__ == "__main__":

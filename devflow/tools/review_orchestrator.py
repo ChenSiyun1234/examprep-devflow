@@ -46,9 +46,9 @@ def state_path_for_repo(repo: str) -> str:
     return os.path.join(STATE_DIR, f"orchestrate_{safe}.json")
 
 # ---- pure heuristics / parsing ----
-# Codex tags each inline finding with a P1/P2/P3 badge; read it so the planner can tell merge-vs-fix
-# (and to deny "clean" when the summary body itself carries an explicit badge).
-_BADGE_RE = re.compile(r"\bP([123])\b")
+# Codex tags each inline finding with a severity badge (P0 release-blocking … P3 minor); read it so the
+# planner can tell merge-vs-fix (and to deny "clean" when the summary body itself carries an explicit badge).
+_BADGE_RE = re.compile(r"\bP([0-9])\b")
 _BUGFIX_RE = re.compile(r"\b(fix|bugfix|hotfix|patch|typo|regression|revert)\b|修复|修正", re.I)
 _FEATURE_RE = re.compile(r"\b(feat|feature|add|adds|implement|support|introduce)\b|新增|实现|支持", re.I)
 _CLEAN_VERDICT_RE = re.compile(
@@ -81,7 +81,10 @@ def is_clean_verdict(body) -> bool:
 
 def finding_severity(body) -> int:
     m = _BADGE_RE.search(body or "")
-    return int(m.group(1)) if m else 3        # an untagged finding is treated as minor (P3)
+    if not m:
+        return 3                              # an untagged inline finding is treated as minor (P3)
+    n = int(m.group(1))
+    return n if 0 <= n <= 3 else 0            # P0-P3 -> that level; any UNKNOWN P-badge -> blocking (0)
 
 
 def priority(meta: dict, rounds: int, reviewed_on_head: bool):
@@ -129,7 +132,7 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
     review_key = f"{latest_real_at}|{(latest_real or {}).get('url', '')}" if latest_real else ""
 
     # CLEAN vs FINDINGS (OPEN PRs only). A merged PR is never 'clean'/auto-merge-able.
-    findings_on_head, clean, max_severity = 0, False, None
+    findings_on_head, clean, max_severity, requested_changes = 0, False, None, False
     if not merged:
         # (a) a clean verdict as a CONVERSATION COMMENT whose 'Reviewed commit' == head — but ONLY if it
         # is at least as new as the latest review on head, so a STALE clean comment can't override a
@@ -183,11 +186,15 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
         review_key = f"comment|{comment_feedback_at}"
 
     # our own outstanding "@codex review" REQUESTS (a non-Codex review/re-review ask, not just any
-    # @codex command) -> awaiting iff newer than the latest substantive review on ANY commit. Comparing
-    # against the latest review ANYWHERE (not just on the current head) means an OLD request that was
-    # already answered on a prior head isn't mistaken for "still awaiting" once the head advances with no
-    # review yet — otherwise an untracked PR would be wrongly counted in-flight and never re-requested.
-    latest_any_real_at = max((r.get("created_at") or "" for r in real), default="")
+    # @codex command) -> awaiting iff newer than the latest substantive Codex response on ANY commit. The
+    # response can be a review OBJECT or a CONVERSATION COMMENT carrying a 'Reviewed commit' (clean verdict
+    # or feedback) — counting both means a comment-answered request clears 'awaiting' instead of staying
+    # wrongly in-flight and filling the cap.
+    latest_any_real_at = max(
+        [r.get("created_at") or "" for r in real]
+        + [c.get("created_at") or "" for c in codex_comments
+           if _REVIEWED_COMMIT_RE.search(c.get("body") or "")],
+        default="")
     my_reqs = [c for c in comments if not is_codex_author(c.get("author"))
                and _REVIEW_REQUEST_RE.search(c.get("body") or "")]
     latest_req_at = max((c.get("created_at") or "" for c in my_reqs), default="")
@@ -222,16 +229,18 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
         "has_head_review": has_head_review, "awaiting": awaiting, "req_age": req_age, "pending": pending,
         "latest_quota": latest_quota, "latest_sig_ts": latest_sig_ts, "responded_after_req": responded,
         "findings_on_head": findings_on_head, "clean": clean, "max_severity": max_severity,
-        "priority": prio, "needs": needs,
+        "requested_changes": requested_changes, "priority": prio, "needs": needs,
     }
 
 
 def force_mergeable(c: dict) -> bool:
     """Rule 2: the CURRENT head has been reviewed >=FORCE_MERGE_ROUNDS times (rounds_on_head, NOT the
     PR's all-time rounds — stale rounds from previous heads must not let a barely-reviewed new revision
-    force-merge) AND its latest review's findings are all minor (worst P3)."""
+    force-merge) AND its latest review's findings are all minor (worst P3) AND there is no outstanding
+    CHANGES_REQUESTED review (which stays blocking until a newer approval, regardless of P-levels)."""
     return (c["findings_on_head"] > 0 and c["max_severity"] is not None
-            and c["max_severity"] >= 3 and c.get("rounds_on_head", 0) >= FORCE_MERGE_ROUNDS)
+            and c["max_severity"] >= 3 and c.get("rounds_on_head", 0) >= FORCE_MERGE_ROUNDS
+            and not c.get("requested_changes"))
 
 
 def _p3_converging(c: dict) -> bool:
@@ -278,24 +287,28 @@ def build_plan(classified: list, *, converged: dict, requested_head: dict, done,
     base_branch = default_branch or "main"
     if merged_branches is None:
         merged_branches = {c.get("branch") for c in cls if c["merged"] and c.get("branch")}
-    else:
-        merged_branches = set(merged_branches)
+    # merged_branches may be a SET (membership only -> retarget to default) or a DICT {head: base}
+    # (retarget the child to its merged parent's ACTUAL base, for multi-level stacks).
+    merged_bases = dict(merged_branches) if isinstance(merged_branches, dict) else {}
+    merged_set = set(merged_branches)
 
     plan = {
         "ranking": [{"pr": c["num"], "priority": c["priority"], "rounds": c["rounds"],
                      "clean": c["clean"], "state": c["state"]} for c in cls],
         "request_review": [], "mergeable_now": [], "force_mergeable": [], "ready_then_merge": [],
-        "needs_conflict": [], "needs_retarget": [], "mergeable_unknown": [], "findings_to_fix": [],
-        "in_flight": [], "rate_limited": False,
+        "needs_conflict": [], "needs_retarget": [], "retarget_to": {}, "mergeable_unknown": [],
+        "findings_to_fix": [], "in_flight": [], "rate_limited": False,
     }
 
-    # 1) RETARGET (INDEPENDENT of review state): ANY open PR whose base branch's parent PR has merged
-    #    must be repointed to the default branch FIRST — else we'd request review / fixes against a
-    #    stale base.
+    # 1) RETARGET (INDEPENDENT of review state): ANY open PR whose base branch's parent PR has merged must
+    #    be repointed FIRST — to the parent's OWN base (multi-level stacks: B merged into A while A isn't
+    #    on default yet -> the child of B retargets to A, not default), else we'd request review / fixes
+    #    against a stale base.
     for c in cls:
         if (c["num"] not in done and c["state"] == "OPEN" and c["base_ref"]
-                and c["base_ref"] != base_branch and c["base_ref"] in merged_branches):
+                and c["base_ref"] != base_branch and c["base_ref"] in merged_set):
             plan["needs_retarget"].append(c["num"])
+            plan["retarget_to"][str(c["num"])] = merged_bases.get(c["base_ref"]) or base_branch
     retarget = set(plan["needs_retarget"])
 
     # 2) merge-ready PRs (clean / force-mergeable / converged) whose base is already the default branch:

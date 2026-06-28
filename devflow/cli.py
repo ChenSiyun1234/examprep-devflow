@@ -576,7 +576,10 @@ def cmd_orchestrate_reviews(args) -> int:
     _print_plan_section("FORCE-MERGEABLE (>=3 rounds, only-minor P3)", plan["force_mergeable"])
     _print_plan_section("READY then MERGE (un-draft first)", plan["ready_then_merge"])
     _print_plan_section(f"RESOLVE CONFLICT (merge {default_branch} in; never force-push)", plan["needs_conflict"])
-    _print_plan_section(f"RETARGET to {default_branch} (base PR merged)", plan["needs_retarget"])
+    if plan["needs_retarget"]:
+        targets = plan.get("retarget_to") or {}
+        print("  RETARGET (parent PR merged): " + ", ".join(
+            f"#{n}->{targets.get(str(n), default_branch)}" for n in plan["needs_retarget"]))
     _print_plan_section("MERGEABILITY PENDING (GitHub still computing; re-run)", plan["mergeable_unknown"])
     _print_plan_section("FINDINGS to fix (P1/P2 or early P3)", plan["findings_to_fix"])
     if args.json:

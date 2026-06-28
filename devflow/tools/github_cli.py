@@ -289,18 +289,20 @@ class ReadOnlyGitHub:
         return [{"number": pr.get("number"), "title": pr.get("title"), "state": pr.get("state"),
                  "head_ref": pr.get("headRefName"), "base_ref": pr.get("baseRefName")} for pr in data]
 
-    def merged_heads(self, branches) -> set:
-        """Of the given branch names, return those that are the HEAD of a MERGED PR (read-only). Used to
-        detect a stacked child whose parent PR already merged WITHOUT scanning the whole merged history
-        (a ``--state merged --limit N`` window can miss an OLDER merged parent). One targeted
-        ``gh pr list --head <branch>`` per candidate branch — bounded by the (small) set of stack bases."""
+    def merged_heads(self, branches) -> dict:
+        """Of the given branch names, return ``{branch: base_ref}`` for those that are the HEAD of a MERGED
+        PR (read-only). Used to detect a stacked child whose parent PR already merged WITHOUT scanning the
+        whole merged history (a ``--state merged --limit N`` window can miss an OLDER merged parent). One
+        targeted ``gh pr list --head <branch>`` per candidate branch — bounded by the (small) set of stack
+        bases. The base_ref lets a child retarget to its merged parent's ACTUAL base (which may itself not
+        be the default branch in a multi-level stack), not blindly to the default branch."""
         repo = self.resolve_repo()
-        out = set()
+        out = {}
         for b in {x for x in branches if x}:
             data = _gh_json(["pr", "list", "-R", repo, "--state", "merged", "--head", str(b),
-                             "--json", "number", "--limit", "1"]) or []
+                             "--json", "number,baseRefName", "--limit", "1"]) or []
             if data:
-                out.add(b)
+                out[b] = data[0].get("baseRefName")
         return out
 
     # comments / reviews ----------------------------------------------------------------
