@@ -206,10 +206,11 @@ def is_codex_quota_notice(body: Optional[str]) -> bool:
     t = (body or "").strip().lower()
     if not t:
         return False
-    # Key off the ACTUAL notice OPENER ("You have reached your Codex usage limits …") plus a short
-    # whole-body — NOT the generic phrase "usage limits for code reviews", which a substantive review
-    # OF this quota code legitimately contains and must not be dropped as a rate-limit notice.
-    return ("reached your codex usage limits" in t and len(t) < 600)
+    # Key off the ACTUAL notice OPENER at the START of the body ("You have reached your Codex usage
+    # limits …"), NOT a substring anywhere — so a real review that QUOTES the notice while discussing
+    # this quota code (and is under 600 chars) isn't misclassified and dropped as a rate-limit notice.
+    i = t.find("reached your codex usage limits")
+    return i != -1 and i <= 12 and len(t) < 600        # <=12 allows a short lead-in ("you have ")
 
 
 # Tie-break for "latest" when GitHub's 1-second timestamps collide (Codex posts a review plus
@@ -389,6 +390,14 @@ class ReadOnlyGitHub:
         _max_ts = max((c.get("created_at") or "") for c in _basis)
         dedupe_key = _max_ts + "|" + ",".join(sorted(
             (c.get("url") or "") for c in _basis if (c.get("created_at") or "") == _max_ts))
+        # Legacy compatibility: an OLDER watcher computed the dedupe key over ALL candidates (including
+        # the quota notice). When a newer quota notice exists (quota_active), expose that legacy key so
+        # an upgraded seen file that stored it is recognized as already-seen — no spurious re-alert of
+        # the same older review just because quota notices are now excluded from the key.
+        legacy_dedupe_key = None
+        if quota_active and real:
+            legacy_dedupe_key = _qmax + "|" + ",".join(sorted(
+                (c.get("url") or "") for c in candidates if (c.get("created_at") or "") == _qmax))
         if not real:
             overall = max(candidates, key=_key)   # only quota notices from Codex -> signal, no review
             return {
@@ -411,6 +420,7 @@ class ReadOnlyGitHub:
         # the actually-new content.
         _lt = latest.get("created_at") or ""
         cotimestamped_blocking = False
+        cotimestamped_extra = []
         for c in real:
             if c is not latest and (c.get("created_at") or "") == _lt:
                 cp = parse_review_packet(c.get("body"), c.get("state"))
@@ -419,10 +429,19 @@ class ReadOnlyGitHub:
                         packet["items"].append(it)
                 if cp.get("blocking"):
                     cotimestamped_blocking = True
+                # a co-timestamped comment that is PLAIN PROSE (no bullet items) would otherwise be
+                # invisible — the alert would re-fire (new dedupe key) but still show only `latest`'s
+                # body/url. Surface its body + url so the new feedback is actually displayed.
+                cbody = (c.get("body") or "").strip()
+                if cbody and cbody not in (packet.get("body") or ""):
+                    cotimestamped_extra.append((c.get("url"), cbody))
         # a co-timestamped lower-ranked signal that is itself blocking must SURFACE its verdict, not
         # just its items — otherwise we'd re-alert the fix while reporting blocking=False.
         if cotimestamped_blocking:
             packet["blocking"] = True
+        if cotimestamped_extra:
+            extra = "\n\n".join(f"[also @ same timestamp] {u or ''}\n{b}" for u, b in cotimestamped_extra)
+            packet["body"] = ((packet.get("body") or "").rstrip() + "\n\n" + extra).strip()
         # Reconcile with terminal review states:
         #  - a CHANGES_REQUESTED review stays in effect until a *newer* APPROVED clears it;
         #  - an APPROVED clears blocking only if it's the most recent signal — a newer plain comment
@@ -448,6 +467,7 @@ class ReadOnlyGitHub:
             "created_at": latest["created_at"],
             "url": latest.get("url"),
             "dedupe_key": dedupe_key,
+            "legacy_dedupe_key": legacy_dedupe_key,
             "quota_limited": quota_active,
             "has_review": True,
             **packet,

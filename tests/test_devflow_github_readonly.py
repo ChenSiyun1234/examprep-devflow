@@ -297,6 +297,35 @@ class TestParsingHardening(unittest.TestCase):
         self.assertTrue(rev["blocking"])  # blocking surfaces despite the same-second approval
         self.assertTrue(any("must fix the race" in str(it) for it in rev["items"]))
 
+    def test_co_timestamped_prose_comment_body_surfaced(self):
+        # finding (Codex r4 P2): a co-timestamped PROSE comment (no bullet items) must still be visible
+        # in the returned body, not hidden behind the higher-ranked review's body
+        gh = ReadOnlyGitHub("o/r")
+        reviews = [{"author": "codex", "body": "## Codex Review\nsee inline.", "state": "COMMENTED",
+                    "created_at": "2026-01-05T00:00:00Z", "url": "r1"}]            # higher-ranked
+        prose = [{"author": "codex", "body": "Heads up — the new edge case needs a follow-up.",
+                  "created_at": "2026-01-05T00:00:00Z", "url": "c1"}]              # same second, no bullets
+        with mock.patch.object(gh, "get_pr_comments", return_value=prose), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_reviews", return_value=reviews):
+            rev = gh.find_latest_codex_review(2)
+        self.assertIn("needs a follow-up", rev["body"])   # co-timestamped prose surfaced into the body
+
+    def test_legacy_dedupe_key_exposed_when_quota_active(self):
+        # finding (Codex r4 P2): when a newer quota notice exists, expose the legacy quota-INCLUSIVE key
+        gh = ReadOnlyGitHub("o/r")
+        reviews = [{"author": "codex", "body": "real review", "state": "COMMENTED",
+                    "created_at": "2026-01-01T00:00:00Z", "url": "r1"}]
+        quota = [{"author": "codex", "body": "You have reached your Codex usage limits for code reviews.",
+                  "created_at": "2026-01-02T00:00:00Z", "url": "q1"}]              # newer quota notice
+        with mock.patch.object(gh, "get_pr_comments", return_value=quota), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_reviews", return_value=reviews):
+            rev = gh.find_latest_codex_review(2)
+        self.assertTrue(rev["quota_limited"])
+        self.assertEqual(rev["dedupe_key"], "2026-01-01T00:00:00Z|r1")            # over the real review
+        self.assertEqual(rev["legacy_dedupe_key"], "2026-01-02T00:00:00Z|q1")     # quota-inclusive legacy
+
 
 if __name__ == "__main__":
     unittest.main()

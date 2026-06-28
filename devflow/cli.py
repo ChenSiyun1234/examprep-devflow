@@ -374,8 +374,16 @@ def _load_codex_seen(path: str) -> dict:
             continue
         # MERGE (not overwrite) into the lowercased key so a file holding both `Owner/Repo` and
         # `owner/repo` keeps every PR entry instead of the later slice clobbering the earlier one.
-        out.setdefault(repo.lower(), {}).update(
-            {pr: entry for pr, entry in slc.items() if isinstance(entry, dict)})
+        dst = out.setdefault(repo.lower(), {})
+        for pr, entry in slc.items():
+            if not isinstance(entry, dict):
+                continue
+            cur = dst.get(pr)
+            # on a same-PR collision across case-variant slices, keep the NEWEST entry (by created_at),
+            # not whichever slice happens to appear later in the JSON — else a stale slice could overwrite
+            # a fresher dedupe key and re-alert already-seen feedback.
+            if cur is None or (entry.get("created_at") or "") >= (cur.get("created_at") or ""):
+                dst[pr] = entry
     return out
 
 
@@ -436,11 +444,15 @@ def cmd_watch_codex_reviews(args) -> int:
         # dedupe key covers ALL Codex signals at the latest timestamp (so a same-second newly-visible
         # comment still counts as new); fall back to created_at|url for older return shapes.
         key = review.get("dedupe_key") or f"{review.get('created_at') or ''}|{review.get('url') or ''}"
+        stored_key = (repo_seen.get(str(num)) or {}).get("key")
+        # a stored key matching EITHER the current key or the legacy (quota-inclusive) key counts as
+        # already-seen, so upgrading the dedupe scheme doesn't re-alert an older review.
+        already_seen = stored_key is not None and stored_key in (key, review.get("legacy_dedupe_key"))
         entry = {"key": key, "created_at": review.get("created_at"),
                  "url": review.get("url"), "blocking": review.get("blocking")}
         if args.init:                       # baseline: record current state, do not alert
             repo_seen[str(num)] = entry
-        elif key != (repo_seen.get(str(num)) or {}).get("key"):
+        elif not already_seen:
             actionable.append({"pr": num, "title": pr.get("title"), "review": review})
             repo_seen[str(num)] = entry
 

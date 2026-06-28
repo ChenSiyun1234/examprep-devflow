@@ -286,6 +286,34 @@ class TestWatchCodexBehavior(WatchCodexBase):
                                    repo="owner/repo")
         self.assertNoNew(out)   # legacy slice migrated on load -> already-seen, not re-alerted
 
+    def test_quota_notice_must_be_at_opener_not_mid_body(self):
+        # a SHORT (<600) real review that QUOTES the canonical notice mid-sentence is NOT a quota
+        # notice — the match must anchor at the opener, not anywhere in the body (Codex r4 P2)
+        self.assertFalse(G.is_codex_quota_notice(
+            "Note: when Codex says 'You have reached your Codex usage limits', this watcher backs off."))
+        self.assertTrue(G.is_codex_quota_notice(
+            "You have reached your Codex usage limits for code reviews."))
+
+    def test_case_colliding_seen_keeps_newest_entry(self):
+        # same PR in both case-variant slices -> keep the NEWEST entry, not JSON insertion order (Codex r4 P2)
+        from devflow.cli import _load_codex_seen
+        with open(self.seen, "w", encoding="utf-8") as f:
+            json.dump({"Owner/Repo": {"1": {"key": "new", "created_at": "2026-01-05T00:00:00Z"}},
+                       "owner/repo": {"1": {"key": "old", "created_at": "2026-01-01T00:00:00Z"}}}, f)
+        merged = _load_codex_seen(self.seen)
+        self.assertEqual(merged["owner/repo"]["1"]["key"], "new")   # newest wins over the later stale slice
+
+    def test_legacy_quota_inclusive_seen_key_not_re_alerted(self):
+        # upgrade path: a seen file storing the OLD quota-INCLUSIVE key must not re-alert the same older
+        # review now that the key excludes quota notices (Codex r4 P2)
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        with open(self.seen, "w", encoding="utf-8") as f:   # old watcher stored the newer quota's key
+            json.dump({"owner/repo": {"1": {"key": "2026-01-04T00:00:00Z|p1#q1"}}}, f)
+        _, out, _ = self.run_watch(
+            prs, reviews_by_pr={1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]},
+            comments_by_pr={1: [codex_quota("2026-01-04T00:00:00Z", "p1#q1")]}, repo="owner/repo")
+        self.assertNotIn("ACTIONABLE_CODEX_REVIEWS", out)   # legacy quota-inclusive key recognized as seen
+
     def test_gh_unauthenticated_returns_nonzero(self):
         rc, out, _ = self.run_watch([{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}],
                                     auth_ok=False)
