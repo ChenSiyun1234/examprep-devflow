@@ -192,6 +192,24 @@ class TestClassify(unittest.TestCase):
             review("Codex Review", "aaaaaaa", 2, "2026-01-02T00:00:00Z", state="COMMENTED")])
         self.assertFalse(classify(meta(head="aaaaaaa"), s)["clean"])
 
+    def test_empty_body_review_with_inline_findings_counted(self):
+        # Codex r4 P2: a review with NO top-level body but inline findings is still a real reviewed round
+        s = signals(reviews=[review("", "aaaaaaa", 5, "2026-01-01T00:00:00Z")],   # empty body...
+                    inline_=[inline("![P2 Badge] fix this", 5, "2026-01-01T00:00:00Z")])  # ...but inline P2
+        c = classify(meta(head="aaaaaaa"), s)
+        self.assertEqual(c["rounds"], 1)
+        self.assertTrue(c["has_head_review"])
+        self.assertEqual(c["findings_on_head"], 1)
+        self.assertEqual(c["max_severity"], 2)
+
+    def test_old_answered_request_on_prior_head_not_awaiting(self):
+        # Codex r4 P2: an old @codex request ANSWERED on a prior head must not look "still awaiting" once
+        # the head advances with no review yet (untracked) — else it's stuck in-flight, never re-requested
+        s = signals(
+            reviews=[review("findings", "oldhead", 1, "2026-01-02T00:00:00Z")],         # review of OLD head
+            comments=[comment("@codex review", "2026-01-01T00:00:00Z", author=ME)])      # request BEFORE it
+        self.assertFalse(classify(meta(head="newhead"), s)["awaiting"])
+
 
 class TestMergePredicates(unittest.TestCase):
     def _c(self, **kw):
@@ -367,6 +385,16 @@ class TestState(unittest.TestCase):
         self.assertNotEqual(orch.state_path_for_repo("ownerA/repo"),
                             orch.state_path_for_repo("ownerB/repo"))
 
+    def test_load_state_degrades_wrong_typed_slice(self):
+        # Codex r4 P3: a slice with the wrong JSON type degrades to its default (no crash on next build)
+        path = os.path.join(tempfile.mkdtemp(), "orch.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"requested_head": [], "converged": {"5": "h"}, "done": "nope"}, f)
+        st = orch.load_state(path)
+        self.assertEqual(st["requested_head"], {})       # wrong-type list -> default {}
+        self.assertEqual(st["converged"], {"5": "h"})    # valid slice kept
+        self.assertEqual(st["done"], [])                 # wrong-type str -> default []
+
 
 # ---- gh-touching layer: fully mocked gh, ASSERT read-only ----
 def _fake_gh(payloads, recorder):
@@ -457,11 +485,13 @@ def _raw_view(num=5, head="aaaaaaa", mergeable="MERGEABLE", base="main", state="
             "additions": adds, "deletions": 0, "changedFiles": files, "isDraft": draft}
 
 
-def _cli_fake_gh(recorder, *, prs, views, signals_map=None, error_prs=(), merged_prs=()):
+def _cli_fake_gh(recorder, *, prs, views, signals_map=None, error_prs=(), merged_prs=(),
+                 default_branch="main"):
     """Flexible read-only gh fake for the orchestrate CLI: per-PR `pr view` (views[num]) + Codex
     signals (signals_map[num] -> {reviews,inline,comments} raw github json). `pr list --state merged`
     returns merged_prs, any other state returns prs. PRs in error_prs fail their `pr view`
-    (returncode 1 -> GhError). Every command passes through _assert_read_only."""
+    (returncode 1 -> GhError). `default_branch` sets the repo's defaultBranchRef. Every command passes
+    through _assert_read_only."""
     signals_map = signals_map or {}
 
     def fake_run(cmd, **kw):
@@ -469,7 +499,8 @@ def _cli_fake_gh(recorder, *, prs, views, signals_map=None, error_prs=(), merged
         args = cmd[1:]
         _assert_read_only(args)
         if args[:2] == ["repo", "view"]:
-            return SimpleNamespace(returncode=0, stdout=json.dumps({"nameWithOwner": "o/r"}), stderr="")
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+                {"nameWithOwner": "o/r", "defaultBranchRef": {"name": default_branch}}))
         if args[:2] == ["pr", "list"]:
             state = args[args.index("--state") + 1] if "--state" in args else "open"
             data = merged_prs if state == "merged" else prs
@@ -592,6 +623,21 @@ class TestOrchestrateCommand(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(_plan_from(out)["needs_retarget"], [7])
         self.assertEqual(_plan_from(out)["request_review"], [])   # not requested against the stale base
+
+    def test_command_labels_use_repo_default_branch(self):
+        # Codex r4 P2: action labels must name the repo's ACTUAL default branch, not hardcoded 'main'
+        calls = []
+        prs = [{"number": 7, "title": "child", "state": "OPEN",
+                "headRefName": "feat/7", "baseRefName": "feat/parent"}]
+        merged = [{"number": 4, "title": "parent", "state": "MERGED",
+                   "headRefName": "feat/parent", "baseRefName": "master"}]
+        fake = _cli_fake_gh(calls, prs=prs, views={7: _raw_view(7, head="ccccccc", base="feat/parent")},
+                            merged_prs=merged, default_branch="master")
+        state_file = os.path.join(tempfile.mkdtemp(), "orch.json")
+        rc, out = _run_orchestrate(["orchestrate-reviews", "--repo", "o/r", "--state-file", state_file], fake)
+        self.assertEqual(rc, 0)
+        self.assertIn("RETARGET to master", out)
+        self.assertNotIn("RETARGET to main", out)
 
 
 if __name__ == "__main__":

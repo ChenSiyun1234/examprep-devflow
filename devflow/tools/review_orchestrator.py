@@ -113,7 +113,13 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
     inline = signals.get("inline") or []
     codex_comments = [c for c in comments if is_codex_author(c.get("author"))]
 
-    real = [r for r in reviews if not is_quota(r.get("body")) and (r.get("body") or "").strip()]
+    # review ids that carry Codex inline findings — so an EMPTY-BODY review (Codex sometimes posts only
+    # inline comments, no top-level body) is still counted as a real round and its findings attributed,
+    # instead of being dropped so the PR looks unreviewed.
+    reviewed_ids = {c.get("review_id") for c in inline
+                    if is_codex_author(c.get("author")) and not is_quota(c.get("body"))}
+    real = [r for r in reviews if not is_quota(r.get("body"))
+            and ((r.get("body") or "").strip() or r.get("id") in reviewed_ids)]
     rounds = len(real)
     on_head = (rounds > 0) if merged else any((r.get("commit_id") or "") == head for r in real)
     head_real = real if merged else [r for r in real if (r.get("commit_id") or "") == head]
@@ -160,13 +166,17 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
         clean = clean_comment or clean_review
 
     # our own outstanding "@codex review" REQUESTS (a non-Codex review/re-review ask, not just any
-    # @codex command) -> awaiting iff newer than the latest substantive review on head.
+    # @codex command) -> awaiting iff newer than the latest substantive review on ANY commit. Comparing
+    # against the latest review ANYWHERE (not just on the current head) means an OLD request that was
+    # already answered on a prior head isn't mistaken for "still awaiting" once the head advances with no
+    # review yet — otherwise an untracked PR would be wrongly counted in-flight and never re-requested.
+    latest_any_real_at = max((r.get("created_at") or "" for r in real), default="")
     my_reqs = [c for c in comments if not is_codex_author(c.get("author"))
                and _REVIEW_REQUEST_RE.search(c.get("body") or "")]
     latest_req_at = max((c.get("created_at") or "" for c in my_reqs), default="")
-    awaiting = bool(latest_req_at) and latest_req_at > latest_real_at
+    awaiting = bool(latest_req_at) and latest_req_at > latest_any_real_at
     req_age = (now - parse_ts(latest_req_at)) if awaiting else 0
-    pending = sum(1 for c in my_reqs if (c.get("created_at") or "") > latest_real_at)
+    pending = sum(1 for c in my_reqs if (c.get("created_at") or "") > latest_any_real_at)
 
     # latest Codex signal (review OR comment) decides this PR's quota state.
     sigs = ([{"ts": r.get("created_at") or "", "body": r.get("body")} for r in reviews]
@@ -335,7 +345,13 @@ def load_state(path: str = STATE_PATH) -> dict:
             data = json.load(f)
         st = _default_state()
         if isinstance(data, dict):
-            st.update({k: data.get(k, st[k]) for k in st})
+            # validate each slice's TYPE before adopting it — a partially-corrupt / hand-edited file
+            # (e.g. {"requested_head": []}) must degrade that slice to its default, not crash the next
+            # build_plan when it does dict ops on a list.
+            for k, default in st.items():
+                v = data.get(k, default)
+                if isinstance(v, type(default)):
+                    st[k] = v
         return st
     except (OSError, ValueError):
         return _default_state()
