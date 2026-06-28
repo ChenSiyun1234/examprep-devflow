@@ -52,7 +52,50 @@ python -m devflow.cli watch-codex-reviews --repo owner/name          # prints AC
 
 # advisory flow up to human approval; --real-github performs the guarded issue + @codex writes
 python -m devflow.cli run-docs-advisory --thread-id demo [--real-github --max-polls 6 --poll-seconds 30]
+
+# after approving a gate, export an Implementation Packet to hand off to Claude Code (local files only)
+python -m devflow.cli run --task docs-advisory --thread-id demo --pause-at advisory
+python -m devflow.cli export-implementation-packet --thread-id demo --decision approved  # --gate optional
 ```
+
+## Implementation Packet (handoff to Claude Code)
+
+devflow orchestrates and summarizes; **Claude Code remains the code editor**. After Codex
+advisory/review is summarized and you approve a gate, devflow can export a structured
+**Implementation Packet** — the handoff boundary:
+
+> Codex advisory/review → devflow summarizes → **you approve** → devflow exports a packet →
+> Claude Code implements the scoped changes → you review → PR / Codex review continues.
+
+```bash
+# pause at a gate (writes a checkpoint), then export the packet (--decision is required)
+python -m devflow.cli run --task docs-advisory --thread-id demo --pause-at advisory
+python -m devflow.cli export-implementation-packet --thread-id demo --decision approved
+```
+
+It writes two local files under a gitignored tool-state dir:
+
+```
+.devflow/packets/<safe-thread-id>/implementation-packet.md
+.devflow/packets/<safe-thread-id>/implementation-packet.json
+```
+
+The packet contains: metadata (thread/task/repo/generated_at, source issue & PR), the approval
+(gate, decision, approved scope, rejected/deferred), advisory/review content (summaries, blocking &
+non-blocking comments, deferred follow-ups), implementation instructions for Claude Code (files
+likely touched, tasks, out-of-scope, tests to run, safety rules), and explicit safety boundaries.
+
+**This command makes no GitHub calls and never edits repository files** — it only reads the local
+checkpoint and writes the two packet files. devflow does not implement code; the packet tells Claude
+Code what to implement, within scope. On export it prints `IMPLEMENTATION_PACKET_EXPORTED`, the two
+paths, the thread id, source issue/PR, and the suggested next Claude Code message.
+
+> ⚠️ **Dry-run / simulated advisories produce a *generic* packet.** A `docs-advisory` run without
+> real Codex input uses a simulated advisory, so the packet's approved scope is generic guidance
+> ("scope to a dry-run scaffold", "add tests + docs") with **no `files likely touched` and no
+> concrete tasks** — it is **not enough for real implementation**. For an actionable packet, export
+> from a thread backed by a **real** Codex advisory/review (a real PR with blocking comments yields
+> concrete tasks + file paths). Manual-scope packet support is planned as a follow-up.
 
 ## LangGraph Studio (`langgraph dev`)
 
