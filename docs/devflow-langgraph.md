@@ -263,12 +263,17 @@ How it works:
 * **dedupes** against a local seen file: per repo, per PR, it stores the latest item's
   `created_at|url` key; a PR is *new* iff that key changed since last run.
 
-Output contract (the **marker is the first line**, so `grep`/`startswith` both work):
+Output contract (the **marker is the first line**, so `grep`/`startswith` both work), in **precedence
+order** — a consumer keys off the first line:
 
 * `ACTIONABLE_CODEX_REVIEWS` — ≥1 open PR has new Codex feedback (followed by per-PR details);
+* `CODEX_WATCH_INCOMPLETE` — at least one PR read failed, so the sweep is incomplete (it may have
+  missed feedback); **retry**, and do NOT treat the run as clean. Outranks quota — a partial failure
+  must not be mistaken for a clean back-off;
+* `CODEX_QUOTA_LIMITED` — Codex is only returning usage-limit notices; a scheduler can **back off**;
 * `NO_NEW_CODEX_REVIEWS` — nothing new (also when there are zero open PRs);
-* `--init` records the current state as the baseline and prints **neither** marker (so the first
-  real run isn't a flood of pre-existing reviews).
+* `--init` records the current state as the baseline and prints **none** of these markers (so the
+  first real run isn't a flood of pre-existing reviews).
 
 Flags: `--repo` (default: current repo), `--seen-file` (default `<tmp>/devflow_runs/codex_seen.json`),
 `--limit` (max open PRs, clamped ≥1), `--reset` (re-alert this repo's current feedback; other repos
@@ -282,6 +287,113 @@ Exit codes follow the read-command convention (0 success — for both markers; 1
 gh unavailable/unauthenticated). Tests mock `gh` entirely
 (`tests/test_devflow_watch_codex.py`): actionable/none/dedupe/spoof/per-PR-error/init/json/
 exit-actionable plus an assertion that **every** spawned `gh` command is read-only.
+
+## Implementation Packet (handoff to Claude Code)
+
+The packet is the **boundary between orchestration and editing**: devflow summarizes the
+advisory/review and records the human approval, then exports a structured packet that **Claude Code**
+uses to make the scoped edits. devflow never edits repository files itself.
+
+```
+Codex advisory/review → devflow summarizes → human approves → devflow exports Implementation Packet
+   → Claude Code implements scoped changes → human reviews → PR / Codex review continues
+```
+
+**Design (fits the checkpoint model).** A standalone, read-only command:
+
+```bash
+python -m devflow.cli run    --task docs-advisory --thread-id demo --pause-at advisory  # writes a checkpoint
+python -m devflow.cli export-implementation-packet --thread-id demo --decision <approved|rejected> [--gate advisory]
+```
+
+`export-implementation-packet` loads the thread's **checkpoint** (which exists precisely when the run
+is paused at a gate), builds the packet from that state, and writes two files. It deliberately does
+**not** run the graph, add a graph node, call `gh`, or edit code — so the handoff is fully decoupled
+from the workflow and has no side effects beyond the two local files. The gate defaults to the
+thread's `paused_at_gate`; `--decision` is **required** (`approved` or `rejected`) — there is no
+silent default, so an approval is never inferred.
+
+**Output (local tool-state, gitignored — never tracked):**
+
+```
+.devflow/packets/<safe-thread-id>/implementation-packet.md
+.devflow/packets/<safe-thread-id>/implementation-packet.json
+```
+
+`<safe-thread-id>` is sanitized (non-`[A-Za-z0-9-_.]` → `_`, length-bounded) and suffixed with a
+hash of the original id, so no thread id can cause a path collision or directory traversal. `.devflow/`
+is in `.gitignore`.
+
+**Packet contents** (`devflow/tools/packet_writer.py`, pure builder + renderer):
+
+1. **Metadata** — thread_id, task_type, repo, generated_at, source issue #/URL, source PR #/URL.
+2. **Approval** — gate, decision, approved scope, rejected/deferred items.
+3. **Advisory / review** — advisory summary, review summary, blocking & non-blocking comments,
+   deferred follow-ups.
+4. **Implementation instructions for Claude Code** — files likely touched, concrete tasks, explicit
+   out-of-scope items, tests/checks to run, safety rules.
+5. **Safety boundaries** — no secrets, no API keys, no unrelated rewrites, no commit/push/PR, no
+   merge, no branch-deletion, no force-push, no "tests passed" claims unless they actually ran, ask
+   before expanding scope.
+
+**Simulated vs real advisories (important).** A dry-run `docs-advisory` with no real Codex input
+uses a *simulated* advisory (`_simulated_packet`), whose `recommended_steps` are generic guidance
+("scope to a dry-run scaffold", "add tests + docs"). The resulting packet therefore has a **generic
+approved scope, no `files_likely_touched`, and no concrete tasks** — it is **not sufficient for real
+implementation**. An actionable packet needs a **real** advisory/review: a real PR with blocking
+comments yields concrete `tasks` and file paths. (Dedicated manual-scope packet support is a planned
+follow-up.)
+
+**Untrusted-input handling.** Advisory/review content and file paths are attacker-influenceable
+(they originate from Codex/GitHub). The builder defends accordingly: `files_likely_touched` is
+filtered to repo-relative paths (absolute paths and `..` traversal are rejected and listed under
+out-of-scope), and the Markdown renderer collapses newlines in untrusted strings so injected content
+cannot forge a new heading/section (e.g. a fake `## Safety boundaries`). The JSON keeps raw values.
+A `--decision rejected` export clears the scope/tasks/files entirely so a rejected packet can never
+read as "go implement this". `write_packet` refuses a symlinked output directory.
+
+On export the CLI prints `IMPLEMENTATION_PACKET_EXPORTED`, the markdown + json paths, the thread id,
+the source issue/PR (if any), and the suggested next Claude Code message (or, for a rejected gate, a
+"nothing to implement" notice). Tests (`tests/test_devflow_packet.py`) cover packet build from an
+approved advisory state, real-advisory summary fallback, inclusion of blocking/non-blocking comments,
+rejected-decision consistency, corrupt/non-dict checkpoint degradation, untrusted path-traversal +
+Markdown-injection neutralization, symlink-dir refusal, thread-id path sanitization, valid JSON, the
+required Markdown sections, that `.devflow/` is gitignored, and that export performs no GitHub writes
+/ never references the write layer.
+
+### Manual scope: `create-implementation-packet`
+
+`export-implementation-packet` is only as good as the underlying advisory — a **simulated/dry-run**
+advisory yields a generic packet (no files, no concrete tasks) that must **not** be used for real
+implementation. `create-implementation-packet` closes that gap: the human owner writes the scope in a
+Markdown file and devflow builds a packet directly from it — no checkpoint/advisory required.
+
+```bash
+python -m devflow.cli create-implementation-packet \
+  --thread-id check-runner-1 --task "Add allowlisted check runner" \
+  --scope-file scope.md --repo ChenSiyun1234/examprep-devflow
+```
+
+**When to use which:**
+- **`export-implementation-packet`** — hand off the scope from a real advisory/review at a paused gate.
+- **`create-implementation-packet`** — hand off a concrete scope you wrote yourself, no advisory.
+
+The scope file is parsed by a tiny, defensive parser (`parse_scope_markdown` — top-level `#` headings
+→ sections; unknown headings ignored; missing sections defaulted). Recognized sections: Task, Approved
+scope, Tasks (optional; falls back to Approved scope), Files likely touched, Out of scope, Checks to
+run, Safety rules. The resulting packet is marked **`source: manual_human_scope`** (top-level and in
+metadata) so it can never be mistaken for a generic simulated-advisory packet.
+
+Same safety posture as the export path and then some: **no GitHub calls, no shell, no code edits**;
+only the two local packet files are written (via the shared `write_packet`, which still refuses a
+symlinked output dir). The **canonical `SAFETY_BOUNDARIES` are always embedded** — a scope file may
+*add* rules but can never remove the hard ones (no secrets/keys, no commit/push/PR, no merge, no
+branch-delete, no force-push, no false "tests passed"). Scope file paths are filtered (absolute / `..`
+rejected and surfaced under out-of-scope), and untrusted scope text is `_md_safe`-sanitized in the
+Markdown. The CLI prints `MANUAL_IMPLEMENTATION_PACKET_CREATED` + paths + thread id + task + the
+suggested Claude Code prompt. Tested in `tests/test_devflow_create_packet.py` (parse, build, manual
+source marking, unsafe-path filtering, non-removable safety, missing-file error, valid JSON, required
+Markdown sections, parser wiring, no-gh, writes-only-under-out-dir).
 
 ## GitHub write mode (guarded, opt-in)
 

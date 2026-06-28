@@ -73,6 +73,16 @@ def request_codex_review(state: DevflowState) -> dict:
                 "errors": ["request_codex_review: no PR number (creation failed) — "
                            "refusing to comment on #0"],
                 "event_log": ["[request_codex_review] stopped: no PR number; not commenting on #0."]}
+    # baseline: the latest Codex review's IDENTITY (dedupe_key) BEFORE this request, so the poll can tell
+    # a FRESH review (a different dedupe_key) from a STALE one merely eclipsed by a later usage-limit
+    # notice. dedupe_key (not the second-resolution timestamp) distinguishes a same-second fresh review.
+    baseline_key = ""
+    if state.get("real_github"):
+        try:
+            prev = ReadOnlyGitHub(state["repo"]).find_latest_codex_review(pr)
+            baseline_key = (prev or {}).get("dedupe_key") or ""
+        except GhError:
+            baseline_key = ""
     res = _writer(state).comment_on_pr(pr, "@codex review this PR.")
     if res.get("error"):
         # comment failed → request never sent; terminal safe-stop so the wait node doesn't poll
@@ -81,7 +91,7 @@ def request_codex_review(state: DevflowState) -> dict:
                 "errors": [f"request_codex_review: {res['error']}"],
                 "event_log": [f"[request_codex_review] FAILED to post '@codex review' "
                               f"({res['error']}); stopping instead of polling."]}
-    return {"codex_review_status": "requested",
+    return {"codex_review_status": "requested", "codex_review_baseline_at": baseline_key,
             "event_log": [f"[request_codex_review] {res.get('log', '')}"]}
 
 
@@ -99,12 +109,19 @@ def wait_for_codex_review(state: DevflowState) -> dict:
         repo = state["repo"]
         pr = state.get("pr_number")
         kwargs = {"sleep_fn": state["_sleep_fn"]} if state.get("_sleep_fn") else {}
+        baseline_key = state.get("codex_review_baseline_at") or ""
         try:
             def _poll_real_review():
                 rev = ReadOnlyGitHub(repo).find_latest_codex_review(pr)
-                # a quota-only result (has_review False) is NOT a review — keep polling (the limit
-                # may clear) rather than treating the rate-limit notice as the awaited review.
-                return rev if (rev and rev.get("has_review", True)) else None
+                # accept ONLY a review with a DIFFERENT identity (dedupe_key) than the baseline captured
+                # before THIS request — i.e. a FRESH response (a new review/comment, even in the same
+                # second). A genuinely new review counts even if a later usage-limit notice eclipses it;
+                # but a STALE older review left as the latest signal because the new request got only a
+                # quota notice (same dedupe_key as baseline) keeps polling, so we never proceed on stale
+                # feedback.
+                if rev and rev.get("has_review", True) and (rev.get("dedupe_key") or "") != baseline_key:
+                    return rev
+                return None
             poll = bounded_poll(
                 _poll_real_review,
                 max_attempts=int(state.get("max_polls", 6)),

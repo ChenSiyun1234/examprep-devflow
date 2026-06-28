@@ -206,11 +206,12 @@ def is_codex_quota_notice(body: Optional[str]) -> bool:
     t = (body or "").strip().lower()
     if not t:
         return False
-    # Match the ACTUAL bot notice ("You have reached your Codex usage limits for code reviews. …")
-    # — specific phrasing AND a short whole-body — so a substantive review that merely MENTIONS usage
-    # limits (e.g. a review OF this watcher) isn't misclassified and dropped as a rate-limit notice.
-    return (("reached your codex usage limits" in t or "usage limits for code reviews" in t)
-            and len(t) < 600)
+    # Require the COMPLETE bot-notice shape, not just the opening sentence: the canonical notice is
+    # "You have reached your Codex usage limits for code reviews. You can see your limits in the …".
+    # A real review that QUOTES only the first sentence and then gives actual feedback (still under 600
+    # chars) lacks the "you can see your limits" continuation, so it isn't dropped as a rate-limit notice.
+    return (t.startswith("you have reached your codex usage limits for code review")
+            and "you can see your limits" in t and len(t) < 600)
 
 
 # Tie-break for "latest" when GitHub's 1-second timestamps collide (Codex posts a review plus
@@ -293,6 +294,24 @@ class ReadOnlyGitHub:
                         "updated_at": pr.get("updatedAt"), "url": pr.get("url")})
         return out
 
+    def list_prs(self, state: str = "open", limit: int = 50) -> list:
+        """List PRs with SIZE metadata for ranking (read-only). ``state`` in {open, closed, merged,
+        all}. Returns ``[{number,title,branch,head,state,additions,deletions,changed_files,url}]``."""
+        repo = self.resolve_repo()
+        st = state if state in ("open", "closed", "merged", "all") else "open"
+        data = _gh_json(["pr", "list", "-R", repo, "--state", st,
+                         "--json", "number,title,headRefName,headRefOid,state,additions,deletions,"
+                                   "changedFiles,url",
+                         "--limit", str(max(1, int(limit)))]) or []
+        out = []
+        for pr in data:
+            out.append({"number": pr.get("number"), "title": pr.get("title"),
+                        "branch": pr.get("headRefName"), "head": pr.get("headRefOid"),
+                        "state": pr.get("state"),
+                        "additions": pr.get("additions") or 0, "deletions": pr.get("deletions") or 0,
+                        "changed_files": pr.get("changedFiles") or 0, "url": pr.get("url")})
+        return out
+
     # comments / reviews ----------------------------------------------------------------
     @staticmethod
     def _norm_comments(raw) -> list:
@@ -338,53 +357,6 @@ class ReadOnlyGitHub:
             })
         return out
 
-    def list_prs(self, state: str = "open", limit: int = 50) -> list:
-        """List PRs with SIZE metadata for ranking (read-only). ``state`` in {open, closed, merged,
-        all}. Returns ``[{number,title,branch,head,state,additions,deletions,changed_files,url}]``."""
-        repo = self.resolve_repo()
-        st = state if state in ("open", "closed", "merged", "all") else "open"
-        data = _gh_json(["pr", "list", "-R", repo, "--state", st,
-                         "--json", "number,title,headRefName,headRefOid,state,additions,deletions,"
-                                   "changedFiles,url",
-                         "--limit", str(max(1, int(limit)))]) or []
-        out = []
-        for pr in data:
-            out.append({"number": pr.get("number"), "title": pr.get("title"),
-                        "branch": pr.get("headRefName"), "head": pr.get("headRefOid"),
-                        "state": pr.get("state"),
-                        "additions": pr.get("additions") or 0, "deletions": pr.get("deletions") or 0,
-                        "changed_files": pr.get("changedFiles") or 0, "url": pr.get("url")})
-        return out
-
-    def codex_review_rounds(self, pr_number: int, head: Optional[str] = None) -> dict:
-        """Count SUBSTANTIVE (non-quota) trusted-Codex reviews on a PR, whether the given ``head`` SHA
-        is already reviewed, and whether the PR is CURRENTLY rate-limited (latest Codex signal — review
-        OR comment — is a usage-limits notice). Read-only.
-        Returns ``{rounds, reviewed_on_head, quota_limited}``."""
-        reviews = self.get_pr_reviews(pr_number)
-        comments = self.get_pr_comments(pr_number)
-        # a substantive review = non-quota Codex review with a body OR a meaningful state (an
-        # empty-body COMMENTED/CHANGES_REQUESTED/APPROVED review whose content is in inline comments
-        # still counts as a review round).
-        revs = [r for r in reviews
-                if is_codex_author(r.get("author"))
-                and not is_codex_quota_notice(r.get("body"))
-                and ((r.get("body") or "").strip()
-                     or (r.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"))]
-        # a PR can also be "reviewed" via a Codex CONVERSATION comment (which find_latest_codex_review
-        # treats as a review) — count substantive non-quota ones so such a PR isn't mis-scored rounds=0
-        # and re-recommended as never-reviewed.
-        crevs = [c for c in comments if is_codex_author(c.get("author"))
-                 and not is_codex_quota_notice(c.get("body")) and (c.get("body") or "").strip()]
-        on_head = bool(head) and any((r.get("commit_id") or "") == head for r in revs)
-        # quota notices arrive as PR COMMENTS (not reviews) — count those too so the ranker won't put a
-        # currently rate-limited PR at the front and ask Codex to review what it just declined.
-        sigs = [(r.get("created_at"), r.get("body")) for r in reviews if is_codex_author(r.get("author"))]
-        sigs += [(c.get("created_at"), c.get("body")) for c in comments if is_codex_author(c.get("author"))]
-        sigs = [(t, b) for t, b in sigs if t]
-        quota_limited = is_codex_quota_notice(max(sigs, key=lambda x: x[0])[1]) if sigs else False
-        return {"rounds": len(revs) + len(crevs), "reviewed_on_head": on_head, "quota_limited": quota_limited}
-
     # Codex helpers ---------------------------------------------------------------------
     def find_latest_codex_advisory(self, issue_number: int) -> Optional[dict]:
         comments = [c for c in self.get_issue_comments(issue_number) if is_codex_author(c["author"])]
@@ -423,7 +395,11 @@ class ReadOnlyGitHub:
         # latest signal is that notice (so callers can back off), but base the verdict on the latest
         # NON-quota signal — so a freshly-posted-then-rate-limited review isn't hidden, and a bare
         # quota notice is never mis-parsed as a verdict.
-        quota_active = is_codex_quota_notice(max(candidates, key=_key).get("body"))
+        # the OVERALL latest signal is a quota notice if ANY candidate at the max timestamp is one — a
+        # same-second review can otherwise win the rank tie and hide a co-timestamped quota notice.
+        _qmax = max((c.get("created_at") or "") for c in candidates)
+        quota_active = any(is_codex_quota_notice(c.get("body"))
+                           for c in candidates if (c.get("created_at") or "") == _qmax)
         real = [c for c in candidates if not is_codex_quota_notice(c.get("body"))]
         # Dedupe key for the watcher over the NON-quota signals at their latest timestamp: cover ALL
         # signals sharing that timestamp (not just the highest-ranked one), so a newly-visible
@@ -434,6 +410,23 @@ class ReadOnlyGitHub:
         _max_ts = max((c.get("created_at") or "") for c in _basis)
         dedupe_key = _max_ts + "|" + ",".join(sorted(
             (c.get("url") or "") for c in _basis if (c.get("created_at") or "") == _max_ts))
+        # Legacy compatibility (QUOTA case only): when a newer quota notice exists, the OLD watcher stored
+        # that quota notice's single `created_at|url`. Its timestamp is NEWER than the latest real review,
+        # so accepting it can't collide with a fresh baseline (which keys off the real review at an earlier
+        # second) -> safe. We deliberately do NOT expose the SAME-SECOND non-quota single key: it is
+        # identical to what a fresh baseline stores when only the review was present, so accepting it would
+        # SUPPRESS the intended same-second re-alert (a NEW lower-ranked comment posted in a seen review's
+        # second). That live feature outweighs a one-time, self-healing re-alert on a pre-upgrade seen file.
+        legacy_dedupe_key = None
+        if quota_active and real:
+            # pick the QUOTA notice's url at _qmax — NOT a same-second review that outranks it. Keying off
+            # the quota url keeps the legacy key distinct from any review baseline, so it can't suppress a
+            # same-second inline-comment re-alert.
+            quota_at_qmax = [c for c in candidates if (c.get("created_at") or "") == _qmax
+                             and is_codex_quota_notice(c.get("body"))]
+            if quota_at_qmax:
+                overall_q = max(quota_at_qmax, key=_key)
+                legacy_dedupe_key = (_qmax or "") + "|" + (overall_q.get("url") or "")
         if not real:
             overall = max(candidates, key=_key)   # only quota notices from Codex -> signal, no review
             return {
@@ -455,25 +448,47 @@ class ReadOnlyGitHub:
         # stays the higher-ranked review; merge that newer signal's items so the alert isn't empty of
         # the actually-new content.
         _lt = latest.get("created_at") or ""
+        cotimestamped_blocking = False
+        cotimestamped_extra = []
         for c in real:
             if c is not latest and (c.get("created_at") or "") == _lt:
-                for it in (parse_review_packet(c.get("body"), c.get("state")).get("items") or []):
+                cp = parse_review_packet(c.get("body"), c.get("state"))
+                for it in (cp.get("items") or []):
                     if it not in packet["items"]:
                         packet["items"].append(it)
+                if cp.get("blocking"):
+                    cotimestamped_blocking = True
+                # a co-timestamped comment that is PLAIN PROSE (no bullet items) would otherwise be
+                # invisible — the alert would re-fire (new dedupe key) but still show only `latest`'s
+                # body/url. Surface its body + url so the new feedback is actually displayed.
+                cbody = (c.get("body") or "").strip()
+                if cbody and cbody not in (packet.get("body") or ""):
+                    cotimestamped_extra.append((c.get("url"), cbody))
+        # a co-timestamped lower-ranked signal that is itself blocking must SURFACE its verdict, not
+        # just its items — otherwise we'd re-alert the fix while reporting blocking=False.
+        if cotimestamped_blocking:
+            packet["blocking"] = True
+        if cotimestamped_extra:
+            extra = "\n\n".join(f"[also @ same timestamp] {u or ''}\n{b}" for u, b in cotimestamped_extra)
+            packet["body"] = ((packet.get("body") or "").rstrip() + "\n\n" + extra).strip()
         # Reconcile with terminal review states:
         #  - a CHANGES_REQUESTED review stays in effect until a *newer* APPROVED clears it;
         #  - an APPROVED clears blocking only if it's the most recent signal — a newer plain comment
-        #    with blocking language still counts (don't let an old approval hide it).
+        #    with blocking language still counts (don't let an old approval hide it);
+        #  - a SAME-SECOND APPROVED must not bury a co-timestamped blocking comment.
         stateful = [c for c in real if (c.get("state") or "").upper() in
                     ("CHANGES_REQUESTED", "APPROVED")]
         if stateful:
             newest_sf = max(stateful, key=lambda c: c.get("created_at") or "")
             nstate = (newest_sf.get("state") or "").upper()
+            _sf_ts, _lt_ts = (newest_sf.get("created_at") or ""), (latest.get("created_at") or "")
             if nstate == "CHANGES_REQUESTED":
                 packet["blocking"] = True
-            elif (newest_sf.get("created_at") or "") >= (latest.get("created_at") or ""):
-                packet["blocking"] = False   # APPROVED is the most recent signal
-            # else: APPROVED predates a newer comment -> keep that comment's parsed verdict
+            elif _sf_ts > _lt_ts:
+                packet["blocking"] = False   # a STRICTLY newer APPROVED clears blocking
+            elif _sf_ts == _lt_ts and not cotimestamped_blocking:
+                packet["blocking"] = False   # same-second APPROVED clears only if nothing blocks at that second
+            # else: APPROVED predates a newer comment (or a co-timestamped blocker stands) -> keep verdict
         return {
             "source": latest["source"],
             "pr_number": int(pr_number),
@@ -481,10 +496,40 @@ class ReadOnlyGitHub:
             "created_at": latest["created_at"],
             "url": latest.get("url"),
             "dedupe_key": dedupe_key,
+            "legacy_dedupe_key": legacy_dedupe_key,
             "quota_limited": quota_active,
             "has_review": True,
             **packet,
         }
+
+    def codex_review_rounds(self, pr_number: int, head: Optional[str] = None) -> dict:
+        """Count SUBSTANTIVE (non-quota) trusted-Codex reviews on a PR, whether the given ``head`` SHA
+        is already reviewed, and whether the PR is CURRENTLY rate-limited (latest Codex signal — review
+        OR comment — is a usage-limits notice). Read-only.
+        Returns ``{rounds, reviewed_on_head, quota_limited}``."""
+        reviews = self.get_pr_reviews(pr_number)
+        comments = self.get_pr_comments(pr_number)
+        # a substantive review = non-quota Codex review with a body OR a meaningful state (an
+        # empty-body COMMENTED/CHANGES_REQUESTED/APPROVED review whose content is in inline comments
+        # still counts as a review round).
+        revs = [r for r in reviews
+                if is_codex_author(r.get("author"))
+                and not is_codex_quota_notice(r.get("body"))
+                and ((r.get("body") or "").strip()
+                     or (r.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"))]
+        # a PR can also be "reviewed" via a Codex CONVERSATION comment (which find_latest_codex_review
+        # treats as a review) — count substantive non-quota ones so such a PR isn't mis-scored rounds=0
+        # and re-recommended as never-reviewed.
+        crevs = [c for c in comments if is_codex_author(c.get("author"))
+                 and not is_codex_quota_notice(c.get("body")) and (c.get("body") or "").strip()]
+        on_head = bool(head) and any((r.get("commit_id") or "") == head for r in revs)
+        # quota notices arrive as PR COMMENTS (not reviews) — count those too so the ranker won't put a
+        # currently rate-limited PR at the front and ask Codex to review what it just declined.
+        sigs = [(r.get("created_at"), r.get("body")) for r in reviews if is_codex_author(r.get("author"))]
+        sigs += [(c.get("created_at"), c.get("body")) for c in comments if is_codex_author(c.get("author"))]
+        sigs = [(t, b) for t, b in sigs if t]
+        quota_limited = is_codex_quota_notice(max(sigs, key=lambda x: x[0])[1]) if sigs else False
+        return {"rounds": len(revs) + len(crevs), "reviewed_on_head": on_head, "quota_limited": quota_limited}
 
 
 # ======================================================================================

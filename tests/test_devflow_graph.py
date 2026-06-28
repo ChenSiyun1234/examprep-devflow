@@ -80,6 +80,25 @@ class TestDevflowGraph(unittest.TestCase):
         self.assertEqual(resumed["status"], "done")
         self.assertIn("devflow dry-run report", resumed["final_report"])
 
+    def test_resume_tolerates_legacy_renamed_node(self):
+        # a checkpoint written before a node rename stores a stale paused_at_node -> stdlib resume
+        # must fall back to the gate's canonical node, not KeyError (Codex review on PR #1)
+        import os
+        import uuid
+        from devflow import cli
+        paused = run(approvals={})                        # real pause at the advisory gate
+        self.assertEqual(paused["status"], "paused")
+        tid = "legacy-" + uuid.uuid4().hex[:8]             # unique id + cleanup so the resume's new
+        paused["thread_id"] = tid                          # (re-paused) checkpoint never leaks to other tests
+        self.addCleanup(lambda: os.path.exists(cli._ckpt_path(tid)) and os.remove(cli._ckpt_path(tid)))
+        paused["paused_at_node"] = "human_approval"        # the OLD (pre-rename) node name
+        paused["approvals"] = {}
+        cli._save_ckpt(paused)
+        args = cli.build_parser().parse_args(
+            ["resume", "--thread-id", tid, "--gate", "advisory", "--decision", "approved"])
+        rc = cli.cmd_resume(args)                           # must not raise KeyError
+        self.assertEqual(rc, 0)
+
     def test_advisory_timeout_safe_stop(self):
         s = run(simulate={"advisory": "timeout", "review": "blocking"})
         self.assertEqual(s["codex_advisory_status"], "timeout")
@@ -216,9 +235,52 @@ class TestWaitForCodexReviewQuota(unittest.TestCase):
             out = pr_review.wait_for_codex_review(state)
         self.assertEqual(out["codex_review_status"], "timeout")   # quota notice is not the awaited review
 
+    def test_accepts_real_review_eclipsed_by_newer_quota(self):
+        # a FRESH review (newer than the pre-request baseline) counts even if a NEWER usage-limits notice
+        # eclipses it (quota_limited=True) — we must NOT time out on a review we actually have
+        # (Codex r3 P2; r8 P1 refines: it must be NEWER than the baseline).
+        from devflow.nodes import pr_review
+        rev = {"has_review": True, "quota_limited": True, "blocking": False, "items": [],
+               "dedupe_key": "fresh-key"}                              # different from the (empty) baseline
+        state = {"real_github": True, "repo": "o/r", "pr_number": 5,
+                 "max_polls": 2, "poll_seconds": 0, "_sleep_fn": lambda *_: None}
+        with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:
+            RG.return_value.find_latest_codex_review.return_value = rev
+            out = pr_review.wait_for_codex_review(state)
+        self.assertEqual(out["codex_review_status"], "ready")
+
+    def test_stale_review_with_quota_keeps_polling(self):
+        # Codex r8 P1 + r9 P2: an OLD review that stays latest because the NEW request got only a quota
+        # notice (SAME dedupe_key as the pre-request baseline) must NOT be accepted — keep polling / time out
+        from devflow.nodes import pr_review
+        stale = {"has_review": True, "quota_limited": True, "blocking": False, "items": [],
+                 "dedupe_key": "stale-key"}
+        state = {"real_github": True, "repo": "o/r", "pr_number": 5, "max_polls": 2, "poll_seconds": 0,
+                 "_sleep_fn": lambda *_: None,
+                 "codex_review_baseline_at": "stale-key"}              # baseline == the stale review's key
+        with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:
+            RG.return_value.find_latest_codex_review.return_value = stale
+            out = pr_review.wait_for_codex_review(state)
+        self.assertEqual(out["codex_review_status"], "timeout")
+
+    def test_fresh_same_second_review_accepted_by_dedupe_key(self):
+        # Codex r9 P2: a fresh review posted in the SAME second as the baseline (different dedupe_key) is
+        # accepted — a timestamp-only check would have rejected it
+        from devflow.nodes import pr_review
+        fresh = {"has_review": True, "quota_limited": False, "blocking": False, "items": [],
+                 "dedupe_key": "2026-01-01T00:00:00Z|new_url"}
+        state = {"real_github": True, "repo": "o/r", "pr_number": 5, "max_polls": 2, "poll_seconds": 0,
+                 "_sleep_fn": lambda *_: None,
+                 "codex_review_baseline_at": "2026-01-01T00:00:00Z|old_url"}   # SAME second, different url
+        with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:
+            RG.return_value.find_latest_codex_review.return_value = fresh
+            out = pr_review.wait_for_codex_review(state)
+        self.assertEqual(out["codex_review_status"], "ready")
+
     def test_real_review_still_satisfies_poll(self):
         from devflow.nodes import pr_review
-        real = {"has_review": True, "quota_limited": False, "blocking": False, "items": ["fix x"]}
+        real = {"has_review": True, "quota_limited": False, "blocking": False, "items": ["fix x"],
+                "dedupe_key": "fresh-key"}
         state = {"real_github": True, "repo": "o/r", "pr_number": 5,
                  "max_polls": 2, "poll_seconds": 0, "_sleep_fn": lambda *_: None}
         with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:

@@ -24,14 +24,19 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 
-from devflow.graph import build_graph, GATE_TO_NODE
+from devflow.graph import build_graph, GATE_TO_NODE, NODE_FUNCS
 from devflow.state import (
     new_state, APPROVED, REJECTED, APPROVAL_GATES,
     GATE_ADVISORY, GATE_FIX, GATE_MERGE,
 )
 from devflow.tools.github_cli import ReadOnlyGitHub, check_gh_available, GhError
 from devflow.tools.review_priority import score as score_review_priority
+from devflow.tools.packet_writer import (
+    build_packet, write_packet, PacketError,
+    parse_scope_markdown, build_manual_packet, render_manual_markdown,
+)
 from devflow._compat import HAS_LANGGRAPH
 
 # Windows GBK consoles otherwise mangle the report box-drawing / CJK text.
@@ -68,6 +73,15 @@ def _save_ckpt(state: dict) -> str:
 def _load_ckpt(thread_id: str) -> dict:
     with open(_ckpt_path(thread_id), "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _clear_fallback_ckpt(thread_id: str) -> None:
+    """Best-effort remove the stdlib-fallback JSON checkpoint for a thread, so a later non-langgraph
+    `resume` can't load obsolete state after a langgraph run/resume has completed. Never raises."""
+    try:
+        os.remove(_ckpt_path(thread_id))
+    except OSError:
+        pass
 
 
 def _approvals_from_args(args) -> dict:
@@ -187,6 +201,10 @@ def _run_langgraph(args) -> int:
         state["_simulate"] = {"advisory": args.simulate_advisory or "ready",
                               "review": args.simulate_review or "blocking"}
     cfg = {"configurable": {"thread_id": args.thread_id}}
+    # drop any stale stdlib-fallback checkpoint for this thread BEFORE running, so that if the
+    # langgraph run pauses, a stray plain `resume` can't load the obsolete fallback state instead of
+    # being told to resume with --langgraph.
+    _clear_fallback_ckpt(args.thread_id)
     print(f"[devflow] backend=langgraph (sqlite checkpointer)  dry_run=True  "
           f"task={args.task}  thread={args.thread_id}")
     with cm as saver:
@@ -197,6 +215,7 @@ def _run_langgraph(args) -> int:
             _print_lg_pause(nxt, payloads, args.thread_id)
             return 0
         _print_outcome(app.get_state(cfg).values)
+        _clear_fallback_ckpt(args.thread_id)   # completed -> drop any stale stdlib checkpoint
     return 0
 
 
@@ -214,11 +233,19 @@ def _resume_langgraph(args) -> int:
     cfg = {"configurable": {"thread_id": args.thread_id}}
     with cm as saver:
         app = _build_state_graph().compile(checkpointer=saver)
-        nxt, _ = _lg_pending(app, cfg)
+        nxt, payloads = _lg_pending(app, cfg)
         if not nxt:
             print(f"[devflow] no paused LangGraph thread '{args.thread_id}'. Start one with:\n"
                   f"  python -m devflow.cli run --task <t> --thread-id {args.thread_id} "
                   f"--langgraph --pause-at <gate>")
+            return 1
+        # Validate the operator-supplied --gate against where the thread is ACTUALLY paused, so a
+        # resume can't approve a different gate than intended (args.gate was previously only logged).
+        paused_gate = (payloads[0] or {}).get("gate") if payloads else None
+        paused_alias = next((a for a, full in _GATE_ALIASES.items() if full == paused_gate), None)
+        if paused_alias and args.gate and args.gate != paused_alias:
+            print(f"[devflow] refusing to resume: thread '{args.thread_id}' is paused at the "
+                  f"'{paused_alias}' gate, not '{args.gate}'. Re-run with --gate {paused_alias}.")
             return 1
         print(f"[devflow] resume(langgraph) thread={args.thread_id} gate={args.gate} "
               f"decision={decision}")
@@ -228,6 +255,7 @@ def _resume_langgraph(args) -> int:
             _print_lg_pause(nxt2, payloads2, args.thread_id)
             return 0
         _print_outcome(app.get_state(cfg).values)   # rejected -> safe-stop report; approved -> done
+        _clear_fallback_ckpt(args.thread_id)        # completed -> drop any stale stdlib checkpoint
     return 0
 
 
@@ -262,6 +290,11 @@ def cmd_resume(args) -> int:
             return 1
     state["real_github"] = want_live
     start = state.get("paused_at_node") or GATE_TO_NODE.get(gate)
+    if start not in NODE_FUNCS:
+        # a checkpoint from before a node rename stores a stale node name -> fall back to the node for
+        # the gate the checkpoint ACTUALLY paused at (state['paused_at_gate']), not the operator's
+        # --gate (which could be wrong for this thread and resume it at the wrong gate).
+        start = GATE_TO_NODE.get(state.get("paused_at_gate")) or GATE_TO_NODE.get(gate)
     state["status"] = "running"
     app = build_graph(prefer_fallback=True)  # resume uses the stdlib runner's start_node support
     print(f"[devflow] resume thread={args.thread_id} gate={args.gate} decision={decision} "
@@ -333,7 +366,7 @@ def cmd_read_pr(args) -> int:
     print(f"[read-pr] #{args.pr} — {len(comments)} comment(s), {len(reviews)} review(s)")
     for r in reviews:
         print(f"  review: {r['author']} [{r['state']}] @ {r['created_at']}")
-    if review:
+    if review and review.get("has_review", True):
         print(f"\nLatest Codex review: by {review['author']} ({review['source']}) "
               f"blocking={review['blocking']} state={review.get('state')}")
         if review["items"]:
@@ -341,6 +374,9 @@ def cmd_read_pr(args) -> int:
             for it in review["items"][:20]:
                 print(f"   - {it}")
         print(review["body"][:800])
+    elif review:   # a quota-only signal (has_review False) is NOT a review — label it as such
+        print(f"\nLatest Codex signal: usage-limit notice (no review yet) by {review['author']} "
+              f"@ {review.get('created_at')}")
     else:
         print("\nLatest Codex review: (none found)")
     return 0
@@ -366,8 +402,26 @@ def _load_codex_seen(path: str) -> dict:
     # case-fold the top-level repo key (GitHub repos are case-insensitive) so a legacy mixed-case
     # slice written before key-normalization still matches the lowercased lookup, instead of being
     # missed and re-alerting every previously-seen review.
-    return {repo.lower(): {pr: entry for pr, entry in slc.items() if isinstance(entry, dict)}
-            for repo, slc in data.items() if isinstance(slc, dict)}
+    out = {}
+    for repo, slc in data.items():
+        if not isinstance(slc, dict):
+            continue
+        # MERGE (not overwrite) into the lowercased key so a file holding both `Owner/Repo` and
+        # `owner/repo` keeps every PR entry instead of the later slice clobbering the earlier one.
+        dst = out.setdefault(repo.lower(), {})
+        for pr, entry in slc.items():
+            if not isinstance(entry, dict):
+                continue
+            cur = dst.get(pr)
+            # on a same-PR collision across case-variant slices, keep the FRESHEST entry: strictly-newer
+            # created_at wins; on an equal timestamp prefer the FULLER key (more same-second URLs, e.g.
+            # 'T|review,inline' over 'T|review') so a stale partial key can't overwrite a fresher one and
+            # re-alert already-seen feedback.
+            e_ts, c_ts = (entry.get("created_at") or ""), ((cur or {}).get("created_at") or "")
+            e_key, c_key = (entry.get("key") or ""), ((cur or {}).get("key") or "")
+            if cur is None or e_ts > c_ts or (e_ts == c_ts and len(e_key) > len(c_key)):
+                dst[pr] = entry
+    return out
 
 
 def _save_codex_seen(path: str, data: dict, only_repo: str = None) -> None:
@@ -386,10 +440,11 @@ def _save_codex_seen(path: str, data: dict, only_repo: str = None) -> None:
 
 
 def cmd_watch_codex_reviews(args) -> int:
-    """Read-only: scan OPEN PRs for NEW trusted-Codex reviews/comments, deduped against a local
-    seen file. Prints ACTIONABLE_CODEX_REVIEWS (with details) if anything is new, else
-    CODEX_QUOTA_LIMITED if Codex is only returning rate-limit notices (so a scheduler can back off),
-    else NO_NEW_CODEX_REVIEWS. Never edits code, comments, commits, pushes, or merges."""
+    """Read-only: scan OPEN PRs for NEW trusted-Codex reviews/comments, deduped against a local seen
+    file. First-line marker, in precedence order: ACTIONABLE_CODEX_REVIEWS (new feedback to act on) >
+    CODEX_WATCH_INCOMPLETE (a PR read failed — sweep incomplete, retry; don't trust a clean result) >
+    CODEX_QUOTA_LIMITED (only rate-limit notices — a scheduler can back off) > NO_NEW_CODEX_REVIEWS.
+    Never edits code, comments, commits, pushes, or merges."""
     rc = _require_gh()
     if rc:
         return rc
@@ -421,18 +476,33 @@ def cmd_watch_codex_reviews(args) -> int:
         if not review:
             continue
         if review.get("quota_limited"):                 # Codex code review is rate-limited on this PR
-            quota_prs.append(num)
+            # only flag a quota notice as a back-off signal when it is NEW — a persistent OLD quota comment
+            # must not emit CODEX_QUOTA_LIMITED on every run, or a scheduler backing off on it would never
+            # return to normal polling after the limit resets.
+            qkey = review.get("dedupe_key") or f"{review.get('created_at') or ''}|{review.get('url') or ''}"
+            if not args.init and (repo_seen.get(str(num)) or {}).get("quota_key") != qkey:
+                quota_prs.append(num)
+            repo_seen.setdefault(str(num), {})["quota_key"] = qkey   # record so it isn't re-flagged
         if not review.get("has_review", True):
             continue                                    # a bare quota notice is not an actionable review
         # dedupe key covers ALL Codex signals at the latest timestamp (so a same-second newly-visible
         # comment still counts as new); fall back to created_at|url for older return shapes.
         key = review.get("dedupe_key") or f"{review.get('created_at') or ''}|{review.get('url') or ''}"
+        stored_key = (repo_seen.get(str(num)) or {}).get("key")
+        # a stored key matching EITHER the current key or the legacy (quota-inclusive) key counts as
+        # already-seen, so upgrading the dedupe scheme doesn't re-alert an older review.
+        already_seen = stored_key is not None and stored_key in (key, review.get("legacy_dedupe_key"))
         entry = {"key": key, "created_at": review.get("created_at"),
                  "url": review.get("url"), "blocking": review.get("blocking")}
         if args.init:                       # baseline: record current state, do not alert
             repo_seen[str(num)] = entry
-        elif key != (repo_seen.get(str(num)) or {}).get("key"):
+        elif not already_seen:
             actionable.append({"pr": num, "title": pr.get("title"), "review": review})
+            repo_seen[str(num)] = entry
+        elif stored_key != key:
+            # seen via the LEGACY key -> MIGRATE the stored key forward to the current dedupe_key. Else the
+            # stale legacy key keeps matching and a later real change (e.g. a same-second inline becoming
+            # visible) whose new key still equals legacy_dedupe_key would never be reported.
             repo_seen[str(num)] = entry
 
     seen[repo_key] = repo_seen
@@ -450,12 +520,12 @@ def cmd_watch_codex_reviews(args) -> int:
     # Marker FIRST (a bare line) so strict consumers can match it; human details + optional JSON
     # follow. ACTIONABLE/NO_NEW is carried by this string, NOT the exit code (exit stays 0 like
     # read-pr, unless --exit-actionable is requested).
-    # Precedence: real new feedback to act on > rate-limited (back off) > nothing new.
-    # Precedence: real feedback to act on > rate-limited (back off) > partial-failure (unknown, retry)
-    # > nothing new. A read failure must NOT surface as a clean NO_NEW.
+    # Precedence: real feedback to act on > partial-failure (incomplete sweep) > rate-limited (back off)
+    # > nothing new. INCOMPLETE outranks QUOTA: a failed PR read may hide actionable feedback, so a
+    # consumer must NOT back off for quota when the sweep didn't actually inspect everything.
     marker = ("ACTIONABLE_CODEX_REVIEWS" if actionable
-              else "CODEX_QUOTA_LIMITED" if quota_prs
               else "CODEX_WATCH_INCOMPLETE" if errors
+              else "CODEX_QUOTA_LIMITED" if quota_prs
               else "NO_NEW_CODEX_REVIEWS")
     print(marker)
     print(f"[watch-codex] repo={repo} open_prs={len(prs)} checked={len(checked)} "
@@ -578,6 +648,129 @@ def cmd_rank_codex_reviews(args) -> int:
                         "title": r["title"]} for r in ranked],
             "errors": [{"pr": n, "error": m} for n, m in errors],
         }, ensure_ascii=False, indent=2))
+    return 0
+
+
+# ---- Implementation Packet export (safe handoff to Claude Code; NO repo edits, NO gh writes) ----
+PACKETS_DIR = os.path.join(".devflow", "packets")   # tool-state, gitignored — not tracked product data
+
+
+def cmd_export_implementation_packet(args) -> int:
+    """Export a structured Implementation Packet from a paused thread's checkpoint.
+
+    devflow summarizes + records the human approval; the packet hands the SCOPED work to Claude Code.
+    This command is read-only w.r.t. GitHub and the repo: it loads the local checkpoint, builds the
+    packet, and writes two local files. It NEVER edits code, runs the workflow, or calls gh.
+    """
+    try:
+        state = _load_ckpt(args.thread_id)
+    except (OSError, ValueError):
+        print(f"[devflow] no checkpoint for thread '{args.thread_id}'. Pause at a gate first, e.g.:\n"
+              f"  python -m devflow.cli run --task <task> --thread-id {args.thread_id} "
+              f"--pause-at advisory")
+        return 1
+    if not isinstance(state, dict):
+        # a valid-JSON but non-object checkpoint (e.g. a stale/hand-edited `[]`) — degrade, don't crash
+        print(f"[devflow] checkpoint for thread '{args.thread_id}' is not a devflow state object "
+              f"(got {type(state).__name__}); re-run a paused workflow to regenerate it.")
+        return 1
+    # Only export from a thread actually PAUSED at a recognized approval gate. A stale/completed/
+    # hand-edited checkpoint (status done/stopped, or no paused_at_gate) must not silently default to
+    # the advisory gate and emit an "approved" packet for a non-existent approval boundary.
+    if state.get("status") != "paused" or state.get("paused_at_gate") not in _GATE_ALIASES.values():
+        print(f"[devflow] thread '{args.thread_id}' is not paused at a recognized approval gate "
+              f"(status={state.get('status')!r}, paused_at_gate={state.get('paused_at_gate')!r}); "
+              f"pause at a gate first: run ... --pause-at <advisory|fix|merge>.")
+        return 1
+
+    # If --gate is given, it must not contradict the gate the thread is actually paused at — otherwise
+    # a script/typo could mark fix/merge scope "approved" for a thread that only reached the advisory
+    # gate. Trust the checkpoint's paused_at_gate; refuse a conflicting override.
+    paused_gate = state.get("paused_at_gate")
+    if args.gate:
+        gate = _GATE_ALIASES[args.gate]
+        if paused_gate and gate != paused_gate:
+            alias = next((a for a, full in _GATE_ALIASES.items() if full == paused_gate), paused_gate)
+            print(f"[devflow] --gate {args.gate} conflicts with the thread's paused gate "
+                  f"'{paused_gate}' (it is paused at '{alias}'). Refusing; omit --gate or pass --gate {alias}.")
+            return 1
+    else:
+        gate = paused_gate or GATE_ADVISORY
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    packet = build_packet(state, gate=gate, decision=args.decision, generated_at=generated_at)
+    out_dir = args.out_dir or PACKETS_DIR
+    try:
+        paths = write_packet(out_dir, args.thread_id, packet)
+    except PacketError as e:
+        print(f"[devflow] {e}")
+        return 1
+
+    m = packet["metadata"]
+    rejected = packet["approval"]["decision"] == REJECTED
+    print("IMPLEMENTATION_PACKET_EXPORTED")
+    print(f"  markdown:  {paths['md_path']}")
+    print(f"  json:      {paths['json_path']}")
+    print(f"  thread_id: {m.get('thread_id')}")
+    print(f"  gate:      {packet['approval']['gate']}  decision: {packet['approval']['decision']}")
+    if m.get("issue_number"):
+        print(f"  source issue: #{m['issue_number']} {m.get('issue_url') or ''}".rstrip())
+    if m.get("pr_number"):
+        print(f"  source PR:    #{m['pr_number']} {m.get('pr_url') or ''}".rstrip())
+    if rejected:
+        print("\nGate REJECTED — nothing to implement; no handoff. The packet records the rejection.")
+    else:
+        print("\nNext (hand off to Claude Code):")
+        print(f"  Implement ONLY the scoped tasks in {paths['md_path']}; run the listed checks; do "
+              f"not commit/push/merge; ask before expanding scope.")
+    return 0
+
+
+def cmd_create_implementation_packet(args) -> int:
+    """Create an Implementation Packet from a HUMAN-PROVIDED Markdown scope file.
+
+    Unlike ``export-implementation-packet`` (which reads a paused checkpoint), this needs no prior
+    advisory — the human supplies a concrete scope directly, so it never produces the generic packet
+    a simulated dry-run advisory would. Read-only w.r.t. GitHub + the repo: it reads one local file
+    and writes the two packet files. No gh, no workflow, no code edits.
+    """
+    try:
+        with open(args.scope_file, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        print(f"[devflow] could not read scope file '{args.scope_file}': {e}\n"
+              f"  provide a Markdown scope file (see README: create-implementation-packet).")
+        return 1
+
+    scope = parse_scope_markdown(text)
+    for h in scope.get("unknown_headings", []):
+        print(f"[devflow] note: ignored unrecognized scope section '# {h}' (its lines were dropped)")
+    task = args.task or scope.get("task") or "(untitled task)"
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    packet = build_manual_packet(thread_id=args.thread_id, task=task, repo=args.repo,
+                                 generated_at=generated_at, scope=scope, scope_file=args.scope_file)
+    # Refuse a scope with no concrete WORK: a files-only scope (paths but no approved scope/tasks) is
+    # not enough — it would recreate the unusable generic-packet failure mode this command exists to
+    # avoid. Require an approved scope or tasks (files alone, or only quarantined items, don't count).
+    ii = packet["implementation_instructions"]
+    if not (packet["approval"]["approved_scope"] or ii["tasks"]):
+        print(f"[devflow] scope file '{args.scope_file}' has no concrete implementation work "
+              f"(needs a '# Approved scope' or '# Tasks' section, not just files). Not writing a packet.")
+        return 1
+    out_dir = args.out_dir or PACKETS_DIR
+    try:
+        paths = write_packet(out_dir, args.thread_id, packet,
+                             markdown=render_manual_markdown(packet))
+    except PacketError as e:
+        print(f"[devflow] {e}")
+        return 1
+
+    print("MANUAL_IMPLEMENTATION_PACKET_CREATED")
+    print(f"  markdown:  {paths['md_path']}")
+    print(f"  json:      {paths['json_path']}")
+    print(f"  thread_id: {args.thread_id}")
+    print(f"  task:      {task}")
+    print("\nNext (hand off to Claude Code):")
+    print(f"  {packet['suggested_prompt']}")
     return 0
 
 
@@ -705,6 +898,28 @@ def build_parser() -> argparse.ArgumentParser:
     rk.add_argument("--json", action="store_true",
                     help="also print a machine-readable JSON ranking")
     rk.set_defaults(func=cmd_rank_codex_reviews)
+    # --- Implementation Packet export (handoff to Claude Code; local files only, no edits/writes) ---
+    ep = sub.add_parser("export-implementation-packet",
+                        help="export a scoped Implementation Packet for Claude Code from a paused thread")
+    ep.add_argument("--thread-id", required=True, help="thread id of a paused (checkpointed) run")
+    ep.add_argument("--gate", choices=list(_GATE_ALIASES), default=None,
+                    help="gate being approved (default: the thread's paused gate, else advisory)")
+    ep.add_argument("--decision", choices=[APPROVED, REJECTED], required=True,
+                    help="REQUIRED — the human's decision recorded in the packet (no silent default)")
+    ep.add_argument("--out-dir", default=None,
+                    help="output base dir (default: .devflow/packets, which is gitignored)")
+    ep.set_defaults(func=cmd_export_implementation_packet)
+
+    # --- create a packet from a HUMAN-provided scope file (no advisory/checkpoint needed) ---
+    cp = sub.add_parser("create-implementation-packet",
+                        help="create an Implementation Packet from a human-provided Markdown scope file")
+    cp.add_argument("--thread-id", required=True, help="thread id (names the packet output dir)")
+    cp.add_argument("--scope-file", required=True, help="path to a Markdown scope file")
+    cp.add_argument("--task", default=None, help="task title (overrides the scope file's '# Task')")
+    cp.add_argument("--repo", default="ZeKaiNie/universal-examprep-skill", help="owner/name")
+    cp.add_argument("--out-dir", default=None,
+                    help="output base dir (default: .devflow/packets, which is gitignored)")
+    cp.set_defaults(func=cmd_create_implementation_packet)
 
     # --- advisory flow up to human approval (dry-run by default; --real-github opts in) ---
     rda = sub.add_parser("run-docs-advisory",

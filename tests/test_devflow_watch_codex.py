@@ -214,6 +214,39 @@ class TestWatchCodexBehavior(WatchCodexBase):
         self.assertEqual(out.splitlines()[0], "CODEX_WATCH_INCOMPLETE")
         self.assertIn("! PR #1", out)
 
+    def test_incomplete_marker_outranks_quota(self):
+        # Codex r5 P2: when one PR read fails AND another only has a quota notice, the incomplete sweep
+        # must win the first-line marker — a consumer must not back off for quota having missed a PR
+        prs = [{"number": 1, "title": "A", "updatedAt": "z", "url": "p1"},
+               {"number": 2, "title": "B", "updatedAt": "z", "url": "p2"}]
+        rc, out, _ = self.run_watch(prs, error_prs={1},
+                                    comments_by_pr={2: [codex_quota("2026-01-04T00:00:00Z", "p2#q1")]})
+        self.assertEqual(out.splitlines()[0], "CODEX_WATCH_INCOMPLETE")   # errors outrank quota
+        self.assertIn("! PR #1", out)
+
+    def test_quota_notice_rejects_prefixed_phrase(self):
+        # Codex r5 P2: a review that opens with a PREFIX before the phrase is NOT a quota notice
+        self.assertFalse(G.is_codex_quota_notice("Bug: reached your Codex usage limits parsing the body."))
+        self.assertTrue(G.is_codex_quota_notice(
+            "You have reached your Codex usage limits for code reviews. You can see your limits in the dashboard."))
+
+    def test_quota_notice_requires_code_review_context(self):
+        # Codex r6 P2: even the opener phrase, WITHOUT the "for code reviews" context, is not the notice
+        # (a real review can open by quoting the opener while discussing this matcher)
+        self.assertFalse(G.is_codex_quota_notice(
+            "You have reached your Codex usage limits parsing — the matcher needs the full opener."))
+        self.assertTrue(G.is_codex_quota_notice(
+            "You have reached your Codex usage limits for code reviews. You can see your limits in the dashboard."))
+
+    def test_quota_notice_requires_full_notice_not_just_first_sentence(self):
+        # Codex r7 P2: a review quoting ONLY the canonical first sentence then giving feedback (no
+        # "you can see your limits" continuation, still <600 chars) is NOT a quota notice
+        self.assertFalse(G.is_codex_quota_notice(
+            "You have reached your Codex usage limits for code reviews. But here is my real feedback: "
+            "fix the null deref in line 12 and add a test."))
+        self.assertTrue(G.is_codex_quota_notice(
+            "You have reached your Codex usage limits for code reviews. You can see your limits in the dashboard."))
+
     def test_init_surfaces_errored_prs_not_baselined(self):
         # --init must report PRs it could NOT baseline (else the next poll re-alerts on them) (Codex r1 #3)
         prs = [{"number": 1, "title": "A", "updatedAt": "z", "url": "p1"},
@@ -255,7 +288,7 @@ class TestWatchCodexBehavior(WatchCodexBase):
         # the exact bot notice -> True; a substantive (long) review that merely MENTIONS usage limits
         # -> False (must not be dropped as a rate-limit notice) (Codex r2)
         self.assertTrue(G.is_codex_quota_notice(
-            "You have reached your Codex usage limits for code reviews. See the dashboard."))
+            "You have reached your Codex usage limits for code reviews. You can see your limits in the dashboard."))
         long_review = "### Codex Review\n- " + "the watcher usage limit / codex handling looks off; " * 30
         self.assertFalse(G.is_codex_quota_notice(long_review))
 
@@ -269,6 +302,14 @@ class TestWatchCodexBehavior(WatchCodexBase):
         self.assertNotIn("ACTIONABLE_CODEX_REVIEWS", out)   # stale review NOT re-alerted (key over non-quota)
         self.assertIn("CODEX_QUOTA_LIMITED", out)           # but rate-limit is still signalled
 
+    def test_case_colliding_seen_slices_merged_not_clobbered(self):
+        # a file holding BOTH 'Owner/Repo' and 'owner/repo' must merge their PR entries (Codex r2)
+        from devflow.cli import _load_codex_seen
+        with open(self.seen, "w", encoding="utf-8") as f:
+            json.dump({"Owner/Repo": {"1": {"key": "a"}}, "owner/repo": {"2": {"key": "b"}}}, f)
+        merged = _load_codex_seen(self.seen)
+        self.assertEqual(set(merged.get("owner/repo", {})), {"1", "2"})   # neither slice clobbered
+
     def test_legacy_mixed_case_seen_slice_is_migrated_on_load(self):
         # a seen file written by pre-normalization code (mixed-case key) must still match (Codex r2)
         with open(self.seen, "w", encoding="utf-8") as f:
@@ -277,6 +318,56 @@ class TestWatchCodexBehavior(WatchCodexBase):
         _, out, _ = self.run_watch(prs, reviews_by_pr={1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]},
                                    repo="owner/repo")
         self.assertNoNew(out)   # legacy slice migrated on load -> already-seen, not re-alerted
+
+    def test_quota_notice_must_be_at_opener_not_mid_body(self):
+        # a SHORT (<600) real review that QUOTES the canonical notice mid-sentence is NOT a quota
+        # notice — the match must anchor at the opener, not anywhere in the body (Codex r4 P2)
+        self.assertFalse(G.is_codex_quota_notice(
+            "Note: when Codex says 'You have reached your Codex usage limits', this watcher backs off."))
+        self.assertTrue(G.is_codex_quota_notice(
+            "You have reached your Codex usage limits for code reviews. You can see your limits in the dashboard."))
+
+    def test_case_colliding_seen_keeps_newest_entry(self):
+        # same PR in both case-variant slices -> keep the NEWEST entry, not JSON insertion order (Codex r4 P2)
+        from devflow.cli import _load_codex_seen
+        with open(self.seen, "w", encoding="utf-8") as f:
+            json.dump({"Owner/Repo": {"1": {"key": "new", "created_at": "2026-01-05T00:00:00Z"}},
+                       "owner/repo": {"1": {"key": "old", "created_at": "2026-01-01T00:00:00Z"}}}, f)
+        merged = _load_codex_seen(self.seen)
+        self.assertEqual(merged["owner/repo"]["1"]["key"], "new")   # newest wins over the later stale slice
+
+    def test_case_colliding_seen_prefers_fuller_key_on_timestamp_tie(self):
+        # Codex r7 P2: on an EQUAL created_at across case variants, the FULLER key (more same-second URLs)
+        # must win, not whichever slice appears later in the JSON
+        from devflow.cli import _load_codex_seen
+        with open(self.seen, "w", encoding="utf-8") as f:
+            json.dump({"Owner/Repo": {"1": {"key": "T|review,inline", "created_at": "2026-01-05T00:00:00Z"}},
+                       "owner/repo": {"1": {"key": "T|review", "created_at": "2026-01-05T00:00:00Z"}}}, f)
+        merged = _load_codex_seen(self.seen)
+        self.assertEqual(merged["owner/repo"]["1"]["key"], "T|review,inline")   # fuller key kept on tie
+
+    def test_legacy_quota_inclusive_seen_key_not_re_alerted(self):
+        # upgrade path: a seen file storing the OLD quota-INCLUSIVE key must not re-alert the same older
+        # review now that the key excludes quota notices (Codex r4 P2)
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        with open(self.seen, "w", encoding="utf-8") as f:   # old watcher stored the newer quota's key
+            json.dump({"owner/repo": {"1": {"key": "2026-01-04T00:00:00Z|p1#q1"}}}, f)
+        _, out, _ = self.run_watch(
+            prs, reviews_by_pr={1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]},
+            comments_by_pr={1: [codex_quota("2026-01-04T00:00:00Z", "p1#q1")]}, repo="owner/repo")
+        self.assertNotIn("ACTIONABLE_CODEX_REVIEWS", out)   # legacy quota-inclusive key recognized as seen
+
+    def test_legacy_key_migrated_forward_when_accepted(self):
+        # Codex r8 P2: when a PR is seen via the legacy quota-inclusive key, MIGRATE the stored key to the
+        # current dedupe_key so a later real change isn't masked by the stale legacy key
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        with open(self.seen, "w", encoding="utf-8") as f:   # old watcher stored the quota's key
+            json.dump({"owner/repo": {"1": {"key": "2026-01-04T00:00:00Z|p1#q1"}}}, f)
+        self.run_watch(prs, reviews_by_pr={1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]},
+                       comments_by_pr={1: [codex_quota("2026-01-04T00:00:00Z", "p1#q1")]}, repo="owner/repo")
+        with open(self.seen, encoding="utf-8") as f:
+            stored = json.load(f)["owner/repo"]["1"]["key"]
+        self.assertEqual(stored, "2026-01-03T00:00:00Z|p1#r1")   # migrated to the current non-quota key
 
     def test_gh_unauthenticated_returns_nonzero(self):
         rc, out, _ = self.run_watch([{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}],
@@ -355,6 +446,17 @@ class TestWatchCodexBehavior(WatchCodexBase):
         self.assertEqual(out.splitlines()[0], "CODEX_QUOTA_LIMITED")   # strict-consumer marker first
         self.assertIn("rate-limited", out)
         self.assertIn("quota_limited=1", out)
+
+    def test_stale_quota_notice_flagged_only_once(self):
+        # Codex r9 P2: a PERSISTENT quota notice must emit CODEX_QUOTA_LIMITED only once — else a
+        # scheduler backing off on the marker never returns to normal polling after the limit resets
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        quota = {1: [codex_quota("2026-01-04T00:00:00Z", "p1#q1")]}
+        _, out1, _ = self.run_watch(prs, comments_by_pr=quota)
+        self.assertIn("CODEX_QUOTA_LIMITED", out1)        # first time: flagged
+        _, out2, _ = self.run_watch(prs, comments_by_pr=quota)
+        self.assertNotIn("CODEX_QUOTA_LIMITED", out2)     # same stale notice -> not re-flagged
+        self.assertNoNew(out2)
 
     def test_real_review_with_newer_quota_is_still_actionable(self):
         # a genuine review followed by a NEWER quota notice must not be hidden -> still actionable,

@@ -7,3 +7,6 @@ __pycache__/
 # Local virtualenvs
 .venv/
 venv/
+
+# devflow local tool-state (checkpoints, exported Implementation Packets) — never tracked
+.devflow/

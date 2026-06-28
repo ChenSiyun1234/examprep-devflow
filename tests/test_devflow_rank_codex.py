@@ -19,7 +19,8 @@ from devflow.tools import github_cli as G
 from devflow.tools.review_priority import score, classify_type
 
 CODEX = "chatgpt-codex-connector[bot]"
-QUOTA_BODY = "You have reached your Codex usage limits for code reviews. See the Codex dashboard."
+QUOTA_BODY = ("You have reached your Codex usage limits for code reviews. "
+              "You can see your limits in the Codex dashboard.")
 _WRITE_TOKENS = {"create", "comment", "merge", "edit", "close", "delete", "review", "push", "clone"}
 
 
@@ -84,7 +85,8 @@ def rev(commit, body="### Codex Review\n- fix the null case", login=CODEX, state
 
 def quota_comment(created_at="2026-02-01T00:00:00Z", login=CODEX):
     return {"user": {"login": login},
-            "body": "You have reached your Codex usage limits for code reviews.",
+            "body": ("You have reached your Codex usage limits for code reviews. "
+                     "You can see your limits in the Codex dashboard."),
             "created_at": created_at, "html_url": "q"}
 
 
