@@ -102,11 +102,10 @@ def wait_for_codex_review(state: DevflowState) -> dict:
         try:
             def _poll_real_review():
                 rev = ReadOnlyGitHub(repo).find_latest_codex_review(pr)
-                # a quota-only result (has_review False) OR a review eclipsed by a newer usage-limits
-                # notice (quota_limited) is NOT the awaited review — keep polling until the limit clears
-                # and a genuine review lands, rather than accepting a stale/rate-limited signal.
-                return rev if (rev and rev.get("has_review", True)
-                               and not rev.get("quota_limited")) else None
+                # key off has_review ONLY: a genuine review that ALREADY arrived counts even if a later
+                # usage-limits notice eclipsed it (quota_limited=True) — otherwise we'd time out on a
+                # review we actually have. A quota-only result (has_review False) keeps polling.
+                return rev if (rev and rev.get("has_review", True)) else None
             poll = bounded_poll(
                 _poll_real_review,
                 max_attempts=int(state.get("max_polls", 6)),

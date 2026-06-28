@@ -332,7 +332,7 @@ def cmd_read_pr(args) -> int:
     print(f"[read-pr] #{args.pr} — {len(comments)} comment(s), {len(reviews)} review(s)")
     for r in reviews:
         print(f"  review: {r['author']} [{r['state']}] @ {r['created_at']}")
-    if review:
+    if review and review.get("has_review", True):
         print(f"\nLatest Codex review: by {review['author']} ({review['source']}) "
               f"blocking={review['blocking']} state={review.get('state')}")
         if review["items"]:
@@ -340,6 +340,9 @@ def cmd_read_pr(args) -> int:
             for it in review["items"][:20]:
                 print(f"   - {it}")
         print(review["body"][:800])
+    elif review:   # a quota-only signal (has_review False) is NOT a review — label it as such
+        print(f"\nLatest Codex signal: usage-limit notice (no review yet) by {review['author']} "
+              f"@ {review.get('created_at')}")
     else:
         print("\nLatest Codex review: (none found)")
     return 0

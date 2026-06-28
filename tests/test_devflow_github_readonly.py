@@ -274,6 +274,29 @@ class TestParsingHardening(unittest.TestCase):
             rev = gh.find_latest_codex_review(2)
         self.assertTrue(rev["blocking"])  # preserved despite newer non-blocking comment
 
+    def test_quota_notice_keys_off_opener_not_generic_phrase(self):
+        # finding 1 (P2): the canonical notice opener IS a quota notice...
+        from devflow.tools.github_cli import is_codex_quota_notice
+        self.assertTrue(is_codex_quota_notice(
+            "You have reached your Codex usage limits for code reviews. See your limits in settings."))
+        # ...but a real review that merely MENTIONS the generic phrase must NOT be dropped as quota
+        self.assertFalse(is_codex_quota_notice(
+            "This predicate keys off 'usage limits for code reviews' too loosely; tighten it."))
+
+    def test_co_timestamped_blocking_survives_same_second_approval(self):
+        # finding 2 (P2): a same-second APPROVED review must not bury a co-timestamped blocking comment
+        gh = ReadOnlyGitHub("o/r")
+        reviews = [{"author": "codex", "body": "lgtm", "state": "APPROVED",
+                    "created_at": "2026-01-05T00:00:00Z", "url": "r1"}]      # higher-ranked, same second
+        same_second_comment = [{"author": "codex", "body": "Blocking problem:\n- must fix the race",
+                                "created_at": "2026-01-05T00:00:00Z", "url": "c1"}]
+        with mock.patch.object(gh, "get_pr_comments", return_value=same_second_comment), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_reviews", return_value=reviews):
+            rev = gh.find_latest_codex_review(2)
+        self.assertTrue(rev["blocking"])  # blocking surfaces despite the same-second approval
+        self.assertTrue(any("must fix the race" in str(it) for it in rev["items"]))
+
 
 if __name__ == "__main__":
     unittest.main()

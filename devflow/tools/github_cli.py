@@ -206,11 +206,10 @@ def is_codex_quota_notice(body: Optional[str]) -> bool:
     t = (body or "").strip().lower()
     if not t:
         return False
-    # Match the ACTUAL bot notice ("You have reached your Codex usage limits for code reviews. …")
-    # — specific phrasing AND a short whole-body — so a substantive review that merely MENTIONS usage
-    # limits (e.g. a review OF this watcher) isn't misclassified and dropped as a rate-limit notice.
-    return (("reached your codex usage limits" in t or "usage limits for code reviews" in t)
-            and len(t) < 600)
+    # Key off the ACTUAL notice OPENER ("You have reached your Codex usage limits …") plus a short
+    # whole-body — NOT the generic phrase "usage limits for code reviews", which a substantive review
+    # OF this quota code legitimately contains and must not be dropped as a rate-limit notice.
+    return ("reached your codex usage limits" in t and len(t) < 600)
 
 
 # Tie-break for "latest" when GitHub's 1-second timestamps collide (Codex posts a review plus
@@ -411,25 +410,37 @@ class ReadOnlyGitHub:
         # stays the higher-ranked review; merge that newer signal's items so the alert isn't empty of
         # the actually-new content.
         _lt = latest.get("created_at") or ""
+        cotimestamped_blocking = False
         for c in real:
             if c is not latest and (c.get("created_at") or "") == _lt:
-                for it in (parse_review_packet(c.get("body"), c.get("state")).get("items") or []):
+                cp = parse_review_packet(c.get("body"), c.get("state"))
+                for it in (cp.get("items") or []):
                     if it not in packet["items"]:
                         packet["items"].append(it)
+                if cp.get("blocking"):
+                    cotimestamped_blocking = True
+        # a co-timestamped lower-ranked signal that is itself blocking must SURFACE its verdict, not
+        # just its items — otherwise we'd re-alert the fix while reporting blocking=False.
+        if cotimestamped_blocking:
+            packet["blocking"] = True
         # Reconcile with terminal review states:
         #  - a CHANGES_REQUESTED review stays in effect until a *newer* APPROVED clears it;
         #  - an APPROVED clears blocking only if it's the most recent signal — a newer plain comment
-        #    with blocking language still counts (don't let an old approval hide it).
+        #    with blocking language still counts (don't let an old approval hide it);
+        #  - a SAME-SECOND APPROVED must not bury a co-timestamped blocking comment.
         stateful = [c for c in real if (c.get("state") or "").upper() in
                     ("CHANGES_REQUESTED", "APPROVED")]
         if stateful:
             newest_sf = max(stateful, key=lambda c: c.get("created_at") or "")
             nstate = (newest_sf.get("state") or "").upper()
+            _sf_ts, _lt_ts = (newest_sf.get("created_at") or ""), (latest.get("created_at") or "")
             if nstate == "CHANGES_REQUESTED":
                 packet["blocking"] = True
-            elif (newest_sf.get("created_at") or "") >= (latest.get("created_at") or ""):
-                packet["blocking"] = False   # APPROVED is the most recent signal
-            # else: APPROVED predates a newer comment -> keep that comment's parsed verdict
+            elif _sf_ts > _lt_ts:
+                packet["blocking"] = False   # a STRICTLY newer APPROVED clears blocking
+            elif _sf_ts == _lt_ts and not cotimestamped_blocking:
+                packet["blocking"] = False   # same-second APPROVED clears only if nothing blocks at that second
+            # else: APPROVED predates a newer comment (or a co-timestamped blocker stands) -> keep verdict
         return {
             "source": latest["source"],
             "pr_number": int(pr_number),

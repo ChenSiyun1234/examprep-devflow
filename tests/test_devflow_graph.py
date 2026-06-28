@@ -216,8 +216,10 @@ class TestWaitForCodexReviewQuota(unittest.TestCase):
             out = pr_review.wait_for_codex_review(state)
         self.assertEqual(out["codex_review_status"], "timeout")   # quota notice is not the awaited review
 
-    def test_keeps_polling_when_review_eclipsed_by_newer_quota(self):
-        # a real review but a NEWER usage-limits notice (quota_limited) -> not the awaited review (Codex r2)
+    def test_accepts_real_review_eclipsed_by_newer_quota(self):
+        # a real review that ALREADY arrived counts even if a NEWER usage-limits notice eclipses it
+        # (quota_limited=True). Keying off has_review only, we must NOT time out on a review we have
+        # (Codex r3, P2 — corrects the earlier "keep polling" behaviour).
         from devflow.nodes import pr_review
         rev = {"has_review": True, "quota_limited": True, "blocking": False, "items": []}
         state = {"real_github": True, "repo": "o/r", "pr_number": 5,
@@ -225,7 +227,7 @@ class TestWaitForCodexReviewQuota(unittest.TestCase):
         with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:
             RG.return_value.find_latest_codex_review.return_value = rev
             out = pr_review.wait_for_codex_review(state)
-        self.assertEqual(out["codex_review_status"], "timeout")
+        self.assertEqual(out["codex_review_status"], "ready")
 
     def test_real_review_still_satisfies_poll(self):
         from devflow.nodes import pr_review
