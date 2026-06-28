@@ -208,6 +208,18 @@ class TestClassify(unittest.TestCase):
                                     state="CHANGES_REQUESTED")])
         self.assertFalse(classify(meta(head="aaaaaaa"), s)["clean"])
 
+    def test_latest_head_comment_decides_clean(self):
+        # Codex r4 P2: a LATER non-clean head comment must override an earlier clean one (same head)
+        s = signals(comments=[
+            comment("Didn't find any issues. Reviewed commit: aaaaaaa", "2026-01-01T00:00:00Z"),
+            comment("Please fix the P2. Reviewed commit: aaaaaaa", "2026-01-02T00:00:00Z")])
+        self.assertFalse(classify(meta(head="aaaaaaa"), s)["clean"])
+        # ...but when the CLEAN verdict is the newest head comment, it IS clean
+        s2 = signals(comments=[
+            comment("Please fix. Reviewed commit: aaaaaaa", "2026-01-01T00:00:00Z"),
+            comment("Didn't find any issues. Reviewed commit: aaaaaaa", "2026-01-02T00:00:00Z")])
+        self.assertTrue(classify(meta(head="aaaaaaa"), s2)["clean"])
+
     def test_non_review_codex_command_not_awaiting(self):
         # Codex r1 F7 (P2): a different @codex command must NOT count as an outstanding review request
         base = review("old", "aaaaaaa", 1, "2026-01-01T00:00:00Z")
@@ -699,6 +711,22 @@ class TestOrchestrateCommand(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(_plan_from(out)["needs_retarget"], [7])
         self.assertEqual(_plan_from(out)["request_review"], [])   # not requested against the stale base
+
+    def test_command_live_open_parent_not_retargeted(self):
+        # Codex r4 P3: a child whose base is a LIVE open parent's head must NOT be retargeted, even if
+        # that branch name also belongs to an OLDER merged PR
+        calls = []
+        prs = [{"number": 10, "title": "parent", "state": "OPEN", "headRefName": "feat/parent", "baseRefName": "main"},
+               {"number": 11, "title": "child", "state": "OPEN", "headRefName": "feat/child", "baseRefName": "feat/parent"}]
+        merged = [{"number": 4, "title": "old", "state": "MERGED", "headRefName": "feat/parent", "baseRefName": "main"}]
+        fake = _cli_fake_gh(calls, prs=prs, merged_prs=merged,
+                            views={10: _raw_view(10, head="pp", base="main"),
+                                   11: _raw_view(11, head="cc", base="feat/parent")})
+        state_file = os.path.join(tempfile.mkdtemp(), "orch.json")
+        rc, out = _run_orchestrate(
+            ["orchestrate-reviews", "--repo", "o/r", "--state-file", state_file, "--json"], fake)
+        self.assertEqual(rc, 0)
+        self.assertEqual(_plan_from(out)["needs_retarget"], [])   # feat/parent is a live open parent
 
     def test_command_labels_use_repo_default_branch(self):
         # Codex r4 P2: action labels must name the repo's ACTUAL default branch, not hardcoded 'main'

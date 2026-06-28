@@ -551,9 +551,13 @@ def cmd_orchestrate_reviews(args) -> int:
             classified.append(orch.classify(meta, signals, converged=state["converged"],
                                              requested_head=state["requested_head"], now=now))
         # detect merged parents by TARGETED lookup of exactly the stack's non-default base branches, so an
-        # OLDER merged parent isn't missed by a --limit-sized window over all merged PRs.
+        # OLDER merged parent isn't missed by a --limit-sized window over all merged PRs. EXCLUDE a base
+        # that is still the head of an OPEN PR (a live parent) — its branch name may also belong to an
+        # older MERGED PR, and that historical match must NOT trigger a spurious retarget of the child.
+        open_heads = {p.get("head_ref") for p in open_prs if p.get("head_ref")}
         candidate_bases = {p.get("base_ref") for p in open_prs
-                           if p.get("base_ref") and p.get("base_ref") != default_branch}
+                           if p.get("base_ref") and p.get("base_ref") != default_branch
+                           and p.get("base_ref") not in open_heads}
         merged_branches = gh.merged_heads(candidate_bases)
     except GhError as e:
         print(f"[devflow] gh error: {e}")

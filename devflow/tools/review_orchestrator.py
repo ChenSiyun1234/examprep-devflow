@@ -134,16 +134,19 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
     # CLEAN vs FINDINGS (OPEN PRs only). A merged PR is never 'clean'/auto-merge-able.
     findings_on_head, clean, max_severity, requested_changes = 0, False, None, False
     if not merged:
-        # (a) a clean verdict as a CONVERSATION COMMENT whose 'Reviewed commit' == head — but ONLY if it
-        # is at least as new as the latest review on head, so a STALE clean comment can't override a
-        # later review that added findings.
+        # (a) the LATEST Codex CONVERSATION comment that references THIS head ('Reviewed commit: <sha>')
+        # is clean ONLY if that newest head comment is itself a clean verdict — a later non-clean head
+        # comment ("Please fix … Reviewed commit: <sha>") must override an earlier clean one — AND it is
+        # at least as new as the latest review object, so a stale clean comment can't override findings.
         clean_comment = False
-        for c in codex_comments:
-            if is_clean_verdict(c.get("body")):
-                mm = _REVIEWED_COMMIT_RE.search(c.get("body") or "")
-                if (mm and head[:7] == mm.group(1)[:7]
-                        and (c.get("created_at") or "") >= latest_real_at):
-                    clean_comment = True
+        head_comments = [c for c in codex_comments
+                         if (lambda mm: mm and head[:7] == mm.group(1)[:7])(
+                             _REVIEWED_COMMIT_RE.search(c.get("body") or ""))]
+        if head_comments:
+            newest_hc = max(head_comments, key=lambda c: c.get("created_at") or "")
+            if (is_clean_verdict(newest_hc.get("body"))
+                    and (newest_hc.get("created_at") or "") >= latest_real_at):
+                clean_comment = True
         # (b) ...or a review OBJECT on head with no own inline findings (matched by review_id so
         # re-anchored older comments don't count), no severity marker in the body, AND not a
         # CHANGES_REQUESTED state (which is authoritative — never 'clean' even with a neutral body).
