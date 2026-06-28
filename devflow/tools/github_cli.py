@@ -25,6 +25,11 @@ from typing import Optional
 # suppress a PR forever once Codex's limit has reset — codex_review_rounds has no seen-state/expiry).
 _QUOTA_ACTIVE_TTL_SECS = 3 * 3600
 
+# Codex sometimes delivers a review as a CONVERSATION comment carrying a 'Reviewed commit: <sha>' marker
+# (not a review object). Same pattern review_orchestrator.py uses, so coverage counting agrees with it:
+# a marked comment is a real review round (of that sha); a generic Codex comment is NOT.
+_REVIEWED_COMMIT_RE = re.compile(r"reviewed commit:?\**\s*`?([0-9a-f]{7,40})", re.I)
+
 
 # ======================================================================================
 # Write layer (recorded no-ops in this scaffold) — unchanged from the initial scaffold
@@ -544,10 +549,12 @@ class ReadOnlyGitHub:
                      or (r.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"))]
         # a PR can also be "reviewed" via a Codex CONVERSATION comment (find_latest_codex_review treats
         # those as reviews) — count substantive non-quota ones so it isn't mis-scored rounds=0.
+        # those as reviews) — but ONLY when the comment carries a 'Reviewed commit: <sha>' marker (a real
+        # comment-based review), NOT a generic status/ack comment, which the orchestrator treats as silence.
         crevs = [c for c in comments if is_codex_author(c.get("author"))
-                 and not is_codex_quota_notice(c.get("body")) and (c.get("body") or "").strip()]
-        # file-level INLINE review comments are review coverage too; count via a +1 floor only when no
-        # review/comment already represents the round, so inline-ONLY feedback isn't mis-scored as 0.
+                 and not is_codex_quota_notice(c.get("body"))
+                 and _REVIEWED_COMMIT_RE.search(c.get("body") or "")]
+        # file-level INLINE review comments are review coverage too.
         codex_inline = [c for c in inline if is_codex_author(c.get("author"))
                         and not is_codex_quota_notice(c.get("body"))]
         # count comment-only coverage by RUN (distinct timestamp), EXCLUDING timestamps already covered
@@ -556,10 +563,17 @@ class ReadOnlyGitHub:
         crev_runs = len({c.get("created_at") for c in crevs} - rev_times)
         rounds = len(revs) + crev_runs
         if rounds == 0 and codex_inline:
-            rounds = 1
-        # current head is reviewed if a review OBJECT or an INLINE-only comment carries head's commit_id.
+            # inline-ONLY feedback: count distinct reviewed heads (each is a separate run) so a PR reviewed
+            # inline-only several times decays like any other — not pinned at 1 forever. Floor 1.
+            rounds = len({c.get("commit_id") for c in codex_inline if c.get("commit_id")}) or 1
+        # current head is reviewed if a review OBJECT, an INLINE comment, OR a marked CONVERSATION comment
+        # ('Reviewed commit: <head>') carries this head — a comment-only review of the head still counts.
+        def _crev_sha(c):
+            m = _REVIEWED_COMMIT_RE.search(c.get("body") or "")
+            return m.group(1) if m else ""
         on_head = bool(head) and (any((r.get("commit_id") or "") == head for r in revs)
-                                  or any((c.get("commit_id") or "") == head for c in codex_inline))
+                                  or any((c.get("commit_id") or "") == head for c in codex_inline)
+                                  or any(_crev_sha(c)[:7] == head[:7] for c in crevs))
         # quota state from the latest Codex signal — review OR conversation comment OR INLINE comment (a
         # later inline review must be able to clear an earlier quota notice). ANY max-ts quota wins the
         # tie (like the watcher), but only while RECENT so a stale quota doesn't suppress forever.

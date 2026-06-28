@@ -259,12 +259,13 @@ class TestRankCodexBehavior(RankCodexBase):
         self.assertIn(9, self.order_of(out))     # merged PR interleaved in, not starved
 
     def test_comment_only_review_counts_as_a_round(self):
-        # a PR "reviewed" only via a Codex conversation comment must score rounds>=1, not 0 (Codex r3)
+        # a PR "reviewed" only via a Codex conversation comment that carries a 'Reviewed commit:' marker
+        # must score rounds>=1, not 0 (Codex r3); a generic comment without the marker does NOT (r8 F6).
         gh = G.ReadOnlyGitHub("o/r")
         with mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
              mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
              mock.patch.object(gh, "get_pr_comments", return_value=[
-                 {"author": CODEX, "body": "Codex review: looks fine, one nit.",
+                 {"author": CODEX, "body": "Codex review: looks fine, one nit.\nReviewed commit: abc1234",
                   "created_at": "2026-01-03T00:00:00Z"}]):
             cov = gh.codex_review_rounds(1)
         self.assertEqual(cov["rounds"], 1)
@@ -321,10 +322,58 @@ class TestRankCodexBehavior(RankCodexBase):
         with mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
              mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
              mock.patch.object(gh, "get_pr_comments", return_value=[
-                 {"author": CODEX, "body": "comment A", "created_at": "2026-02-01T00:00:00Z"},
-                 {"author": CODEX, "body": "comment B", "created_at": "2026-02-01T00:00:00Z"}]):
+                 {"author": CODEX, "body": "comment A\nReviewed commit: abc1234", "created_at": "2026-02-01T00:00:00Z"},
+                 {"author": CODEX, "body": "comment B\nReviewed commit: abc1234", "created_at": "2026-02-01T00:00:00Z"}]):
             cov = gh.codex_review_rounds(1)
         self.assertEqual(cov["rounds"], 1)        # one run, not two
+
+    def test_generic_comment_not_a_review_round(self):
+        # Codex r8 F6: a generic Codex conversation comment (no 'Reviewed commit:' marker) is NOT a
+        # review round — only marked comment-based reviews count, matching the orchestrator (else a
+        # status/ack comment would falsely deprioritize a PR as already reviewed).
+        gh = G.ReadOnlyGitHub("o/r")
+        with mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[
+                 {"author": CODEX, "body": "@codex address that feedback please",
+                  "created_at": "2026-02-01T00:00:00Z"}]):
+            cov = gh.codex_review_rounds(1)
+        self.assertEqual(cov["rounds"], 0)
+
+    def test_comment_review_of_head_marks_reviewed_on_head(self):
+        # Codex r8 F4: a comment-based review naming THIS head ('Reviewed commit: <sha>') sets
+        # reviewed_on_head, so the ranker doesn't re-recommend a head Codex already reviewed by comment.
+        gh = G.ReadOnlyGitHub("o/r")
+        with mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[
+                 {"author": CODEX, "body": "Codex Review: looks good.\nReviewed commit: cc204a77f9",
+                  "created_at": "2026-02-01T00:00:00Z"}]):
+            cov = gh.codex_review_rounds(1, head="cc204a77f9cc50f01e0879dbe621b1f18011e256")
+        self.assertTrue(cov["reviewed_on_head"])      # full head matched by its abbreviated marker prefix
+        self.assertEqual(cov["rounds"], 1)
+
+    def test_inline_only_multiple_heads_count_separate_rounds(self):
+        # Codex r8 F5: inline-only feedback across DISTINCT reviewed heads counts as separate rounds
+        # (not pinned at 1 forever), so a heavily inline-reviewed PR decays like any other.
+        gh = G.ReadOnlyGitHub("o/r")
+        with mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[
+                 {"author": CODEX, "body": "nit 1", "created_at": "2026-02-01T00:00:00Z", "commit_id": "head1"},
+                 {"author": CODEX, "body": "nit 2", "created_at": "2026-02-02T00:00:00Z", "commit_id": "head2"},
+                 {"author": CODEX, "body": "nit 2b", "created_at": "2026-02-02T00:00:01Z", "commit_id": "head2"}]):
+            cov = gh.codex_review_rounds(1)
+        self.assertEqual(cov["rounds"], 2)            # two distinct heads -> two rounds, not 1 or 3
+
+    def test_feature_with_issue_ref_classifies_as_feature(self):
+        # Codex r8 F7: 'feat: …, fixes #123' is a FEATURE, not a bugfix — an issue-closing reference is
+        # not a bugfix signal when an explicit feature marker is present.
+        self.assertEqual(classify_type("feat: add import flow, fixes #123", "feat/import", 150), "feature")
+        # a genuine small bugfix (no feature marker) is still a bugfix
+        self.assertEqual(classify_type("fix: null deref on empty input", "fix/npe", 30), "bugfix")
+        # a feature that also closes an issue via 'closes #N'
+        self.assertEqual(classify_type("feat: add export, closes #9", "feat/export", 200), "feature")
 
     def test_partial_lookup_failure_marks_incomplete(self):
         # Codex r6 P2: if ANY coverage lookup fails, the ranking is INCOMPLETE even if others ranked

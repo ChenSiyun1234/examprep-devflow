@@ -25,8 +25,13 @@ _BIG_CHANGE = 400   # additions at/above this make a "fix" count as a feature (d
 def classify_type(title: str, branch: str, additions: int, deletions: int = 0) -> str:
     """'feature' | 'bugfix' | 'mixed' from the title + branch name (and size as a tie-breaker)."""
     text = f"{title or ''} {branch or ''}"
-    bug = bool(_BUGFIX_RE.search(text))
     feat = bool(_FEATURE_RE.search(text))
+    # an issue-closing reference ("fixes #123", "closes #45") is NOT a bugfix signal on its own — a
+    # feature PR commonly closes an issue ("feat: add import flow, fixes #123"). When an explicit feature
+    # marker is present, strip such refs before the bugfix check so the PR isn't deprioritized as a bugfix.
+    text_for_bug = text if not feat else re.sub(
+        r"\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\b\s*#?\d+", " ", text, flags=re.I)
+    bug = bool(_BUGFIX_RE.search(text_for_bug))
     # size = additions + deletions so a big REMOVAL-heavy fix (e.g. "fix: drop legacy engine" +0/-2000)
     # isn't deprioritized as a small bugfix.
     if bug and (int(additions or 0) + int(deletions or 0)) < _BIG_CHANGE:
