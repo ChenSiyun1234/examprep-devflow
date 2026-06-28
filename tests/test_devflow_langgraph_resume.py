@@ -8,6 +8,7 @@ The stdlib fallback resume test needs neither. No test performs real GitHub writ
     python -m unittest tests.test_devflow_langgraph_resume
 """
 
+import os
 import uuid
 import unittest
 from types import SimpleNamespace
@@ -122,6 +123,33 @@ class TestLangGraphCliDurableFlow(unittest.TestCase):
         from devflow import cli
         self.assertEqual(cli.cmd_resume(self._resume_args("never-ran-" + uuid.uuid4().hex[:8],
                                                           "approved")), 1)
+
+    def test_resume_refuses_gate_mismatch(self):
+        # resuming with a --gate that isn't where the thread is actually paused must be refused
+        from devflow import cli
+        from devflow.tools import github_cli
+        tid = "cli-mismatch-" + uuid.uuid4().hex[:8]
+        with mock.patch.object(github_cli.subprocess, "run",
+                               side_effect=AssertionError("no real gh writes in dry-run")):
+            self.assertEqual(cli.cmd_run(self._run_args(tid)), 0)        # paused at the advisory gate
+            wrong = SimpleNamespace(thread_id=tid, gate="fix", decision="approved",
+                                    real_github=False, langgraph=True)
+            self.assertEqual(cli.cmd_resume(wrong), 1)                   # wrong gate -> refused
+            self.assertEqual(cli.cmd_resume(self._resume_args(tid, "approved")), 0)  # correct gate completes
+
+    def test_completion_clears_stale_fallback_checkpoint(self):
+        # a leftover stdlib JSON checkpoint for the thread must be cleared when the langgraph run completes
+        from devflow import cli
+        from devflow.tools import github_cli
+        tid = "cli-clear-" + uuid.uuid4().hex[:8]
+        os.makedirs(cli.CKPT_DIR, exist_ok=True)
+        with open(cli._ckpt_path(tid), "w", encoding="utf-8") as f:
+            f.write("{}")                                               # plant a stale fallback checkpoint
+        with mock.patch.object(github_cli.subprocess, "run",
+                               side_effect=AssertionError("no real gh writes in dry-run")):
+            self.assertEqual(cli.cmd_run(self._run_args(tid)), 0)
+            self.assertEqual(cli.cmd_resume(self._resume_args(tid, "approved")), 0)  # completes
+        self.assertFalse(os.path.exists(cli._ckpt_path(tid)))          # cleared on completion
 
 
 if __name__ == "__main__":
