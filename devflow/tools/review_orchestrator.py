@@ -37,6 +37,13 @@ FORCE_MERGE_ROUNDS = 3      # after this many Codex rounds, a PR with ONLY minor
 STATE_DIR = os.path.join(tempfile.gettempdir(), "devflow_runs")
 STATE_PATH = os.path.join(STATE_DIR, "orchestrate_state.json")
 
+
+def state_path_for_repo(repo: str) -> str:
+    """Default tracking-state path NAMESPACED by repo, so a convergence/in-flight pin for one repo can't
+    leak to a same-numbered PR in another (forks / copied repos with overlapping PR numbers)."""
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in (repo or "default"))
+    return os.path.join(STATE_DIR, f"orchestrate_{safe}.json")
+
 # ---- pure heuristics / parsing ----
 # A severity marker in a REVIEW BODY denies "clean" (P1/P2/P3 or imperative blocking language).
 _SEVERITY_RE = re.compile(r"\bP[123]\b|must[-\s]?fix|blocking|should fix|needs? fix|changes? requested", re.I)
@@ -49,6 +56,9 @@ _CLEAN_VERDICT_RE = re.compile(
     r"|no (major )?(issues|problems|concerns)( found| identified)?\b"
     r"|looks good to me|\blgtm\b", re.I)
 _REVIEWED_COMMIT_RE = re.compile(r"reviewed commit:?\**\s*`?([0-9a-f]{7,40})", re.I)
+# Our outstanding ask is specifically a REVIEW request ("@codex review", "@codex please review") — a
+# different command ("@codex address that feedback") must NOT be read as an in-flight review.
+_REVIEW_REQUEST_RE = re.compile(r"@codex\b.{0,30}\breview\b", re.I | re.S)
 
 
 def parse_ts(s) -> int:
@@ -115,14 +125,20 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
     # CLEAN vs FINDINGS (OPEN PRs only). A merged PR is never 'clean'/auto-merge-able.
     findings_on_head, clean, max_severity = 0, False, None
     if not merged:
-        # (a) a clean verdict delivered as a CONVERSATION COMMENT whose 'Reviewed commit' == the head.
+        # (a) a clean verdict as a CONVERSATION COMMENT whose 'Reviewed commit' == head — but ONLY if it
+        # is at least as new as the latest review on head, so a STALE clean comment can't override a
+        # later review that added findings.
+        clean_comment = False
         for c in codex_comments:
             if is_clean_verdict(c.get("body")):
                 mm = _REVIEWED_COMMIT_RE.search(c.get("body") or "")
-                if mm and head[:7] == mm.group(1)[:7]:
-                    clean = True
-        # (b) ...or a review OBJECT on head: count ITS OWN inline findings (matched by review_id, so
-        # re-anchored comments from older reviews don't count) and read their worst severity badge.
+                if (mm and head[:7] == mm.group(1)[:7]
+                        and (c.get("created_at") or "") >= latest_real_at):
+                    clean_comment = True
+        # (b) ...or a review OBJECT on head with no own inline findings (matched by review_id so
+        # re-anchored older comments don't count), no severity marker in the body, AND not a
+        # CHANGES_REQUESTED state (which is authoritative — never 'clean' even with a neutral body).
+        clean_review = False
         if latest_real:
             rid = latest_real.get("id")
             own = [c for c in inline if is_codex_author(c.get("author"))
@@ -130,13 +146,15 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
             findings_on_head = len(own)
             sev = [finding_severity(c.get("body")) for c in own]
             max_severity = min(sev) if sev else None       # 1=P1 (worst) … 3=P3; None = no findings
-            if findings_on_head == 0 and not _SEVERITY_RE.search((latest_real.get("body") or "")):
-                clean = True
+            requested_changes = (latest_real.get("state") or "").upper() == "CHANGES_REQUESTED"
+            clean_review = (findings_on_head == 0 and not requested_changes
+                            and not _SEVERITY_RE.search((latest_real.get("body") or "")))
+        clean = clean_comment or clean_review
 
-    # our own outstanding "@codex review" requests (any non-Codex author) -> awaiting iff newer than
-    # the latest substantive review on head.
+    # our own outstanding "@codex review" REQUESTS (a non-Codex review/re-review ask, not just any
+    # @codex command) -> awaiting iff newer than the latest substantive review on head.
     my_reqs = [c for c in comments if not is_codex_author(c.get("author"))
-               and "@codex" in (c.get("body") or "").lower()]
+               and _REVIEW_REQUEST_RE.search(c.get("body") or "")]
     latest_req_at = max((c.get("created_at") or "" for c in my_reqs), default="")
     awaiting = bool(latest_req_at) and latest_req_at > latest_real_at
     req_age = (now - parse_ts(latest_req_at)) if awaiting else 0
@@ -163,6 +181,7 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
     return {
         "num": n, "branch": meta.get("head_ref"), "head": head, "merged": merged,
         "state": meta.get("state"), "mergeable": meta.get("mergeable"), "base_ref": meta.get("base_ref"),
+        "is_draft": bool(meta.get("is_draft")),
         "rounds": rounds, "reviewed_on_head": on_head, "review_key": review_key,
         "has_head_review": bool(latest_real), "awaiting": awaiting, "req_age": req_age, "pending": pending,
         "latest_quota": latest_quota, "latest_sig_ts": latest_sig_ts, "responded_after_req": responded,
@@ -213,49 +232,61 @@ def build_plan(classified: list, *, converged: dict, requested_head: dict, done,
     plan = {
         "ranking": [{"pr": c["num"], "priority": c["priority"], "rounds": c["rounds"],
                      "clean": c["clean"], "state": c["state"]} for c in cls],
-        "request_review": [], "mergeable_now": [], "force_mergeable": [], "needs_conflict": [],
-        "needs_retarget": [], "findings_to_fix": [], "in_flight": [], "rate_limited": False,
+        "request_review": [], "mergeable_now": [], "force_mergeable": [], "ready_then_merge": [],
+        "needs_conflict": [], "needs_retarget": [], "findings_to_fix": [], "in_flight": [],
+        "rate_limited": False,
     }
 
-    # 1) merge-ready PRs (recommendations only): retarget a stacked child whose base PR merged; flag a
-    #    CONFLICTING merge-ready PR for the human to resolve (merge main in, never force-push); else
-    #    it's mergeable now.
+    # 1) RETARGET (INDEPENDENT of review state): ANY open PR whose base branch's parent PR has merged
+    #    must be repointed to main FIRST — otherwise we'd request review / fixes against a stale base.
     for c in cls:
-        if c["num"] in done or c["state"] != "OPEN" or not ok_to_merge(c, converged):
-            continue
-        base, mergeable = c["base_ref"], c["mergeable"]
-        if base and base != "main" and base in merged_branches:
+        if (c["num"] not in done and c["state"] == "OPEN" and c["base_ref"]
+                and c["base_ref"] != "main" and c["base_ref"] in merged_branches):
             plan["needs_retarget"].append(c["num"])
-        elif mergeable == "CONFLICTING" and base == "main":
-            plan["needs_conflict"].append(c["num"])
-        elif mergeable == "MERGEABLE" and base == "main":
-            plan["mergeable_now"].append(c["num"])
-            if force_mergeable(c):
-                plan["force_mergeable"].append(c["num"])
+    retarget = set(plan["needs_retarget"])
 
-    # 2) fresh findings to fix (P1/P2, or early P3) — the human/agent fix path; not merge-ready.
+    # 2) merge-ready PRs (clean / force-mergeable / converged) whose base is already main: a CONFLICTING
+    #    one is flagged for the human to resolve (merge main in, never force-push); a still-DRAFT one goes
+    #    to ready_then_merge (un-draft first); otherwise it's mergeable now.
     for c in cls:
-        if (c["num"] not in done and not ok_to_merge(c, converged)
+        if (c["num"] in done or c["state"] != "OPEN" or c["num"] in retarget
+                or c["base_ref"] != "main" or not ok_to_merge(c, converged)):
+            continue
+        if c["mergeable"] == "CONFLICTING":
+            plan["needs_conflict"].append(c["num"])
+        elif c["mergeable"] == "MERGEABLE":
+            if c.get("is_draft"):
+                plan["ready_then_merge"].append(c["num"])   # a draft must be marked ready before merging
+            else:
+                plan["mergeable_now"].append(c["num"])
+                if force_mergeable(c):
+                    plan["force_mergeable"].append(c["num"])
+
+    # 3) fresh findings to fix — but NOT a PR that must retarget first (re-review against main may change
+    #    its findings); not merge-ready.
+    for c in cls:
+        if (c["num"] not in done and c["num"] not in retarget and not ok_to_merge(c, converged)
                 and c["has_head_review"] and c["review_key"]):
             plan["findings_to_fix"].append(c["num"])
 
-    # 3) global rate-limit from the single globally-most-recent Codex signal (not per-PR).
+    # 4) global rate-limit from the single globally-most-recent Codex signal (not per-PR).
     active = [c for c in cls if c["num"] not in done]
     sigs = [c for c in active if c.get("latest_sig_ts")]
     gl = max(sigs, key=lambda c: c["latest_sig_ts"]) if sigs else None
     plan["rate_limited"] = bool(gl and gl["latest_quota"])
 
-    # 4) request review: the SINGLE gate for ALL @codex requests (initial AND re-review-after-fix),
+    # 5) request review: the SINGLE gate for ALL @codex requests (initial AND re-review-after-fix),
     #    priority-ordered and capped at INFLIGHT_CAP. A post-fix PR is no longer is_inflight (head
-    #    advanced past the tracked request), so it re-queues here.
+    #    advanced past the tracked request), so it re-queues here. Skip PRs that must retarget first.
     in_flight = [c["num"] for c in active if is_inflight(c, requested_head)]
     if not plan["rate_limited"]:
         for c in cls:
             if len(in_flight) >= INFLIGHT_CAP:
                 break
-            if (c["num"] in done or c["num"] in in_flight or is_inflight(c, requested_head)
+            if (c["num"] in done or c["num"] in in_flight or c["num"] in retarget
+                    or is_inflight(c, requested_head)
                     or c["needs"] <= 0 or c["reviewed_on_head"] or ok_to_merge(c, converged)):
-                continue   # a merge-ready PR (clean / converged) never needs another review request
+                continue   # merge-ready / must-retarget PRs never need another review request
             plan["request_review"].append(c["num"])
             in_flight.append(c["num"])
             requested_head[str(c["num"])] = c["head"]   # tool-local: this request is for the current head
@@ -264,8 +295,8 @@ def build_plan(classified: list, *, converged: dict, requested_head: dict, done,
 
 
 def has_actions(plan: dict) -> bool:
-    return any(plan.get(k) for k in ("request_review", "mergeable_now", "needs_conflict",
-                                     "needs_retarget", "findings_to_fix"))
+    return any(plan.get(k) for k in ("request_review", "mergeable_now", "ready_then_merge",
+                                     "needs_conflict", "needs_retarget", "findings_to_fix"))
 
 
 # ---- tool-local tracking state (NOT a GitHub artifact: head-aware in-flight + converged pins) ----
@@ -286,6 +317,8 @@ def load_state(path: str = STATE_PATH) -> dict:
 
 
 def save_state(state: dict, path: str = STATE_PATH) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # `os.path.dirname` of a BARE filename ("orch.json") is "" -> makedirs("") raises; fall back to "."
+    # so a bare --state-file still works.
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)

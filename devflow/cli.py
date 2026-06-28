@@ -515,14 +515,22 @@ def cmd_orchestrate_reviews(args) -> int:
     if rc:
         return rc
     gh = ReadOnlyGitHub(args.repo)
-    state_path = args.state_file or orch.STATE_PATH
-    state = orch.load_state(state_path)
     now = int(datetime.now(timezone.utc).timestamp())
     errors = []
     try:
         repo = gh.resolve_repo()
-        all_prs = gh.list_prs(state="all", limit=args.limit)
-        open_prs = [p for p in all_prs if p.get("state") == "OPEN"]
+    except GhError as e:
+        print(f"[devflow] gh error: {e}")
+        return 1
+    # default tracking state is namespaced by repo so a pin can't leak across forks/copies with
+    # overlapping PR numbers; an explicit --state-file always wins.
+    state_path = args.state_file or orch.state_path_for_repo(repo)
+    state = orch.load_state(state_path)
+    try:
+        # fetch the OPEN stack and MERGED history SEPARATELY so --limit bounds the open PRs we promise to
+        # inspect (a long closed/merged history can't crowd out open PRs from a single all-state result).
+        open_prs = gh.list_prs(state="open", limit=args.limit)
+        merged_prs = gh.list_prs(state="merged", limit=args.limit)
         # --mark-converged: pin the CURRENT head of the named PR(s) as agent-verified-clean (merge rule 3).
         for num in (args.mark_converged or []):
             meta = gh.get_pr_meta(num)
@@ -545,8 +553,7 @@ def cmd_orchestrate_reviews(args) -> int:
         print(f"[devflow] gh error: {e}")
         return 1
 
-    merged_branches = {p.get("head_ref") for p in all_prs
-                       if p.get("state") == "MERGED" and p.get("head_ref")}
+    merged_branches = {p.get("head_ref") for p in merged_prs if p.get("head_ref")}
     plan = orch.build_plan(classified, merged_branches=merged_branches, converged=state["converged"],
                            requested_head=state["requested_head"], done=state["done"], now=now)
     if not args.dry:                                  # persist head-aware in-flight tracking (tool state)
@@ -561,6 +568,7 @@ def cmd_orchestrate_reviews(args) -> int:
     _print_plan_section("REQUEST REVIEW (priority-ordered, <=3 in-flight)", plan["request_review"])
     _print_plan_section("MERGEABLE now (clean / converged)", plan["mergeable_now"])
     _print_plan_section("FORCE-MERGEABLE (>=3 rounds, only-minor P3)", plan["force_mergeable"])
+    _print_plan_section("READY then MERGE (un-draft first)", plan["ready_then_merge"])
     _print_plan_section("RESOLVE CONFLICT (merge main in; never force-push)", plan["needs_conflict"])
     _print_plan_section("RETARGET to main (base PR merged)", plan["needs_retarget"])
     _print_plan_section("FINDINGS to fix (P1/P2 or early P3)", plan["findings_to_fix"])

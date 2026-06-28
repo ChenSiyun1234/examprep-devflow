@@ -153,6 +153,31 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(c["rounds"], 0)
         self.assertFalse(c["has_head_review"])
 
+    def test_stale_clean_comment_does_not_override_newer_findings(self):
+        # Codex r1 F1 (P1): an OLDER clean comment must NOT keep a PR clean when a LATER review on the
+        # same head adds findings
+        s = signals(
+            comments=[comment("Didn't find any issues. Reviewed commit: aaaaaaa", "2026-01-01T00:00:00Z")],
+            reviews=[review("Codex Review", "aaaaaaa", 9, "2026-01-02T00:00:00Z")],   # newer review...
+            inline_=[inline("![P2 Badge] fix this", 9, "2026-01-02T00:00:00Z")])       # ...with a P2 finding
+        c = classify(meta(head="aaaaaaa"), s)
+        self.assertFalse(c["clean"])
+        self.assertEqual(c["max_severity"], 2)
+
+    def test_changes_requested_review_not_clean(self):
+        # Codex r1 F3 (P1): a CHANGES_REQUESTED state is authoritative even with a neutral body + no inline
+        s = signals(reviews=[review("Codex Review", "aaaaaaa", 5, "2026-01-01T00:00:00Z",
+                                    state="CHANGES_REQUESTED")])
+        self.assertFalse(classify(meta(head="aaaaaaa"), s)["clean"])
+
+    def test_non_review_codex_command_not_awaiting(self):
+        # Codex r1 F7 (P2): a different @codex command must NOT count as an outstanding review request
+        base = review("old", "aaaaaaa", 1, "2026-01-01T00:00:00Z")
+        cmd = comment("@codex address that feedback please", "2026-01-03T00:00:00Z", author=ME)
+        self.assertFalse(classify(meta(head="aaaaaaa"), signals(reviews=[base], comments=[cmd]))["awaiting"])
+        req = comment("@codex review", "2026-01-03T00:00:00Z", author=ME)   # an actual review request IS
+        self.assertTrue(classify(meta(head="aaaaaaa"), signals(reviews=[base], comments=[req]))["awaiting"])
+
 
 class TestMergePredicates(unittest.TestCase):
     def _c(self, **kw):
@@ -183,10 +208,11 @@ class TestMergePredicates(unittest.TestCase):
 class TestBuildPlan(unittest.TestCase):
     def _classified(self, **kw):
         base = {"num": 1, "branch": "b1", "head": "h1", "merged": False, "state": "OPEN",
-                "mergeable": "MERGEABLE", "base_ref": "main", "rounds": 0, "reviewed_on_head": False,
-                "review_key": "", "has_head_review": False, "awaiting": False, "req_age": 0,
-                "pending": 0, "latest_quota": False, "latest_sig_ts": "", "responded_after_req": False,
-                "findings_on_head": 0, "clean": False, "max_severity": None, "priority": 50, "needs": 10}
+                "mergeable": "MERGEABLE", "base_ref": "main", "is_draft": False, "rounds": 0,
+                "reviewed_on_head": False, "review_key": "", "has_head_review": False, "awaiting": False,
+                "req_age": 0, "pending": 0, "latest_quota": False, "latest_sig_ts": "",
+                "responded_after_req": False, "findings_on_head": 0, "clean": False,
+                "max_severity": None, "priority": 50, "needs": 10}
         base.update(kw)
         return base
 
@@ -224,6 +250,22 @@ class TestBuildPlan(unittest.TestCase):
                                merged_branches={"feat/parent"})
         self.assertEqual(plan["needs_retarget"], [1])
 
+    def test_retarget_independent_of_merge_readiness(self):
+        # Codex r1 F8 (P2): an UNREVIEWED child whose parent merged must be flagged to retarget FIRST and
+        # NOT be requested for review against the stale base
+        cs = [self._classified(num=1, head="h1", base_ref="feat/parent")]   # not clean, no head review
+        plan = orch.build_plan(cs, converged={}, requested_head={}, done=[], now=1,
+                               merged_branches={"feat/parent"})
+        self.assertEqual(plan["needs_retarget"], [1])
+        self.assertEqual(plan["request_review"], [])       # never request review against a stale base
+
+    def test_clean_draft_goes_to_ready_then_merge(self):
+        # Codex r1 F5 (P2): a clean DRAFT is not directly mergeable — it must be un-drafted first
+        cs = [self._classified(num=1, clean=True, is_draft=True)]
+        plan = orch.build_plan(cs, converged={}, requested_head={}, done=[], now=1, merged_branches=set())
+        self.assertEqual(plan["ready_then_merge"], [1])
+        self.assertEqual(plan["mergeable_now"], [])
+
     def test_findings_to_fix(self):
         cs = [self._classified(num=1, has_head_review=True, review_key="k", findings_on_head=1,
                                max_severity=2, rounds=1)]
@@ -256,6 +298,20 @@ class TestState(unittest.TestCase):
         orch.save_state(st, path)
         self.assertEqual(orch.load_state(path)["requested_head"]["5"], "abc")
         self.assertEqual(orch.load_state(path)["converged"]["6"], "def")
+
+    def test_save_state_bare_filename(self):
+        # Codex r1 F2 (P2): a bare --state-file (no dir component) must not crash on makedirs('')
+        d = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        os.chdir(d)
+        self.addCleanup(os.chdir, cwd)
+        orch.save_state(orch._default_state(), "bare_orch.json")
+        self.assertTrue(os.path.exists(os.path.join(d, "bare_orch.json")))
+
+    def test_state_path_namespaced_by_repo(self):
+        # Codex r1 F6 (P3): the default state path must differ per repo so pins don't leak across forks
+        self.assertNotEqual(orch.state_path_for_repo("ownerA/repo"),
+                            orch.state_path_for_repo("ownerB/repo"))
 
 
 # ---- gh-touching layer: fully mocked gh, ASSERT read-only ----
@@ -332,17 +388,18 @@ class TestReadOnlyOrchestrationReads(unittest.TestCase):
 
 
 def _raw_view(num=5, head="aaaaaaa", mergeable="MERGEABLE", base="main", state="OPEN",
-              title="feat: x", adds=10, files=2):
+              title="feat: x", adds=10, files=2, draft=False):
     """Raw `gh pr view --json` shape (field names as GitHub returns them)."""
     return {"number": num, "state": state, "mergeable": mergeable, "baseRefName": base,
             "headRefName": f"feat/{num}", "headRefOid": head, "title": title,
-            "additions": adds, "deletions": 0, "changedFiles": files, "isDraft": True}
+            "additions": adds, "deletions": 0, "changedFiles": files, "isDraft": draft}
 
 
-def _cli_fake_gh(recorder, *, prs, views, signals_map=None, error_prs=()):
+def _cli_fake_gh(recorder, *, prs, views, signals_map=None, error_prs=(), merged_prs=()):
     """Flexible read-only gh fake for the orchestrate CLI: per-PR `pr view` (views[num]) + Codex
-    signals (signals_map[num] -> {reviews,inline,comments} raw github json). PRs in error_prs fail
-    their `pr view` (returncode 1 -> GhError). Every command passes through _assert_read_only."""
+    signals (signals_map[num] -> {reviews,inline,comments} raw github json). `pr list --state merged`
+    returns merged_prs, any other state returns prs. PRs in error_prs fail their `pr view`
+    (returncode 1 -> GhError). Every command passes through _assert_read_only."""
     signals_map = signals_map or {}
 
     def fake_run(cmd, **kw):
@@ -352,7 +409,9 @@ def _cli_fake_gh(recorder, *, prs, views, signals_map=None, error_prs=()):
         if args[:2] == ["repo", "view"]:
             return SimpleNamespace(returncode=0, stdout=json.dumps({"nameWithOwner": "o/r"}), stderr="")
         if args[:2] == ["pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout=json.dumps(prs), stderr="")
+            state = args[args.index("--state") + 1] if "--state" in args else "open"
+            data = merged_prs if state == "merged" else prs
+            return SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr="")
         if args[:2] == ["pr", "view"]:
             num = int(args[2])
             if num in error_prs:
@@ -454,6 +513,23 @@ class TestOrchestrateCommand(unittest.TestCase):
         self.assertEqual(data["plan"]["request_review"], [6])   # the healthy PR is still planned
         for cmd in calls:
             _assert_read_only(cmd[1:])
+
+    def test_command_retargets_child_of_merged_parent(self):
+        # Codex r1 F4+F8: open stack + merged history are fetched SEPARATELY, and a child of a merged
+        # parent is flagged to retarget even though it is not merge-ready
+        calls = []
+        prs = [{"number": 7, "title": "child", "state": "OPEN",
+                "headRefName": "feat/7", "baseRefName": "feat/parent"}]
+        merged = [{"number": 4, "title": "parent", "state": "MERGED",
+                   "headRefName": "feat/parent", "baseRefName": "main"}]
+        fake = _cli_fake_gh(calls, prs=prs, views={7: _raw_view(7, head="ccccccc", base="feat/parent")},
+                            merged_prs=merged)
+        state_file = os.path.join(tempfile.mkdtemp(), "orch.json")
+        rc, out = _run_orchestrate(
+            ["orchestrate-reviews", "--repo", "o/r", "--state-file", state_file, "--json"], fake)
+        self.assertEqual(rc, 0)
+        self.assertEqual(_plan_from(out)["needs_retarget"], [7])
+        self.assertEqual(_plan_from(out)["request_review"], [])   # not requested against the stale base
 
 
 if __name__ == "__main__":
