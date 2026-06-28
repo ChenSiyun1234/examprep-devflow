@@ -442,7 +442,13 @@ def cmd_watch_codex_reviews(args) -> int:
         if not review:
             continue
         if review.get("quota_limited"):                 # Codex code review is rate-limited on this PR
-            quota_prs.append(num)
+            # only flag a quota notice as a back-off signal when it is NEW — a persistent OLD quota comment
+            # must not emit CODEX_QUOTA_LIMITED on every run, or a scheduler backing off on it would never
+            # return to normal polling after the limit resets.
+            qkey = review.get("dedupe_key") or f"{review.get('created_at') or ''}|{review.get('url') or ''}"
+            if not args.init and (repo_seen.get(str(num)) or {}).get("quota_key") != qkey:
+                quota_prs.append(num)
+            repo_seen.setdefault(str(num), {})["quota_key"] = qkey   # record so it isn't re-flagged
         if not review.get("has_review", True):
             continue                                    # a bare quota notice is not an actionable review
         # dedupe key covers ALL Codex signals at the latest timestamp (so a same-second newly-visible

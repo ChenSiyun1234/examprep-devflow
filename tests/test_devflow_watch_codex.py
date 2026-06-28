@@ -447,6 +447,17 @@ class TestWatchCodexBehavior(WatchCodexBase):
         self.assertIn("rate-limited", out)
         self.assertIn("quota_limited=1", out)
 
+    def test_stale_quota_notice_flagged_only_once(self):
+        # Codex r9 P2: a PERSISTENT quota notice must emit CODEX_QUOTA_LIMITED only once — else a
+        # scheduler backing off on the marker never returns to normal polling after the limit resets
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        quota = {1: [codex_quota("2026-01-04T00:00:00Z", "p1#q1")]}
+        _, out1, _ = self.run_watch(prs, comments_by_pr=quota)
+        self.assertIn("CODEX_QUOTA_LIMITED", out1)        # first time: flagged
+        _, out2, _ = self.run_watch(prs, comments_by_pr=quota)
+        self.assertNotIn("CODEX_QUOTA_LIMITED", out2)     # same stale notice -> not re-flagged
+        self.assertNoNew(out2)
+
     def test_real_review_with_newer_quota_is_still_actionable(self):
         # a genuine review followed by a NEWER quota notice must not be hidden -> still actionable,
         # and quota is still signalled so a scheduler knows Codex is now rate-limited.

@@ -227,7 +227,7 @@ class TestCodexReviewFixesPR3Round2(unittest.TestCase):
         st["pr_number"] = 8
         st["_sleep_fn"] = quiet
         rev = {"blocking": True, "items": [], "state": "CHANGES_REQUESTED", "body": "please fix",
-               "has_review": True, "created_at": "2026-02-01T00:00:00Z"}   # fresh (newer than baseline)
+               "has_review": True, "dedupe_key": "fresh-key"}   # fresh (different from the empty baseline)
         with mock.patch.object(G.ReadOnlyGitHub, "find_latest_codex_review", return_value=rev):
             out = pr_nodes.wait_for_codex_review(st)
         self.assertEqual(out["codex_review_status"], "ready")

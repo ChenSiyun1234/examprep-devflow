@@ -222,7 +222,7 @@ class TestWaitForCodexReviewQuota(unittest.TestCase):
         # (Codex r3 P2; r8 P1 refines: it must be NEWER than the baseline).
         from devflow.nodes import pr_review
         rev = {"has_review": True, "quota_limited": True, "blocking": False, "items": [],
-               "created_at": "2026-02-01T00:00:00Z"}                  # newer than the (empty) baseline
+               "dedupe_key": "fresh-key"}                              # different from the (empty) baseline
         state = {"real_github": True, "repo": "o/r", "pr_number": 5,
                  "max_polls": 2, "poll_seconds": 0, "_sleep_fn": lambda *_: None}
         with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:
@@ -231,23 +231,37 @@ class TestWaitForCodexReviewQuota(unittest.TestCase):
         self.assertEqual(out["codex_review_status"], "ready")
 
     def test_stale_review_with_quota_keeps_polling(self):
-        # Codex r8 P1: an OLD review that stays latest because the NEW request got only a quota notice
-        # (same timestamp as the pre-request baseline) must NOT be accepted — keep polling / time out
+        # Codex r8 P1 + r9 P2: an OLD review that stays latest because the NEW request got only a quota
+        # notice (SAME dedupe_key as the pre-request baseline) must NOT be accepted — keep polling / time out
         from devflow.nodes import pr_review
         stale = {"has_review": True, "quota_limited": True, "blocking": False, "items": [],
-                 "created_at": "2026-01-01T00:00:00Z"}
+                 "dedupe_key": "stale-key"}
         state = {"real_github": True, "repo": "o/r", "pr_number": 5, "max_polls": 2, "poll_seconds": 0,
                  "_sleep_fn": lambda *_: None,
-                 "codex_review_baseline_at": "2026-01-01T00:00:00Z"}   # baseline == the stale review's ts
+                 "codex_review_baseline_at": "stale-key"}              # baseline == the stale review's key
         with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:
             RG.return_value.find_latest_codex_review.return_value = stale
             out = pr_review.wait_for_codex_review(state)
         self.assertEqual(out["codex_review_status"], "timeout")
 
+    def test_fresh_same_second_review_accepted_by_dedupe_key(self):
+        # Codex r9 P2: a fresh review posted in the SAME second as the baseline (different dedupe_key) is
+        # accepted — a timestamp-only check would have rejected it
+        from devflow.nodes import pr_review
+        fresh = {"has_review": True, "quota_limited": False, "blocking": False, "items": [],
+                 "dedupe_key": "2026-01-01T00:00:00Z|new_url"}
+        state = {"real_github": True, "repo": "o/r", "pr_number": 5, "max_polls": 2, "poll_seconds": 0,
+                 "_sleep_fn": lambda *_: None,
+                 "codex_review_baseline_at": "2026-01-01T00:00:00Z|old_url"}   # SAME second, different url
+        with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:
+            RG.return_value.find_latest_codex_review.return_value = fresh
+            out = pr_review.wait_for_codex_review(state)
+        self.assertEqual(out["codex_review_status"], "ready")
+
     def test_real_review_still_satisfies_poll(self):
         from devflow.nodes import pr_review
         real = {"has_review": True, "quota_limited": False, "blocking": False, "items": ["fix x"],
-                "created_at": "2026-02-01T00:00:00Z"}
+                "dedupe_key": "fresh-key"}
         state = {"real_github": True, "repo": "o/r", "pr_number": 5,
                  "max_polls": 2, "poll_seconds": 0, "_sleep_fn": lambda *_: None}
         with mock.patch.object(pr_review, "ReadOnlyGitHub") as RG:
