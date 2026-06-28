@@ -539,21 +539,25 @@ class ReadOnlyGitHub:
         codex_inline = [c for c in inline if is_codex_author(c.get("author"))
                         and not is_codex_quota_notice(c.get("body"))]
         # count comment-only coverage by RUN (distinct timestamp), not per comment — one Codex run that
-        # leaves several conversation comments is ONE round, else its needs_review decays too fast and the
-        # PR is wrongly pushed out of recommend_next.
-        crev_runs = len({c.get("created_at") for c in crevs})
+        # leaves several conversation comments is ONE round. Also EXCLUDE timestamps already covered by a
+        # review object: a single run that posts both a review AND a same-second comment is one round, not
+        # two (else needs_review decays twice as fast and the PR is wrongly pushed out of recommend_next).
+        rev_times = {r.get("created_at") for r in revs}
+        crev_runs = len({c.get("created_at") for c in crevs} - rev_times)
         rounds = len(revs) + crev_runs
         if rounds == 0 and codex_inline:
             rounds = 1
         # current head is reviewed if a review OBJECT or an INLINE-only comment carries head's commit_id.
         on_head = bool(head) and (any((r.get("commit_id") or "") == head for r in revs)
                                   or any((c.get("commit_id") or "") == head for c in codex_inline))
-        # quota state from the latest Codex signal (review OR comment). If a real review and a quota
-        # notice SHARE the max one-second timestamp, treat the PR as rate-limited (ANY max-ts quota wins,
-        # like the watcher) — a review listed first must not hide a co-timestamped quota notice. But only
+        # quota state from the latest Codex signal — review OR conversation comment OR INLINE comment
+        # (inline is review coverage too, so a later inline review must be able to clear an earlier quota
+        # notice's latest-signal status). If a real signal and a quota notice SHARE the max one-second
+        # timestamp, treat the PR as rate-limited (ANY max-ts quota wins, like the watcher). But only
         # while the notice is RECENT, so a stale quota doesn't suppress the PR forever after the reset.
         sigs = [(r.get("created_at"), r.get("body")) for r in reviews if is_codex_author(r.get("author"))]
         sigs += [(c.get("created_at"), c.get("body")) for c in comments if is_codex_author(c.get("author"))]
+        sigs += [(c.get("created_at"), c.get("body")) for c in inline if is_codex_author(c.get("author"))]
         sigs = [(t, b) for t, b in sigs if t]
         quota_limited = False
         if sigs:

@@ -333,6 +333,30 @@ class TestRankCodexBehavior(RankCodexBase):
         self.assertIn("RANK_CODEX_INCOMPLETE", out)
         self.assertNotIn("RANKED_CODEX_REVIEW_QUEUE", out)
 
+    def test_inline_review_after_quota_clears_rate_limit(self):
+        # Codex r7 P2: a later INLINE review must count in quota ordering and clear an earlier quota notice
+        gh = G.ReadOnlyGitHub("o/r")
+        with mock.patch.object(G.time, "gmtime", return_value=_FIXED_NOW), \
+             mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[
+                 {"author": CODEX, "body": QUOTA_BODY, "created_at": "2026-02-01T00:00:00Z"}]), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[
+                 {"author": CODEX, "body": "nit", "created_at": "2026-02-01T00:10:00Z", "commit_id": "h"}]):
+            cov = gh.codex_review_rounds(1)
+        self.assertFalse(cov["quota_limited"])    # the later inline review is the latest signal, not quota
+
+    def test_same_run_review_and_comment_count_once(self):
+        # Codex r7 P2: a review + a same-timestamp conversation comment from ONE run = ONE round, not two
+        gh = G.ReadOnlyGitHub("o/r")
+        with mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_reviews", return_value=[
+                 {"author": CODEX, "body": "### Codex Review", "state": "COMMENTED",
+                  "created_at": "2026-02-01T00:00:00Z", "commit_id": "h"}]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[
+                 {"author": CODEX, "body": "summary note", "created_at": "2026-02-01T00:00:00Z"}]):
+            cov = gh.codex_review_rounds(1)
+        self.assertEqual(cov["rounds"], 1)
+
     def test_json_output_parses_and_has_ranking(self):
         prs = [pr(1, "feat: a", "feat/a", 400, files=4), pr(2, "fix: b", "fix/b", 30, files=1)]
         _, out, _ = self.run_rank(prs, as_json=True)
