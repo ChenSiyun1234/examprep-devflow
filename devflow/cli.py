@@ -36,6 +36,7 @@ from devflow.tools.packet_writer import (
     build_packet, write_packet, PacketError,
     parse_scope_markdown, build_manual_packet, render_manual_markdown,
 )
+from devflow.tools.review_priority import score as score_review_priority
 from devflow.tools import review_orchestrator as orch
 from devflow._compat import HAS_LANGGRAPH
 
@@ -566,6 +567,92 @@ def cmd_watch_codex_reviews(args) -> int:
     return 0
 
 
+def cmd_rank_codex_reviews(args) -> int:
+    """Read-only: rank PRs by Codex-review PRIORITY (unreviewed + big-feature first; well-reviewed
+    or small-bugfix last) and recommend the top-N to request review on next. Deterministic, stdlib
+    heuristic (see review_priority.score). Prints RANKED_CODEX_REVIEW_QUEUE + a ranked table + the
+    recommended batch; never edits code, comments, commits, pushes, or merges."""
+    rc = _require_gh()
+    if rc:
+        return rc
+    gh = ReadOnlyGitHub(args.repo)
+    try:
+        repo = gh.resolve_repo()
+        if args.include_merged:
+            # fetch OPEN and MERGED separately so --limit counts ELIGIBLE PRs, not closed-unmerged
+            # ones that would consume the limit before filtering (retroactive review of merged work).
+            # INTERLEAVE open+merged before the final --limit cap, so merged candidates aren't all
+            # crowded out behind the open PRs when there are >= limit open ones.
+            opens = gh.list_prs(state="open", limit=args.limit)
+            merged = gh.list_prs(state="merged", limit=args.limit)
+            prs = []
+            for i in range(max(len(opens), len(merged))):
+                if i < len(opens):
+                    prs.append(opens[i])
+                if i < len(merged):
+                    prs.append(merged[i])
+            prs = prs[:args.limit]
+        else:
+            prs = gh.list_prs(state="open", limit=args.limit)
+    except GhError as e:
+        print(f"[devflow] gh error: {e}")
+        return 1
+
+    ranked, errors = [], []
+    for pr in prs:
+        num = pr.get("number")
+        if num is None:
+            continue
+        try:
+            cov = gh.codex_review_rounds(num, head=pr.get("head"))
+        except GhError as e:                            # a failed lookup must not be ranked as rounds=0
+            errors.append((num, str(e)))                # (which mints MAX priority) — surface, don't rank
+            continue
+        s = score_review_priority(
+            additions=pr["additions"], deletions=pr["deletions"], changed_files=pr["changed_files"],
+            title=pr["title"], branch=pr["branch"], codex_rounds=cov["rounds"],
+            reviewed_on_head=cov["reviewed_on_head"])
+        ranked.append({**pr, **s, "reviewed_on_head": cov["reviewed_on_head"],
+                       "quota_limited": cov.get("quota_limited", False)})
+
+    # highest priority first; tie-break by need, then PR number (stable + deterministic)
+    ranked.sort(key=lambda r: (-r["priority"], -r["needs_review"], r["number"]))
+    # don't recommend requesting review on a CURRENTLY rate-limited PR — Codex just said it can't
+    # review now; such PRs are still shown in the table but kept out of recommend_next.
+    top = [r["number"] for r in ranked if not r.get("quota_limited")][:args.top]
+
+    # ANY coverage-lookup failure makes the ranking INCOMPLETE — a failed (possibly highest-priority) PR
+    # is silently absent from recommend_next, so a driver must retry/alert rather than spend slots on a
+    # partial batch. Errors take precedence over a non-empty (but incomplete) ranking.
+    marker = ("RANK_CODEX_INCOMPLETE" if errors
+              else "RANKED_CODEX_REVIEW_QUEUE" if ranked
+              else "NO_PRS_TO_RANK")
+    print(marker)
+    print(f"[rank-codex] repo={repo} ranked={len(ranked)} recommend_next={top} "
+          f"(read-only; top={args.top})")
+    for r in ranked:
+        flag = "  <-- request next" if r["number"] in top else ""
+        head_note = " head-reviewed" if r["reviewed_on_head"] else ""
+        q_note = " rate-limited" if r.get("quota_limited") else ""
+        print(f"  #{r['number']:>3} prio={r['priority']:>3} {r['type']:>7} "
+              f"needs={r['needs_review']} impact={r['impact']} rounds={r['codex_rounds']}{head_note}{q_note} "
+              f"+{r['additions']}/-{r['deletions']} {r['state']}{flag}  {(r['title'] or '')[:48]}")
+    for e_num, e_msg in errors:
+        print(f"  ! PR #{e_num}: gh error: {e_msg}")
+    if args.json:
+        print(json.dumps({
+            "repo": repo, "marker": marker, "recommend_next": top,
+            "ranked": [{"pr": r["number"], "priority": r["priority"], "type": r["type"],
+                        "needs_review": r["needs_review"], "impact": r["impact"],
+                        "codex_rounds": r["codex_rounds"], "reviewed_on_head": r["reviewed_on_head"],
+                        "quota_limited": r.get("quota_limited", False),
+                        "state": r["state"], "additions": r["additions"], "deletions": r["deletions"],
+                        "title": r["title"]} for r in ranked],
+            "errors": [{"pr": n, "error": m} for n, m in errors],
+        }, ensure_ascii=False, indent=2))
+    return 0
+
+
 # ---- read-only cross-PR review ORCHESTRATOR (planner): recommends actions, never mutates GitHub ----
 def _print_plan_section(label: str, prs) -> None:
     if prs:
@@ -913,6 +1000,21 @@ def build_parser() -> argparse.ArgumentParser:
     oc.add_argument("--exit-actionable", action="store_true",
                     help="return exit code 10 (not 0) when the plan recommends any action")
     oc.set_defaults(func=cmd_orchestrate_reviews)
+
+    rk = sub.add_parser("rank-codex-reviews",
+                        help="read-only: rank PRs by Codex-review priority (unreviewed + big-feature "
+                             "first) and recommend the top-N to request review on next")
+    rk.add_argument("--repo", default=None, help="owner/name (default: current repo)")
+    rk.add_argument("--limit", type=_pos_int, default=50,
+                    help="max PRs to inspect (must be >= 1)")
+    rk.add_argument("--top", type=_pos_int, default=3,
+                    help="how many top-priority PRs to recommend requesting review on (default 3)")
+    rk.add_argument("--include-merged", action="store_true",
+                    help="also rank MERGED PRs (e.g. ones merged before review was available) for "
+                         "retroactive review, not just open PRs")
+    rk.add_argument("--json", action="store_true",
+                    help="also print a machine-readable JSON ranking")
+    rk.set_defaults(func=cmd_rank_codex_reviews)
 
     # --- Implementation Packet export (handoff to Claude Code; local files only, no edits/writes) ---
     ep = sub.add_parser("export-implementation-packet",
