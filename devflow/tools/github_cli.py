@@ -197,6 +197,23 @@ def is_codex_author(login: Optional[str]) -> bool:
     return bool(login) and login.strip().lower() in _TRUSTED_CODEX_LOGINS
 
 
+def is_codex_quota_notice(body: Optional[str]) -> bool:
+    """True if a trusted-Codex message is the "you've hit your usage limits" rate-limit notice
+    (e.g. "You have reached your Codex usage limits for code reviews."). This is NOT a review:
+    callers must not treat it as actionable, and can use it to back off. Matched precisely (the
+    limit phrase AND a code-review/codex context) so a real finding that merely mentions a "usage
+    limit" in the code under review isn't misread as rate-limiting."""
+    t = (body or "").strip().lower()
+    if not t:
+        return False
+    # Require the COMPLETE bot-notice shape, not just the opening sentence: the canonical notice is
+    # "You have reached your Codex usage limits for code reviews. You can see your limits in the …".
+    # A real review that QUOTES only the first sentence and then gives actual feedback (still under 600
+    # chars) lacks the "you can see your limits" continuation, so it isn't dropped as a rate-limit notice.
+    return (t.startswith("you have reached your codex usage limits for code review")
+            and "you can see your limits" in t and len(t) < 600)
+
+
 # Tie-break for "latest" when GitHub's 1-second timestamps collide (Codex posts a review plus
 # several review-comments in the same second). A higher rank + url makes a *new* same-second signal
 # win the tie so dedupe keys advance and the new feedback is not silently swallowed.
@@ -351,30 +368,118 @@ class ReadOnlyGitHub:
             return None
         # tie-break same-second signals by (timestamp, source rank, url) so a brand-new review
         # posted in the same second as a seen comment is still picked as "latest" (see watcher dedupe)
-        latest = max(candidates, key=lambda c: (c.get("created_at") or "",
-                                                _CODEX_SOURCE_RANK.get(c.get("source"), 0),
-                                                c.get("url") or ""))
+        def _key(c):
+            return (c.get("created_at") or "",
+                    _CODEX_SOURCE_RANK.get(c.get("source"), 0),
+                    c.get("url") or "")
+        # A Codex "usage limits" notice is rate-limiting, NOT a review. Detect whether the OVERALL
+        # latest signal is that notice (so callers can back off), but base the verdict on the latest
+        # NON-quota signal — so a freshly-posted-then-rate-limited review isn't hidden, and a bare
+        # quota notice is never mis-parsed as a verdict.
+        # the OVERALL latest signal is a quota notice if ANY candidate at the max timestamp is one — a
+        # same-second review can otherwise win the rank tie and hide a co-timestamped quota notice.
+        _qmax = max((c.get("created_at") or "") for c in candidates)
+        quota_active = any(is_codex_quota_notice(c.get("body"))
+                           for c in candidates if (c.get("created_at") or "") == _qmax)
+        real = [c for c in candidates if not is_codex_quota_notice(c.get("body"))]
+        # Dedupe key for the watcher over the NON-quota signals at their latest timestamp: cover ALL
+        # signals sharing that timestamp (not just the highest-ranked one), so a newly-visible
+        # same-second lower-ranked comment advances the key — while a bare quota notice arriving AFTER
+        # a seen review does NOT (it would otherwise re-alert stale feedback). Falls back to all
+        # candidates only when the PR has nothing but quota notices.
+        _basis = real or candidates
+        _max_ts = max((c.get("created_at") or "") for c in _basis)
+        dedupe_key = _max_ts + "|" + ",".join(sorted(
+            (c.get("url") or "") for c in _basis if (c.get("created_at") or "") == _max_ts))
+        # Legacy compatibility (QUOTA case only): when a newer quota notice exists, the OLD watcher stored
+        # that quota notice's single `created_at|url`. Its timestamp is NEWER than the latest real review,
+        # so accepting it can't collide with a fresh baseline (which keys off the real review at an earlier
+        # second) -> safe. We deliberately do NOT expose the SAME-SECOND non-quota single key: it is
+        # identical to what a fresh baseline stores when only the review was present, so accepting it would
+        # SUPPRESS the intended same-second re-alert (a NEW lower-ranked comment posted in a seen review's
+        # second). That live feature outweighs a one-time, self-healing re-alert on a pre-upgrade seen file.
+        legacy_dedupe_key = None
+        if quota_active and real:
+            # pick the QUOTA notice's url at _qmax — NOT a same-second review that outranks it. Keying off
+            # the quota url keeps the legacy key distinct from any review baseline, so it can't suppress a
+            # same-second inline-comment re-alert.
+            quota_at_qmax = [c for c in candidates if (c.get("created_at") or "") == _qmax
+                             and is_codex_quota_notice(c.get("body"))]
+            if quota_at_qmax:
+                overall_q = max(quota_at_qmax, key=_key)
+                legacy_dedupe_key = (_qmax or "") + "|" + (overall_q.get("url") or "")
+        if not real:
+            overall = max(candidates, key=_key)   # only quota notices from Codex -> signal, no review
+            return {
+                "source": overall["source"],
+                "pr_number": int(pr_number),
+                "author": overall["author"],
+                "created_at": overall["created_at"],
+                "url": overall.get("url"),
+                "dedupe_key": dedupe_key,
+                "quota_limited": True,
+                "has_review": False,
+                "blocking": None,
+                "items": [],
+                "body": overall.get("body") or "",
+            }
+        latest = max(real, key=_key)
         packet = parse_review_packet(latest["body"], latest.get("state"))  # default: latest item's verdict
+        # A same-second lower-ranked signal can advance the dedupe key (re-alerting) while `latest`
+        # stays the higher-ranked review; merge that newer signal's items so the alert isn't empty of
+        # the actually-new content.
+        _lt = latest.get("created_at") or ""
+        cotimestamped_blocking = False
+        cotimestamped_extra = []
+        for c in real:
+            if c is not latest and (c.get("created_at") or "") == _lt:
+                cp = parse_review_packet(c.get("body"), c.get("state"))
+                for it in (cp.get("items") or []):
+                    if it not in packet["items"]:
+                        packet["items"].append(it)
+                if cp.get("blocking"):
+                    cotimestamped_blocking = True
+                # a co-timestamped comment that is PLAIN PROSE (no bullet items) would otherwise be
+                # invisible — the alert would re-fire (new dedupe key) but still show only `latest`'s
+                # body/url. Surface its body + url so the new feedback is actually displayed.
+                cbody = (c.get("body") or "").strip()
+                if cbody and cbody not in (packet.get("body") or ""):
+                    cotimestamped_extra.append((c.get("url"), cbody))
+        # a co-timestamped lower-ranked signal that is itself blocking must SURFACE its verdict, not
+        # just its items — otherwise we'd re-alert the fix while reporting blocking=False.
+        if cotimestamped_blocking:
+            packet["blocking"] = True
+        if cotimestamped_extra:
+            extra = "\n\n".join(f"[also @ same timestamp] {u or ''}\n{b}" for u, b in cotimestamped_extra)
+            packet["body"] = ((packet.get("body") or "").rstrip() + "\n\n" + extra).strip()
         # Reconcile with terminal review states:
         #  - a CHANGES_REQUESTED review stays in effect until a *newer* APPROVED clears it;
         #  - an APPROVED clears blocking only if it's the most recent signal — a newer plain comment
-        #    with blocking language still counts (don't let an old approval hide it).
-        stateful = [c for c in candidates if (c.get("state") or "").upper() in
+        #    with blocking language still counts (don't let an old approval hide it);
+        #  - a SAME-SECOND APPROVED must not bury a co-timestamped blocking comment.
+        stateful = [c for c in real if (c.get("state") or "").upper() in
                     ("CHANGES_REQUESTED", "APPROVED")]
         if stateful:
             newest_sf = max(stateful, key=lambda c: c.get("created_at") or "")
             nstate = (newest_sf.get("state") or "").upper()
+            _sf_ts, _lt_ts = (newest_sf.get("created_at") or ""), (latest.get("created_at") or "")
             if nstate == "CHANGES_REQUESTED":
                 packet["blocking"] = True
-            elif (newest_sf.get("created_at") or "") >= (latest.get("created_at") or ""):
-                packet["blocking"] = False   # APPROVED is the most recent signal
-            # else: APPROVED predates a newer comment -> keep that comment's parsed verdict
+            elif _sf_ts > _lt_ts:
+                packet["blocking"] = False   # a STRICTLY newer APPROVED clears blocking
+            elif _sf_ts == _lt_ts and not cotimestamped_blocking:
+                packet["blocking"] = False   # same-second APPROVED clears only if nothing blocks at that second
+            # else: APPROVED predates a newer comment (or a co-timestamped blocker stands) -> keep verdict
         return {
             "source": latest["source"],
             "pr_number": int(pr_number),
             "author": latest["author"],
             "created_at": latest["created_at"],
             "url": latest.get("url"),
+            "dedupe_key": dedupe_key,
+            "legacy_dedupe_key": legacy_dedupe_key,
+            "quota_limited": quota_active,
+            "has_review": True,
             **packet,
         }
 

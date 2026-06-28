@@ -365,7 +365,7 @@ def cmd_read_pr(args) -> int:
     print(f"[read-pr] #{args.pr} — {len(comments)} comment(s), {len(reviews)} review(s)")
     for r in reviews:
         print(f"  review: {r['author']} [{r['state']}] @ {r['created_at']}")
-    if review:
+    if review and review.get("has_review", True):
         print(f"\nLatest Codex review: by {review['author']} ({review['source']}) "
               f"blocking={review['blocking']} state={review.get('state')}")
         if review["items"]:
@@ -373,6 +373,9 @@ def cmd_read_pr(args) -> int:
             for it in review["items"][:20]:
                 print(f"   - {it}")
         print(review["body"][:800])
+    elif review:   # a quota-only signal (has_review False) is NOT a review — label it as such
+        print(f"\nLatest Codex signal: usage-limit notice (no review yet) by {review['author']} "
+              f"@ {review.get('created_at')}")
     else:
         print("\nLatest Codex review: (none found)")
     return 0
@@ -395,20 +398,52 @@ def _load_codex_seen(path: str) -> dict:
         return {}
     # Tolerate PARTIAL corruption / legacy slices too: keep only dict repo-slices whose per-PR
     # entries are themselves dicts, so a present-but-non-dict slice/entry can't crash the use sites.
-    return {repo: {pr: entry for pr, entry in slc.items() if isinstance(entry, dict)}
-            for repo, slc in data.items() if isinstance(slc, dict)}
+    # case-fold the top-level repo key (GitHub repos are case-insensitive) so a legacy mixed-case
+    # slice written before key-normalization still matches the lowercased lookup, instead of being
+    # missed and re-alerting every previously-seen review.
+    out = {}
+    for repo, slc in data.items():
+        if not isinstance(slc, dict):
+            continue
+        # MERGE (not overwrite) into the lowercased key so a file holding both `Owner/Repo` and
+        # `owner/repo` keeps every PR entry instead of the later slice clobbering the earlier one.
+        dst = out.setdefault(repo.lower(), {})
+        for pr, entry in slc.items():
+            if not isinstance(entry, dict):
+                continue
+            cur = dst.get(pr)
+            # on a same-PR collision across case-variant slices, keep the FRESHEST entry: strictly-newer
+            # created_at wins; on an equal timestamp prefer the FULLER key (more same-second URLs, e.g.
+            # 'T|review,inline' over 'T|review') so a stale partial key can't overwrite a fresher one and
+            # re-alert already-seen feedback.
+            e_ts, c_ts = (entry.get("created_at") or ""), ((cur or {}).get("created_at") or "")
+            e_key, c_key = (entry.get("key") or ""), ((cur or {}).get("key") or "")
+            if cur is None or e_ts > c_ts or (e_ts == c_ts and len(e_key) > len(c_key)):
+                dst[pr] = entry
+    return out
 
 
-def _save_codex_seen(path: str, data: dict) -> None:
+def _save_codex_seen(path: str, data: dict, only_repo: str = None) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # Merge against the LATEST on-disk state so a concurrent writer's OTHER-repo slices aren't lost,
+    # and write atomically (temp + os.replace) so a crash mid-write can't truncate the shared file.
+    merged = _load_codex_seen(path)
+    if only_repo is not None:
+        merged[only_repo] = data.get(only_repo, {})    # update only our repo; keep others' fresh state
+    else:
+        merged.update(data)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 def cmd_watch_codex_reviews(args) -> int:
-    """Read-only: scan OPEN PRs for NEW trusted-Codex reviews/comments, deduped against a local
-    seen file. Prints ACTIONABLE_CODEX_REVIEWS (with details) if anything is new, else
-    NO_NEW_CODEX_REVIEWS. Never edits code, comments, commits, pushes, or merges."""
+    """Read-only: scan OPEN PRs for NEW trusted-Codex reviews/comments, deduped against a local seen
+    file. First-line marker, in precedence order: ACTIONABLE_CODEX_REVIEWS (new feedback to act on) >
+    CODEX_WATCH_INCOMPLETE (a PR read failed — sweep incomplete, retry; don't trust a clean result) >
+    CODEX_QUOTA_LIMITED (only rate-limit notices — a scheduler can back off) > NO_NEW_CODEX_REVIEWS.
+    Never edits code, comments, commits, pushes, or merges."""
     rc = _require_gh()
     if rc:
         return rc
@@ -420,11 +455,12 @@ def cmd_watch_codex_reviews(args) -> int:
         print(f"[devflow] gh error: {e}")
         return 1
 
+    repo_key = repo.lower()    # GitHub repos are case-insensitive -> one seen slice regardless of --repo casing
     seen_path = _codex_seen_path(args.seen_file)
     seen = _load_codex_seen(seen_path)
     # --reset / --init start THIS repo's slice fresh, but never clobber other repos in the file.
-    repo_seen = {} if (args.reset or args.init) else dict(seen.get(repo, {}))
-    actionable, checked, errors = [], [], []
+    repo_seen = {} if (args.reset or args.init) else dict(seen.get(repo_key, {}))
+    actionable, checked, errors, quota_prs = [], [], [], []
 
     for pr in prs:
         num = pr.get("number")
@@ -438,35 +474,66 @@ def cmd_watch_codex_reviews(args) -> int:
             continue
         if not review:
             continue
-        # dedupe key = the latest Codex item's (created_at, url). New iff it differs from last seen.
-        key = f"{review.get('created_at') or ''}|{review.get('url') or ''}"
+        if review.get("quota_limited"):                 # Codex code review is rate-limited on this PR
+            # only flag a quota notice as a back-off signal when it is NEW — a persistent OLD quota comment
+            # must not emit CODEX_QUOTA_LIMITED on every run, or a scheduler backing off on it would never
+            # return to normal polling after the limit resets.
+            qkey = review.get("dedupe_key") or f"{review.get('created_at') or ''}|{review.get('url') or ''}"
+            if not args.init and (repo_seen.get(str(num)) or {}).get("quota_key") != qkey:
+                quota_prs.append(num)
+            repo_seen.setdefault(str(num), {})["quota_key"] = qkey   # record so it isn't re-flagged
+        if not review.get("has_review", True):
+            continue                                    # a bare quota notice is not an actionable review
+        # dedupe key covers ALL Codex signals at the latest timestamp (so a same-second newly-visible
+        # comment still counts as new); fall back to created_at|url for older return shapes.
+        key = review.get("dedupe_key") or f"{review.get('created_at') or ''}|{review.get('url') or ''}"
+        stored_key = (repo_seen.get(str(num)) or {}).get("key")
+        # a stored key matching EITHER the current key or the legacy (quota-inclusive) key counts as
+        # already-seen, so upgrading the dedupe scheme doesn't re-alert an older review.
+        already_seen = stored_key is not None and stored_key in (key, review.get("legacy_dedupe_key"))
         entry = {"key": key, "created_at": review.get("created_at"),
                  "url": review.get("url"), "blocking": review.get("blocking")}
         if args.init:                       # baseline: record current state, do not alert
             repo_seen[str(num)] = entry
-        elif key != (repo_seen.get(str(num)) or {}).get("key"):
+        elif not already_seen:
             actionable.append({"pr": num, "title": pr.get("title"), "review": review})
             repo_seen[str(num)] = entry
+        elif stored_key != key:
+            # seen via the LEGACY key -> MIGRATE the stored key forward to the current dedupe_key. Else the
+            # stale legacy key keeps matching and a later real change (e.g. a same-second inline becoming
+            # visible) whose new key still equals legacy_dedupe_key would never be reported.
+            repo_seen[str(num)] = entry
 
-    seen[repo] = repo_seen
-    _save_codex_seen(seen_path, seen)         # local tool state only — no GitHub mutation
+    seen[repo_key] = repo_seen
+    _save_codex_seen(seen_path, seen, only_repo=repo_key)  # local tool state only — no GitHub mutation
 
     # --init records a baseline and emits NEITHER marker, so the first real run isn't a flood of
     # pre-existing reviews.
     if args.init:
-        print(f"[watch-codex] baseline recorded for {len(checked)} open PR(s) in {repo}; "
-              f"no markers emitted (seen={seen_path})")
+        for e_num, e_msg in errors:           # surface PRs that could NOT be baselined (don't hide them)
+            print(f"  ! PR #{e_num}: gh error — NOT baselined: {e_msg}")
+        print(f"[watch-codex] baseline recorded for {len(checked) - len(errors)} open PR(s) in {repo}; "
+              f"{len(errors)} errored (NOT baselined); no markers emitted (seen={seen_path})")
         return 0
 
     # Marker FIRST (a bare line) so strict consumers can match it; human details + optional JSON
     # follow. ACTIONABLE/NO_NEW is carried by this string, NOT the exit code (exit stays 0 like
     # read-pr, unless --exit-actionable is requested).
-    marker = "ACTIONABLE_CODEX_REVIEWS" if actionable else "NO_NEW_CODEX_REVIEWS"
+    # Precedence: real feedback to act on > partial-failure (incomplete sweep) > rate-limited (back off)
+    # > nothing new. INCOMPLETE outranks QUOTA: a failed PR read may hide actionable feedback, so a
+    # consumer must NOT back off for quota when the sweep didn't actually inspect everything.
+    marker = ("ACTIONABLE_CODEX_REVIEWS" if actionable
+              else "CODEX_WATCH_INCOMPLETE" if errors
+              else "CODEX_QUOTA_LIMITED" if quota_prs
+              else "NO_NEW_CODEX_REVIEWS")
     print(marker)
     print(f"[watch-codex] repo={repo} open_prs={len(prs)} checked={len(checked)} "
-          f"new={len(actionable)} (read-only; seen={seen_path})")
+          f"new={len(actionable)} quota_limited={len(quota_prs)} (read-only; seen={seen_path})")
     for e_num, e_msg in errors:
         print(f"  ! PR #{e_num}: gh error: {e_msg}")
+    if quota_prs:
+        print("Codex code review is rate-limited (usage limits) on PR(s): "
+              + ", ".join(f"#{n}" for n in quota_prs) + " — back off and retry later.")
     if actionable:
         print("PRs with new Codex feedback: " + ", ".join(f"#{a['pr']}" for a in actionable))
         for a in actionable:
@@ -489,6 +556,7 @@ def cmd_watch_codex_reviews(args) -> int:
                             "created_at": a["review"].get("created_at"),
                             "url": a["review"].get("url"),
                             "blocking": a["review"].get("blocking")} for a in actionable],
+            "quota_limited": quota_prs,
             "errors": [{"pr": n, "error": m} for n, m in errors],
             "marker": marker,
         }, ensure_ascii=False, indent=2))

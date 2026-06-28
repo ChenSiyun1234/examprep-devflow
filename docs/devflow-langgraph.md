@@ -263,12 +263,17 @@ How it works:
 * **dedupes** against a local seen file: per repo, per PR, it stores the latest item's
   `created_at|url` key; a PR is *new* iff that key changed since last run.
 
-Output contract (the **marker is the first line**, so `grep`/`startswith` both work):
+Output contract (the **marker is the first line**, so `grep`/`startswith` both work), in **precedence
+order** — a consumer keys off the first line:
 
 * `ACTIONABLE_CODEX_REVIEWS` — ≥1 open PR has new Codex feedback (followed by per-PR details);
+* `CODEX_WATCH_INCOMPLETE` — at least one PR read failed, so the sweep is incomplete (it may have
+  missed feedback); **retry**, and do NOT treat the run as clean. Outranks quota — a partial failure
+  must not be mistaken for a clean back-off;
+* `CODEX_QUOTA_LIMITED` — Codex is only returning usage-limit notices; a scheduler can **back off**;
 * `NO_NEW_CODEX_REVIEWS` — nothing new (also when there are zero open PRs);
-* `--init` records the current state as the baseline and prints **neither** marker (so the first
-  real run isn't a flood of pre-existing reviews).
+* `--init` records the current state as the baseline and prints **none** of these markers (so the
+  first real run isn't a flood of pre-existing reviews).
 
 Flags: `--repo` (default: current repo), `--seen-file` (default `<tmp>/devflow_runs/codex_seen.json`),
 `--limit` (max open PRs, clamped ≥1), `--reset` (re-alert this repo's current feedback; other repos
