@@ -459,6 +459,11 @@ def cmd_watch_codex_reviews(args) -> int:
         elif not already_seen:
             actionable.append({"pr": num, "title": pr.get("title"), "review": review})
             repo_seen[str(num)] = entry
+        elif stored_key != key:
+            # seen via the LEGACY key -> MIGRATE the stored key forward to the current dedupe_key. Else the
+            # stale legacy key keeps matching and a later real change (e.g. a same-second inline becoming
+            # visible) whose new key still equals legacy_dedupe_key would never be reported.
+            repo_seen[str(num)] = entry
 
     seen[repo_key] = repo_seen
     _save_codex_seen(seen_path, seen, only_repo=repo_key)  # local tool state only — no GitHub mutation

@@ -226,7 +226,8 @@ class TestCodexReviewFixesPR3Round2(unittest.TestCase):
         st = new_state("t", "t", real_github=True, max_polls=2, poll_seconds=0)
         st["pr_number"] = 8
         st["_sleep_fn"] = quiet
-        rev = {"blocking": True, "items": [], "state": "CHANGES_REQUESTED", "body": "please fix"}
+        rev = {"blocking": True, "items": [], "state": "CHANGES_REQUESTED", "body": "please fix",
+               "has_review": True, "created_at": "2026-02-01T00:00:00Z"}   # fresh (newer than baseline)
         with mock.patch.object(G.ReadOnlyGitHub, "find_latest_codex_review", return_value=rev):
             out = pr_nodes.wait_for_codex_review(st)
         self.assertEqual(out["codex_review_status"], "ready")

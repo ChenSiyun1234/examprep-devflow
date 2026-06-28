@@ -357,6 +357,18 @@ class TestWatchCodexBehavior(WatchCodexBase):
             comments_by_pr={1: [codex_quota("2026-01-04T00:00:00Z", "p1#q1")]}, repo="owner/repo")
         self.assertNotIn("ACTIONABLE_CODEX_REVIEWS", out)   # legacy quota-inclusive key recognized as seen
 
+    def test_legacy_key_migrated_forward_when_accepted(self):
+        # Codex r8 P2: when a PR is seen via the legacy quota-inclusive key, MIGRATE the stored key to the
+        # current dedupe_key so a later real change isn't masked by the stale legacy key
+        prs = [{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}]
+        with open(self.seen, "w", encoding="utf-8") as f:   # old watcher stored the quota's key
+            json.dump({"owner/repo": {"1": {"key": "2026-01-04T00:00:00Z|p1#q1"}}}, f)
+        self.run_watch(prs, reviews_by_pr={1: [codex_review("2026-01-03T00:00:00Z", "p1#r1")]},
+                       comments_by_pr={1: [codex_quota("2026-01-04T00:00:00Z", "p1#q1")]}, repo="owner/repo")
+        with open(self.seen, encoding="utf-8") as f:
+            stored = json.load(f)["owner/repo"]["1"]["key"]
+        self.assertEqual(stored, "2026-01-03T00:00:00Z|p1#r1")   # migrated to the current non-quota key
+
     def test_gh_unauthenticated_returns_nonzero(self):
         rc, out, _ = self.run_watch([{"number": 1, "title": "T", "updatedAt": "z", "url": "p1"}],
                                     auth_ok=False)

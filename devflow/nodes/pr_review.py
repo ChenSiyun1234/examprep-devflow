@@ -73,6 +73,15 @@ def request_codex_review(state: DevflowState) -> dict:
                 "errors": ["request_codex_review: no PR number (creation failed) — "
                            "refusing to comment on #0"],
                 "event_log": ["[request_codex_review] stopped: no PR number; not commenting on #0."]}
+    # baseline: the latest Codex review's timestamp BEFORE this request, so the poll can tell a FRESH
+    # review (newer than this) from a STALE one merely eclipsed by a later usage-limit notice.
+    baseline_at = ""
+    if state.get("real_github"):
+        try:
+            prev = ReadOnlyGitHub(state["repo"]).find_latest_codex_review(pr)
+            baseline_at = (prev or {}).get("created_at") or ""
+        except GhError:
+            baseline_at = ""
     res = _writer(state).comment_on_pr(pr, "@codex review this PR.")
     if res.get("error"):
         # comment failed → request never sent; terminal safe-stop so the wait node doesn't poll
@@ -81,7 +90,7 @@ def request_codex_review(state: DevflowState) -> dict:
                 "errors": [f"request_codex_review: {res['error']}"],
                 "event_log": [f"[request_codex_review] FAILED to post '@codex review' "
                               f"({res['error']}); stopping instead of polling."]}
-    return {"codex_review_status": "requested",
+    return {"codex_review_status": "requested", "codex_review_baseline_at": baseline_at,
             "event_log": [f"[request_codex_review] {res.get('log', '')}"]}
 
 
@@ -99,13 +108,18 @@ def wait_for_codex_review(state: DevflowState) -> dict:
         repo = state["repo"]
         pr = state.get("pr_number")
         kwargs = {"sleep_fn": state["_sleep_fn"]} if state.get("_sleep_fn") else {}
+        baseline_at = state.get("codex_review_baseline_at") or ""
         try:
             def _poll_real_review():
                 rev = ReadOnlyGitHub(repo).find_latest_codex_review(pr)
-                # key off has_review ONLY: a genuine review that ALREADY arrived counts even if a later
-                # usage-limits notice eclipsed it (quota_limited=True) — otherwise we'd time out on a
-                # review we actually have. A quota-only result (has_review False) keeps polling.
-                return rev if (rev and rev.get("has_review", True)) else None
+                # accept ONLY a review NEWER than the baseline captured before THIS request — i.e. a FRESH
+                # response. A genuinely new review counts even if a later usage-limit notice eclipses it
+                # (quota_limited); but a STALE older review left as the latest real signal because the new
+                # request got only a quota notice (same/older timestamp) keeps polling, so we never proceed
+                # toward fix/merge on stale feedback.
+                if rev and rev.get("has_review", True) and (rev.get("created_at") or "") > baseline_at:
+                    return rev
+                return None
             poll = bounded_poll(
                 _poll_real_review,
                 max_attempts=int(state.get("max_polls", 6)),

@@ -58,6 +58,7 @@ class DevflowState(TypedDict, total=False):
     # --- Codex interaction status ---
     codex_advisory_status: str   # "" | "requested" | "ready" | "timeout"
     codex_review_status: str     # "" | "requested" | "ready" | "timeout"
+    codex_review_baseline_at: str  # latest Codex review timestamp BEFORE the request (fresh-vs-stale poll)
     advisory_packet: Optional[dict]
     review_summary: Optional[dict]
 
