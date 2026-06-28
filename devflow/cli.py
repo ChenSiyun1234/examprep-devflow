@@ -25,7 +25,7 @@ import os
 import sys
 import tempfile
 
-from devflow.graph import build_graph, GATE_TO_NODE
+from devflow.graph import build_graph, GATE_TO_NODE, NODE_FUNCS
 from devflow.state import (
     new_state, APPROVED, REJECTED, APPROVAL_GATES,
     GATE_ADVISORY, GATE_FIX, GATE_MERGE,
@@ -67,6 +67,15 @@ def _save_ckpt(state: dict) -> str:
 def _load_ckpt(thread_id: str) -> dict:
     with open(_ckpt_path(thread_id), "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _clear_fallback_ckpt(thread_id: str) -> None:
+    """Best-effort remove the stdlib-fallback JSON checkpoint for a thread, so a later non-langgraph
+    `resume` can't load obsolete state after a langgraph run/resume has completed. Never raises."""
+    try:
+        os.remove(_ckpt_path(thread_id))
+    except OSError:
+        pass
 
 
 def _approvals_from_args(args) -> dict:
@@ -186,6 +195,10 @@ def _run_langgraph(args) -> int:
         state["_simulate"] = {"advisory": args.simulate_advisory or "ready",
                               "review": args.simulate_review or "blocking"}
     cfg = {"configurable": {"thread_id": args.thread_id}}
+    # drop any stale stdlib-fallback checkpoint for this thread BEFORE running, so that if the
+    # langgraph run pauses, a stray plain `resume` can't load the obsolete fallback state instead of
+    # being told to resume with --langgraph.
+    _clear_fallback_ckpt(args.thread_id)
     print(f"[devflow] backend=langgraph (sqlite checkpointer)  dry_run=True  "
           f"task={args.task}  thread={args.thread_id}")
     with cm as saver:
@@ -196,6 +209,7 @@ def _run_langgraph(args) -> int:
             _print_lg_pause(nxt, payloads, args.thread_id)
             return 0
         _print_outcome(app.get_state(cfg).values)
+        _clear_fallback_ckpt(args.thread_id)   # completed -> drop any stale stdlib checkpoint
     return 0
 
 
@@ -213,11 +227,19 @@ def _resume_langgraph(args) -> int:
     cfg = {"configurable": {"thread_id": args.thread_id}}
     with cm as saver:
         app = _build_state_graph().compile(checkpointer=saver)
-        nxt, _ = _lg_pending(app, cfg)
+        nxt, payloads = _lg_pending(app, cfg)
         if not nxt:
             print(f"[devflow] no paused LangGraph thread '{args.thread_id}'. Start one with:\n"
                   f"  python -m devflow.cli run --task <t> --thread-id {args.thread_id} "
                   f"--langgraph --pause-at <gate>")
+            return 1
+        # Validate the operator-supplied --gate against where the thread is ACTUALLY paused, so a
+        # resume can't approve a different gate than intended (args.gate was previously only logged).
+        paused_gate = (payloads[0] or {}).get("gate") if payloads else None
+        paused_alias = next((a for a, full in _GATE_ALIASES.items() if full == paused_gate), None)
+        if paused_alias and args.gate and args.gate != paused_alias:
+            print(f"[devflow] refusing to resume: thread '{args.thread_id}' is paused at the "
+                  f"'{paused_alias}' gate, not '{args.gate}'. Re-run with --gate {paused_alias}.")
             return 1
         print(f"[devflow] resume(langgraph) thread={args.thread_id} gate={args.gate} "
               f"decision={decision}")
@@ -227,6 +249,7 @@ def _resume_langgraph(args) -> int:
             _print_lg_pause(nxt2, payloads2, args.thread_id)
             return 0
         _print_outcome(app.get_state(cfg).values)   # rejected -> safe-stop report; approved -> done
+        _clear_fallback_ckpt(args.thread_id)        # completed -> drop any stale stdlib checkpoint
     return 0
 
 
@@ -261,6 +284,11 @@ def cmd_resume(args) -> int:
             return 1
     state["real_github"] = want_live
     start = state.get("paused_at_node") or GATE_TO_NODE.get(gate)
+    if start not in NODE_FUNCS:
+        # a checkpoint from before a node rename stores a stale node name -> fall back to the node for
+        # the gate the checkpoint ACTUALLY paused at (state['paused_at_gate']), not the operator's
+        # --gate (which could be wrong for this thread and resume it at the wrong gate).
+        start = GATE_TO_NODE.get(state.get("paused_at_gate")) or GATE_TO_NODE.get(gate)
     state["status"] = "running"
     app = build_graph(prefer_fallback=True)  # resume uses the stdlib runner's start_node support
     print(f"[devflow] resume thread={args.thread_id} gate={args.gate} decision={decision} "
