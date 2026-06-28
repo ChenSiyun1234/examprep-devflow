@@ -13,12 +13,17 @@ Two clearly separated pieces:
 
 from __future__ import annotations
 
+import calendar
 import json
 import re
 import shutil
 import subprocess
 import time
 from typing import Optional
+
+# a quota notice older than this no longer counts as a CURRENT rate-limit (so a stale notice can't
+# suppress a PR forever once Codex's limit has reset — codex_review_rounds has no seen-state/expiry).
+_QUOTA_ACTIVE_TTL_SECS = 3 * 3600
 
 
 # ======================================================================================
@@ -509,6 +514,7 @@ class ReadOnlyGitHub:
         Returns ``{rounds, reviewed_on_head, quota_limited}``."""
         reviews = self.get_pr_reviews(pr_number)
         comments = self.get_pr_comments(pr_number)
+        inline = self.get_pr_review_comments(pr_number)
         # a substantive review = non-quota Codex review with a body OR a meaningful state (an
         # empty-body COMMENTED/CHANGES_REQUESTED/APPROVED review whose content is in inline comments
         # still counts as a review round).
@@ -522,14 +528,34 @@ class ReadOnlyGitHub:
         # and re-recommended as never-reviewed.
         crevs = [c for c in comments if is_codex_author(c.get("author"))
                  and not is_codex_quota_notice(c.get("body")) and (c.get("body") or "").strip()]
+        # file-level INLINE review comments are Codex review coverage too (find_latest_codex_review counts
+        # them). Count them only when no review object/conversation comment already represents the round
+        # — inline always belongs to a review object, so a +1 floor when revs+crevs==0 avoids overcounting
+        # while ensuring inline-ONLY feedback isn't mis-scored as never-reviewed.
+        codex_inline = [c for c in inline if is_codex_author(c.get("author"))
+                        and not is_codex_quota_notice(c.get("body"))]
+        rounds = len(revs) + len(crevs)
+        if rounds == 0 and codex_inline:
+            rounds = 1
         on_head = bool(head) and any((r.get("commit_id") or "") == head for r in revs)
-        # quota notices arrive as PR COMMENTS (not reviews) — count those too so the ranker won't put a
-        # currently rate-limited PR at the front and ask Codex to review what it just declined.
+        # quota state from the latest Codex signal (review OR comment). If a real review and a quota
+        # notice SHARE the max one-second timestamp, treat the PR as rate-limited (ANY max-ts quota wins,
+        # like the watcher) — a review listed first must not hide a co-timestamped quota notice. But only
+        # while the notice is RECENT, so a stale quota doesn't suppress the PR forever after the reset.
         sigs = [(r.get("created_at"), r.get("body")) for r in reviews if is_codex_author(r.get("author"))]
         sigs += [(c.get("created_at"), c.get("body")) for c in comments if is_codex_author(c.get("author"))]
         sigs = [(t, b) for t, b in sigs if t]
-        quota_limited = is_codex_quota_notice(max(sigs, key=lambda x: x[0])[1]) if sigs else False
-        return {"rounds": len(revs) + len(crevs), "reviewed_on_head": on_head, "quota_limited": quota_limited}
+        quota_limited = False
+        if sigs:
+            max_ts = max(t for t, _ in sigs)
+            if any(is_codex_quota_notice(b) for t, b in sigs if t == max_ts):
+                try:
+                    age = calendar.timegm(time.gmtime()) - calendar.timegm(
+                        time.strptime(max_ts, "%Y-%m-%dT%H:%M:%SZ"))
+                except (ValueError, TypeError):
+                    age = 0
+                quota_limited = age < _QUOTA_ACTIVE_TTL_SECS
+        return {"rounds": rounds, "reviewed_on_head": on_head, "quota_limited": quota_limited}
 
 
 # ======================================================================================

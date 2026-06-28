@@ -10,9 +10,14 @@ import contextlib
 import io
 import json
 import re
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+# pin "now" close to the fixtures' quota timestamps so the quota TTL treats them as RECENT (active);
+# tests that exercise the stale-quota expiry set their own now.
+_FIXED_NOW = time.strptime("2026-02-01T00:30:00Z", "%Y-%m-%dT%H:%M:%SZ")
 
 from devflow import cli
 from devflow.tools import github_cli as G
@@ -141,6 +146,7 @@ class RankCodexBase(unittest.TestCase):
         buf = io.StringIO()
         with mock.patch.object(G.shutil, "which", return_value="gh"), \
              mock.patch.object(G.subprocess, "run", side_effect=fake), \
+             mock.patch.object(G.time, "gmtime", return_value=_FIXED_NOW), \
              contextlib.redirect_stdout(buf):
             rc = cli.cmd_rank_codex_reviews(args)
         return rc, buf.getvalue(), recorder
@@ -256,11 +262,47 @@ class TestRankCodexBehavior(RankCodexBase):
         # a PR "reviewed" only via a Codex conversation comment must score rounds>=1, not 0 (Codex r3)
         gh = G.ReadOnlyGitHub("o/r")
         with mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
              mock.patch.object(gh, "get_pr_comments", return_value=[
                  {"author": CODEX, "body": "Codex review: looks fine, one nit.",
                   "created_at": "2026-01-03T00:00:00Z"}]):
             cov = gh.codex_review_rounds(1)
         self.assertEqual(cov["rounds"], 1)
+
+    def test_inline_only_review_counts_as_a_round(self):
+        # Codex r? P2: feedback existing ONLY as file-level inline comments must score rounds>=1
+        gh = G.ReadOnlyGitHub("o/r")
+        with mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[
+                 {"author": CODEX, "body": "nit: rename this", "created_at": "2026-01-03T00:00:00Z"}]):
+            cov = gh.codex_review_rounds(1)
+        self.assertEqual(cov["rounds"], 1)
+
+    def test_co_timestamped_quota_marks_rate_limited(self):
+        # Codex r? P2: a quota notice sharing the latest second with a real review still rate-limits
+        gh = G.ReadOnlyGitHub("o/r")
+        with mock.patch.object(G.time, "gmtime", return_value=_FIXED_NOW), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_reviews", return_value=[
+                 {"author": CODEX, "body": "### Codex Review", "state": "COMMENTED",
+                  "created_at": "2026-02-01T00:00:00Z", "commit_id": "h"}]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[
+                 {"author": CODEX, "body": QUOTA_BODY, "created_at": "2026-02-01T00:00:00Z"}]):
+            cov = gh.codex_review_rounds(1)
+        self.assertTrue(cov["quota_limited"])     # same-second quota wins the tie
+
+    def test_stale_quota_no_longer_rate_limits(self):
+        # Codex r? P2: a quota notice older than the TTL must NOT suppress the PR forever
+        gh = G.ReadOnlyGitHub("o/r")
+        # "now" is ~5 months after the quota -> well past the 3h TTL
+        with mock.patch.object(G.time, "gmtime", return_value=_FIXED_NOW), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[
+                 {"author": CODEX, "body": QUOTA_BODY, "created_at": "2025-09-01T00:00:00Z"}]):
+            cov = gh.codex_review_rounds(1)
+        self.assertFalse(cov["quota_limited"])    # stale -> not currently rate-limited
 
     def test_json_output_parses_and_has_ranking(self):
         prs = [pr(1, "feat: a", "feat/a", 400, files=4), pr(2, "fix: b", "fix/b", 30, files=1)]
