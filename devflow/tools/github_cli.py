@@ -206,10 +206,11 @@ def is_codex_quota_notice(body: Optional[str]) -> bool:
     t = (body or "").strip().lower()
     if not t:
         return False
-    # Match ONLY the real notice opener at the very START ("You have reached your Codex usage limits …")
-    # — not the phrase after ANY short lead-in — so a real review that opens with a prefix while quoting
-    # the notice ("Bug: reached your Codex usage limits parsing…") isn't dropped as a rate-limit notice.
-    return t.startswith("you have reached your codex usage limits") and len(t) < 600
+    # Require the FULL notice opener including its "for code review(s)" context — so a real review that
+    # merely OPENS with "You have reached your Codex usage limits …" while discussing this matcher isn't
+    # dropped as a rate-limit notice. The canonical notice is "You have reached your Codex usage limits
+    # for code reviews."
+    return t.startswith("you have reached your codex usage limits for code review") and len(t) < 600
 
 
 # Tie-break for "latest" when GitHub's 1-second timestamps collide (Codex posts a review plus
@@ -389,10 +390,13 @@ class ReadOnlyGitHub:
         _max_ts = max((c.get("created_at") or "") for c in _basis)
         dedupe_key = _max_ts + "|" + ",".join(sorted(
             (c.get("url") or "") for c in _basis if (c.get("created_at") or "") == _max_ts))
-        # Legacy compatibility: the OLDER watcher stored the SINGLE winning `created_at|url` of the
-        # latest signal (the quota notice when it wins the tie). When a newer quota notice exists
-        # (quota_active), expose that exact single key so an upgraded seen file holding it is recognized
-        # as already-seen — no spurious re-alert of the older review just because quota is now excluded.
+        # Legacy compatibility (QUOTA case only): when a newer quota notice exists, the OLD watcher stored
+        # that quota notice's single `created_at|url`. Its timestamp is NEWER than the latest real review,
+        # so accepting it can't collide with a fresh baseline (which keys off the real review at an earlier
+        # second) -> safe. We deliberately do NOT expose the SAME-SECOND non-quota single key: it is
+        # identical to what a fresh baseline stores when only the review was present, so accepting it would
+        # SUPPRESS the intended same-second re-alert (a NEW lower-ranked comment posted in a seen review's
+        # second). That live feature outweighs a one-time, self-healing re-alert on a pre-upgrade seen file.
         legacy_dedupe_key = None
         if quota_active and real:
             overall_q = max((c for c in candidates if (c.get("created_at") or "") == _qmax), key=_key)

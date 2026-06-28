@@ -48,7 +48,8 @@ python -m devflow.cli read-pr    --pr 456     --repo owner/name
 
 # read-only Codex review watcher: scan OPEN PRs for NEW trusted-Codex feedback (deduped)
 python -m devflow.cli watch-codex-reviews --repo owner/name --init   # baseline first (no alert flood)
-python -m devflow.cli watch-codex-reviews --repo owner/name          # prints ACTIONABLE_/NO_NEW_CODEX_REVIEWS
+python -m devflow.cli watch-codex-reviews --repo owner/name          # first-line marker (precedence below)
+# ACTIONABLE_CODEX_REVIEWS > CODEX_WATCH_INCOMPLETE (read failed, retry) > CODEX_QUOTA_LIMITED (back off) > NO_NEW_CODEX_REVIEWS
 
 # advisory flow up to human approval; --real-github performs the guarded issue + @codex writes
 python -m devflow.cli run-docs-advisory --thread-id demo [--real-github --max-polls 6 --poll-seconds 30]

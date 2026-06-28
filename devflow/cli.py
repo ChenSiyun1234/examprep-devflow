@@ -403,10 +403,11 @@ def _save_codex_seen(path: str, data: dict, only_repo: str = None) -> None:
 
 
 def cmd_watch_codex_reviews(args) -> int:
-    """Read-only: scan OPEN PRs for NEW trusted-Codex reviews/comments, deduped against a local
-    seen file. Prints ACTIONABLE_CODEX_REVIEWS (with details) if anything is new, else
-    CODEX_QUOTA_LIMITED if Codex is only returning rate-limit notices (so a scheduler can back off),
-    else NO_NEW_CODEX_REVIEWS. Never edits code, comments, commits, pushes, or merges."""
+    """Read-only: scan OPEN PRs for NEW trusted-Codex reviews/comments, deduped against a local seen
+    file. First-line marker, in precedence order: ACTIONABLE_CODEX_REVIEWS (new feedback to act on) >
+    CODEX_WATCH_INCOMPLETE (a PR read failed — sweep incomplete, retry; don't trust a clean result) >
+    CODEX_QUOTA_LIMITED (only rate-limit notices — a scheduler can back off) > NO_NEW_CODEX_REVIEWS.
+    Never edits code, comments, commits, pushes, or merges."""
     rc = _require_gh()
     if rc:
         return rc

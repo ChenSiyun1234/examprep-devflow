@@ -229,6 +229,13 @@ class TestWatchCodexBehavior(WatchCodexBase):
         self.assertFalse(G.is_codex_quota_notice("Bug: reached your Codex usage limits parsing the body."))
         self.assertTrue(G.is_codex_quota_notice("You have reached your Codex usage limits for code reviews."))
 
+    def test_quota_notice_requires_code_review_context(self):
+        # Codex r6 P2: even the opener phrase, WITHOUT the "for code reviews" context, is not the notice
+        # (a real review can open by quoting the opener while discussing this matcher)
+        self.assertFalse(G.is_codex_quota_notice(
+            "You have reached your Codex usage limits parsing — the matcher needs the full opener."))
+        self.assertTrue(G.is_codex_quota_notice("You have reached your Codex usage limits for code reviews."))
+
     def test_init_surfaces_errored_prs_not_baselined(self):
         # --init must report PRs it could NOT baseline (else the next poll re-alerts on them) (Codex r1 #3)
         prs = [{"number": 1, "title": "A", "updatedAt": "z", "url": "p1"},
