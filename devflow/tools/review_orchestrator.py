@@ -32,7 +32,8 @@ from devflow.tools.github_cli import is_codex_author, parse_review_packet
 
 # ---- tuning constants (the load-bearing ones from the watcher; vestigial ones intentionally dropped) ----
 INFLIGHT_CAP = 3            # max concurrent outstanding "@codex review" requests recommended at once
-FORCE_MERGE_ROUNDS = 3      # after this many Codex rounds, a PR with ONLY minor (P3) findings is force-mergeable
+FORCE_MERGE_ROUNDS = 3      # after this many head reviews, a PR with ONLY minor (P3) findings is force-mergeable
+QUOTA_TTL_SECS = 3 * 3600   # a quota notice older than this no longer counts as rate-limited (window reset)
 
 STATE_DIR = os.path.join(tempfile.gettempdir(), "devflow_runs")
 STATE_PATH = os.path.join(STATE_DIR, "orchestrate_state.json")
@@ -51,8 +52,8 @@ _BADGE_RE = re.compile(r"\bP([123])\b")
 _BUGFIX_RE = re.compile(r"\b(fix|bugfix|hotfix|patch|typo|regression|revert)\b|修复|修正", re.I)
 _FEATURE_RE = re.compile(r"\b(feat|feature|add|adds|implement|support|introduce)\b|新增|实现|支持", re.I)
 _CLEAN_VERDICT_RE = re.compile(
-    r"did\s*n'?o?t find any (major )?(issues|problems|concerns)"
-    r"|no (major )?(issues|problems|concerns)( found| identified)?\b"
+    r"did\s*n'?o?t find any (major |blocking )?(issues|problems|concerns)"
+    r"|no (major |blocking )?(issues|problems|concerns)( found| identified)?\b"
     r"|looks good to me|\blgtm\b", re.I)
 _REVIEWED_COMMIT_RE = re.compile(r"reviewed commit:?\**\s*`?([0-9a-f]{7,40})", re.I)
 # Our outstanding ask is specifically a REVIEW request ("@codex review", "@codex please review") — a
@@ -156,14 +157,30 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
             sf = [r for r in head_real if (r.get("state") or "").upper() in ("CHANGES_REQUESTED", "APPROVED")]
             newest_sf = max(sf, key=lambda r: r.get("created_at") or "") if sf else None
             requested_changes = bool(newest_sf and (newest_sf.get("state") or "").upper() == "CHANGES_REQUESTED")
-            # the body must not indicate problems — but a NEGATED phrase ("no blocking issues found") is
-            # clean, so use devflow's negation-aware parser instead of a bare keyword match; also reject an
-            # explicit P1/P2/P3 badge in the summary body.
+            # require a POSITIVE clean signal — an explicit clean verdict OR Codex's standard "automated
+            # review suggestions" summary (whose findings live in inline comments, of which there are
+            # zero here). A review carrying free-text feedback ("please fix the null deref") is NEITHER,
+            # so it is NOT assumed clean just because the keyword parser didn't flag it as blocking.
             body = latest_real.get("body") or ""
+            positive_clean = is_clean_verdict(body) or "automated review suggestions" in body.lower()
             body_blocking = bool(parse_review_packet(body, latest_real.get("state")).get("blocking"))
-            clean_review = (findings_on_head == 0 and not requested_changes
+            clean_review = (findings_on_head == 0 and not requested_changes and positive_clean
                             and not body_blocking and not _BADGE_RE.search(body))
         clean = clean_comment or clean_review
+
+    # Codex sometimes delivers review FEEDBACK as a CONVERSATION COMMENT ("Reviewed commit: <sha>")
+    # rather than a review object. A non-clean such comment on the head is feedback to surface, so the PR
+    # isn't treated as UNREVIEWED (which would wrongly request another review / hold it in-flight).
+    comment_feedback_at = ""
+    if not merged and not clean:
+        for c in codex_comments:
+            mm = _REVIEWED_COMMIT_RE.search(c.get("body") or "")
+            if (mm and head[:7] == mm.group(1)[:7] and not is_quota(c.get("body"))
+                    and not is_clean_verdict(c.get("body"))):
+                comment_feedback_at = max(comment_feedback_at, c.get("created_at") or "")
+    has_head_review = bool(latest_real) or bool(comment_feedback_at)
+    if not latest_real and comment_feedback_at:
+        review_key = f"comment|{comment_feedback_at}"
 
     # our own outstanding "@codex review" REQUESTS (a non-Codex review/re-review ask, not just any
     # @codex command) -> awaiting iff newer than the latest substantive review on ANY commit. Comparing
@@ -202,7 +219,7 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
         "is_draft": bool(meta.get("is_draft")),
         "rounds": rounds, "rounds_on_head": len(head_real), "reviewed_on_head": on_head,
         "review_key": review_key,
-        "has_head_review": bool(latest_real), "awaiting": awaiting, "req_age": req_age, "pending": pending,
+        "has_head_review": has_head_review, "awaiting": awaiting, "req_age": req_age, "pending": pending,
         "latest_quota": latest_quota, "latest_sig_ts": latest_sig_ts, "responded_after_req": responded,
         "findings_on_head": findings_on_head, "clean": clean, "max_severity": max_severity,
         "priority": prio, "needs": needs,
@@ -215,6 +232,14 @@ def force_mergeable(c: dict) -> bool:
     force-merge) AND its latest review's findings are all minor (worst P3)."""
     return (c["findings_on_head"] > 0 and c["max_severity"] is not None
             and c["max_severity"] >= 3 and c.get("rounds_on_head", 0) >= FORCE_MERGE_ROUNDS)
+
+
+def _p3_converging(c: dict) -> bool:
+    """A head with ONLY minor (P3) findings that hasn't yet reached the force-merge round threshold: it
+    should keep getting RE-REVIEWED to accumulate head rounds toward force-merge (not sit in
+    findings_to_fix forever, since the single gate otherwise skips already-reviewed heads)."""
+    return (c["findings_on_head"] > 0 and c["max_severity"] is not None and c["max_severity"] >= 3
+            and c.get("rounds_on_head", 0) < FORCE_MERGE_ROUNDS and not c["clean"])
 
 
 def ok_to_merge(c: dict, converged: dict) -> bool:
@@ -298,14 +323,17 @@ def build_plan(classified: list, *, converged: dict, requested_head: dict, done,
     #    its findings); not merge-ready.
     for c in cls:
         if (c["num"] not in done and c["num"] not in retarget and not ok_to_merge(c, converged)
-                and c["has_head_review"] and c["review_key"]):
+                and c["has_head_review"] and c["review_key"] and not _p3_converging(c)):
             plan["findings_to_fix"].append(c["num"])
 
-    # 4) global rate-limit from the single globally-most-recent Codex signal (not per-PR).
+    # 4) global rate-limit from the single globally-most-recent Codex signal (not per-PR) — but ONLY if
+    #    that quota notice is still RECENT. Without a TTL a quota notice would suppress requests forever
+    #    (no new request -> no newer signal -> rate_limited never clears), deadlocking the gate.
     active = [c for c in cls if c["num"] not in done]
     sigs = [c for c in active if c.get("latest_sig_ts")]
     gl = max(sigs, key=lambda c: c["latest_sig_ts"]) if sigs else None
-    plan["rate_limited"] = bool(gl and gl["latest_quota"])
+    plan["rate_limited"] = bool(gl and gl["latest_quota"]
+                                and (now - parse_ts(gl["latest_sig_ts"])) < QUOTA_TTL_SECS)
 
     # 5) request review: the SINGLE gate for ALL @codex requests (initial AND re-review-after-fix),
     #    priority-ordered and capped at INFLIGHT_CAP. A post-fix PR is no longer is_inflight (head
@@ -318,9 +346,10 @@ def build_plan(classified: list, *, converged: dict, requested_head: dict, done,
             if len(in_flight) >= INFLIGHT_CAP:
                 break
             if (c["num"] in done or c["num"] in in_flight or c["num"] in retarget
-                    or is_inflight(c, requested_head)
-                    or c["needs"] <= 0 or c["reviewed_on_head"] or ok_to_merge(c, converged)):
-                continue   # merge-ready / must-retarget PRs never need another review request
+                    or is_inflight(c, requested_head) or c["needs"] <= 0 or ok_to_merge(c, converged)
+                    or (c["reviewed_on_head"] and not _p3_converging(c))):
+                continue   # merge-ready / must-retarget PRs never need another request; but a P3-only head
+                           # below the force-merge threshold IS re-requested so it can accumulate rounds
             plan["request_review"].append(c["num"])
             in_flight.append(c["num"])
             requested_head[str(c["num"])] = c["head"]   # tool-local: this request is for the current head

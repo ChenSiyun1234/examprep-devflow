@@ -86,7 +86,8 @@ class TestHelpers(unittest.TestCase):
 
 class TestClassify(unittest.TestCase):
     def test_clean_review_on_head(self):
-        s = signals(reviews=[review("Reviewed commit: aaaaaaa", "aaaaaaa", 1, "2026-01-01T00:00:00Z")])
+        s = signals(reviews=[review("Here are some automated review suggestions. Reviewed commit: aaaaaaa",
+                                    "aaaaaaa", 1, "2026-01-01T00:00:00Z")])
         c = classify(meta(head="aaaaaaa"), s)
         self.assertTrue(c["clean"])
         self.assertEqual(c["findings_on_head"], 0)
@@ -104,11 +105,31 @@ class TestClassify(unittest.TestCase):
     def test_reanchored_comment_from_older_review_not_counted(self):
         # latest review id=7 has ZERO own inline; the P2 inline belongs to OLDER review id=3 -> ignored
         s = signals(reviews=[review("old", "old", 3, "2026-01-01T00:00:00Z"),
-                             review("Reviewed commit: aaaaaaa", "aaaaaaa", 7, "2026-01-02T00:00:00Z")],
+                             review("Here are some automated review suggestions. Reviewed commit: aaaaaaa",
+                                    "aaaaaaa", 7, "2026-01-02T00:00:00Z")],
                     inline_=[inline("![P2 Badge] stale", 3, "2026-01-01T00:00:00Z")])
         c = classify(meta(head="aaaaaaa"), s)
         self.assertEqual(c["findings_on_head"], 0)
         self.assertTrue(c["clean"])                    # latest review has no own findings -> clean
+
+    def test_textual_feedback_review_not_clean(self):
+        # Codex r5 P2: a review with free-text feedback (no badge, no inline, not a clean verdict) is NOT
+        # clean — don't assume clean just because the keyword parser didn't flag it
+        s = signals(reviews=[review("please fix the null deref in line 12", "aaaaaaa", 1,
+                                    "2026-01-01T00:00:00Z")])
+        c = classify(meta(head="aaaaaaa"), s)
+        self.assertFalse(c["clean"])
+        self.assertTrue(c["has_head_review"])
+
+    def test_codex_comment_review_with_findings_is_head_feedback(self):
+        # Codex r5 P2: feedback delivered as a CONVERSATION COMMENT (Reviewed commit: head) counts as head
+        # feedback, so the PR isn't treated as unreviewed
+        s = signals(comments=[comment("Please address: the parser drops empty input. Reviewed commit: aaaaaaa",
+                                      "2026-01-02T00:00:00Z")])
+        c = classify(meta(head="aaaaaaa1234567"), s)
+        self.assertTrue(c["has_head_review"])
+        self.assertFalse(c["clean"])
+        self.assertTrue(c["review_key"])
 
     def test_clean_verdict_comment_matching_head(self):
         s = signals(comments=[comment("Codex Review: Didn't find any issues. Reviewed commit: aaaaaaa",
@@ -350,6 +371,29 @@ class TestBuildPlan(unittest.TestCase):
         plan = orch.build_plan(cs, converged={}, requested_head={}, done=[], now=1, merged_branches=set())
         self.assertTrue(plan["rate_limited"])
         self.assertEqual(plan["request_review"], [])
+
+    def test_stale_quota_notice_expires_and_requests_resume(self):
+        # Codex r5 P2: a quota notice older than the TTL must stop rate-limiting (else the gate deadlocks)
+        old = "2026-01-01T00:00:00Z"
+        stale_now = orch.parse_ts(old) + orch.QUOTA_TTL_SECS + 100
+        cs = [self._classified(num=1, head="h1", latest_sig_ts=old, latest_quota=True)]
+        plan = orch.build_plan(cs, converged={}, requested_head={}, done=[], now=stale_now, merged_branches=set())
+        self.assertFalse(plan["rate_limited"])
+        self.assertEqual(plan["request_review"], [1])    # requests resume after the window
+        # ...but a RECENT quota notice still rate-limits
+        plan2 = orch.build_plan([self._classified(num=1, head="h1", latest_sig_ts=old, latest_quota=True)],
+                                converged={}, requested_head={}, done=[], now=orch.parse_ts(old) + 60,
+                                merged_branches=set())
+        self.assertTrue(plan2["rate_limited"])
+
+    def test_p3_only_below_threshold_re_requested_not_stuck(self):
+        # Codex r5 P2: a P3-only head below the force-merge threshold is re-requested to accumulate head
+        # rounds, not stranded in findings_to_fix
+        cs = [self._classified(num=1, head="h1", reviewed_on_head=True, has_head_review=True, review_key="k",
+                               findings_on_head=2, max_severity=3, rounds_on_head=1)]
+        plan = orch.build_plan(cs, converged={}, requested_head={}, done=[], now=1, merged_branches=set())
+        self.assertEqual(plan["request_review"], [1])    # re-requested to accumulate rounds
+        self.assertEqual(plan["findings_to_fix"], [])    # not stuck
 
     def test_done_pr_excluded(self):
         cs = [self._classified(num=1, clean=True)]
