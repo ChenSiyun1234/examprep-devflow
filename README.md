@@ -50,12 +50,47 @@ python -m devflow.cli read-pr    --pr 456     --repo owner/name
 python -m devflow.cli watch-codex-reviews --repo owner/name --init   # baseline first (no alert flood)
 python -m devflow.cli watch-codex-reviews --repo owner/name          # prints ACTIONABLE_/NO_NEW_CODEX_REVIEWS
 
+# read-only cross-PR review ORCHESTRATOR: prints the recommended PLAN across the whole open-PR stack
+# (priority-ordered review requests behind a <=3 in-flight cap, merge-ready / force-mergeable PRs,
+# conflicts + stacked retargets to resolve, findings to fix, rate-limit). RECOMMENDS only — never merges.
+python -m devflow.cli orchestrate-reviews --repo owner/name          # prints ORCHESTRATION_PLAN/NO_ACTION_NEEDED
+python -m devflow.cli orchestrate-reviews --repo owner/name --json --exit-actionable
+
 # advisory flow up to human approval; --real-github performs the guarded issue + @codex writes
 python -m devflow.cli run-docs-advisory --thread-id demo [--real-github --max-polls 6 --poll-seconds 30]
 
 # after approving a gate, export an Implementation Packet to hand off to Claude Code (local files only)
 python -m devflow.cli run --task docs-advisory --thread-id demo --pause-at advisory
 python -m devflow.cli export-implementation-packet --thread-id demo --decision approved  # --gate optional
+```
+
+## Cross-PR review orchestrator (read-only planner)
+
+`watch-codex-reviews` tells you *which* PRs have new Codex feedback. `orchestrate-reviews` goes a step
+further and computes a **deterministic plan across the whole open-PR stack**:
+
+- **priority ranking** — unreviewed + big-feature PRs rank above well-reviewed or small-bugfix ones;
+- **request review** — the PRs to send `@codex review` to next, priority-ordered behind a **≤3
+  in-flight cap**. In-flight is **head-aware**: once a fix advances a PR's head, its old request goes
+  stale and the PR re-enters the queue (this is the single gate for *all* requests — initial and
+  re-review-after-a-fix, so you never hand-poke `@codex` out of band);
+- **mergeable / force-mergeable** — PRs Codex called clean (rule 1), or that have been through ≥3
+  rounds with only minor **P3** findings left (rule 2, severity read from Codex's own P1/P2/P3 badges);
+- **resolve conflict / retarget** — a merge-ready PR that conflicts with `main` (resolve by merging
+  `main` in — never force-push), or a stacked child whose base PR already merged (retarget to `main`);
+- **findings to fix** — PRs with P1/P2 (or early P3) findings still open;
+- **rate-limited** — whether Codex's globally-most-recent signal is a usage-limit notice.
+
+It is **strictly read-only and never mutates GitHub** — it *recommends*; a human (devflow's
+confirmation posture) or an external executor acts. There is no merge / comment / delete / push
+capability here, exactly as in the rest of devflow. The only side effect is the tool's own local
+tracking file (`<tmp>/devflow_runs/orchestrate_state.json`: head-aware in-flight + `--mark-converged`
+pins), which is not a GitHub artifact. Use `--dry` to compute the plan without touching that file.
+
+```bash
+python -m devflow.cli orchestrate-reviews --repo owner/name            # ORCHESTRATION_PLAN / NO_ACTION_NEEDED
+python -m devflow.cli orchestrate-reviews --repo owner/name --json     # + machine-readable plan
+python -m devflow.cli orchestrate-reviews --repo owner/name --mark-converged 7  # pin #7's head as clean
 ```
 
 ## Implementation Packet (handoff to Claude Code)

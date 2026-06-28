@@ -277,6 +277,18 @@ class ReadOnlyGitHub:
                         "updated_at": pr.get("updatedAt"), "url": pr.get("url")})
         return out
 
+    def list_prs(self, state: str = "open", limit: int = 50) -> list:
+        """List PRs in a given state (open/merged/closed/all) with their branches — read-only
+        (``gh pr list``). Returns ``[{number,title,state,head_ref,base_ref}]``. Used by the
+        orchestrator to plan the OPEN stack and detect stacked children whose (MERGED) base branch
+        still exists. ``limit`` is clamped to >= 1."""
+        repo = self.resolve_repo()
+        data = _gh_json(["pr", "list", "-R", repo, "--state", state,
+                         "--json", "number,title,state,headRefName,baseRefName",
+                         "--limit", str(max(1, int(limit)))]) or []
+        return [{"number": pr.get("number"), "title": pr.get("title"), "state": pr.get("state"),
+                 "head_ref": pr.get("headRefName"), "base_ref": pr.get("baseRefName")} for pr in data]
+
     # comments / reviews ----------------------------------------------------------------
     @staticmethod
     def _norm_comments(raw) -> list:
@@ -377,6 +389,48 @@ class ReadOnlyGitHub:
             "url": latest.get("url"),
             **packet,
         }
+
+    # orchestration reads (read-only; preserve fields the normalized helpers drop) ---------
+    def get_pr_meta(self, pr_number: int) -> dict:
+        """Read-only PR metadata + diffstat for orchestration: mergeable / base / head / draft +
+        additions/changedFiles (for the priority heuristic). Uses ``gh pr view --json`` — a read that
+        passes ``_assert_read_only``; NO mutation."""
+        repo = self.resolve_repo()
+        data = _gh_json(["pr", "view", str(int(pr_number)), "-R", repo, "--json",
+                         "number,title,state,mergeable,baseRefName,headRefName,headRefOid,isDraft,"
+                         "additions,deletions,changedFiles"]) or {}
+        return {
+            "number": data.get("number"), "title": data.get("title"), "state": data.get("state"),
+            "mergeable": data.get("mergeable"), "base_ref": data.get("baseRefName"),
+            "head_ref": data.get("headRefName"), "head_oid": data.get("headRefOid"),
+            "is_draft": data.get("isDraft"), "additions": int(data.get("additions") or 0),
+            "deletions": int(data.get("deletions") or 0),
+            "changed_files": int(data.get("changedFiles") or 0),
+        }
+
+    def get_pr_codex_signals(self, pr_number: int) -> dict:
+        """Read-only fetch of the three Codex review surfaces, PRESERVING the id / commit_id /
+        pull_request_review_id fields that the normalized helpers drop. The orchestrator needs them to
+        (a) match a review to the current head (commit_id) and (b) tie an inline finding to its OWN
+        review by ``pull_request_review_id`` so re-anchored comments from older reviews don't count.
+        Returns ``{reviews, inline, comments}``. All GET endpoints — passes ``_assert_read_only``."""
+        repo = self.resolve_repo()
+        n = int(pr_number)
+        reviews = [{
+            "author": (r.get("user") or {}).get("login"), "body": r.get("body") or "",
+            "state": r.get("state"), "created_at": r.get("submitted_at"),
+            "commit_id": r.get("commit_id"), "id": r.get("id"), "url": r.get("html_url"),
+        } for r in (_gh_json_paginated(f"repos/{repo}/pulls/{n}/reviews") or [])]
+        inline = [{
+            "author": (c.get("user") or {}).get("login"), "body": c.get("body") or "",
+            "created_at": c.get("created_at"), "commit_id": c.get("commit_id"),
+            "review_id": c.get("pull_request_review_id"), "id": c.get("id"), "url": c.get("html_url"),
+        } for c in (_gh_json_paginated(f"repos/{repo}/pulls/{n}/comments") or [])]
+        comments = [{
+            "author": (c.get("user") or {}).get("login"), "body": c.get("body") or "",
+            "created_at": c.get("created_at"), "id": c.get("id"), "url": c.get("html_url"),
+        } for c in (_gh_json_paginated(f"repos/{repo}/issues/{n}/comments") or [])]
+        return {"reviews": reviews, "inline": inline, "comments": comments}
 
 
 # ======================================================================================
