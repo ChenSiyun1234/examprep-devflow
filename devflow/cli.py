@@ -379,10 +379,13 @@ def _load_codex_seen(path: str) -> dict:
             if not isinstance(entry, dict):
                 continue
             cur = dst.get(pr)
-            # on a same-PR collision across case-variant slices, keep the NEWEST entry (by created_at),
-            # not whichever slice happens to appear later in the JSON — else a stale slice could overwrite
-            # a fresher dedupe key and re-alert already-seen feedback.
-            if cur is None or (entry.get("created_at") or "") >= (cur.get("created_at") or ""):
+            # on a same-PR collision across case-variant slices, keep the FRESHEST entry: strictly-newer
+            # created_at wins; on an equal timestamp prefer the FULLER key (more same-second URLs, e.g.
+            # 'T|review,inline' over 'T|review') so a stale partial key can't overwrite a fresher one and
+            # re-alert already-seen feedback.
+            e_ts, c_ts = (entry.get("created_at") or ""), ((cur or {}).get("created_at") or "")
+            e_key, c_key = (entry.get("key") or ""), ((cur or {}).get("key") or "")
+            if cur is None or e_ts > c_ts or (e_ts == c_ts and len(e_key) > len(c_key)):
                 dst[pr] = entry
     return out
 

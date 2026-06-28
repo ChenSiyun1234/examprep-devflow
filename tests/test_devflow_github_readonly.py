@@ -278,7 +278,7 @@ class TestParsingHardening(unittest.TestCase):
         # finding 1 (P2): the canonical notice opener IS a quota notice...
         from devflow.tools.github_cli import is_codex_quota_notice
         self.assertTrue(is_codex_quota_notice(
-            "You have reached your Codex usage limits for code reviews. See your limits in settings."))
+            "You have reached your Codex usage limits for code reviews. You can see your limits in settings."))
         # ...but a real review that merely MENTIONS the generic phrase must NOT be dropped as quota
         self.assertFalse(is_codex_quota_notice(
             "This predicate keys off 'usage limits for code reviews' too loosely; tighten it."))
@@ -316,7 +316,8 @@ class TestParsingHardening(unittest.TestCase):
         gh = ReadOnlyGitHub("o/r")
         reviews = [{"author": "codex", "body": "real review", "state": "COMMENTED",
                     "created_at": "2026-01-01T00:00:00Z", "url": "r1"}]
-        quota = [{"author": "codex", "body": "You have reached your Codex usage limits for code reviews.",
+        quota = [{"author": "codex", "body": "You have reached your Codex usage limits for code reviews. "
+                  "You can see your limits in the dashboard.",
                   "created_at": "2026-01-02T00:00:00Z", "url": "q1"}]              # newer quota notice
         with mock.patch.object(gh, "get_pr_comments", return_value=quota), \
              mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
@@ -325,6 +326,22 @@ class TestParsingHardening(unittest.TestCase):
         self.assertTrue(rev["quota_limited"])
         self.assertEqual(rev["dedupe_key"], "2026-01-01T00:00:00Z|r1")            # over the real review
         self.assertEqual(rev["legacy_dedupe_key"], "2026-01-02T00:00:00Z|q1")     # quota-inclusive legacy
+
+    def test_legacy_key_keys_off_quota_url_when_review_shares_timestamp(self):
+        # Codex r7 P2: when a quota notice and a real review share the latest second, the legacy key must
+        # key off the QUOTA url (not the higher-ranked review) so it can't suppress a same-second re-alert
+        gh = ReadOnlyGitHub("o/r")
+        reviews = [{"author": "codex", "body": "real review", "state": "COMMENTED",
+                    "created_at": "2026-01-02T00:00:00Z", "url": "rev_url"}]
+        quota = [{"author": "codex", "body": "You have reached your Codex usage limits for code reviews. "
+                  "You can see your limits in the dashboard.",
+                  "created_at": "2026-01-02T00:00:00Z", "url": "quota_url"}]       # SAME second as the review
+        with mock.patch.object(gh, "get_pr_comments", return_value=quota), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_reviews", return_value=reviews):
+            rev = gh.find_latest_codex_review(2)
+        self.assertTrue(rev["quota_limited"])
+        self.assertEqual(rev["legacy_dedupe_key"], "2026-01-02T00:00:00Z|quota_url")  # quota url, not rev_url
 
 
 if __name__ == "__main__":

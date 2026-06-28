@@ -206,11 +206,12 @@ def is_codex_quota_notice(body: Optional[str]) -> bool:
     t = (body or "").strip().lower()
     if not t:
         return False
-    # Require the FULL notice opener including its "for code review(s)" context — so a real review that
-    # merely OPENS with "You have reached your Codex usage limits …" while discussing this matcher isn't
-    # dropped as a rate-limit notice. The canonical notice is "You have reached your Codex usage limits
-    # for code reviews."
-    return t.startswith("you have reached your codex usage limits for code review") and len(t) < 600
+    # Require the COMPLETE bot-notice shape, not just the opening sentence: the canonical notice is
+    # "You have reached your Codex usage limits for code reviews. You can see your limits in the …".
+    # A real review that QUOTES only the first sentence and then gives actual feedback (still under 600
+    # chars) lacks the "you can see your limits" continuation, so it isn't dropped as a rate-limit notice.
+    return (t.startswith("you have reached your codex usage limits for code review")
+            and "you can see your limits" in t and len(t) < 600)
 
 
 # Tie-break for "latest" when GitHub's 1-second timestamps collide (Codex posts a review plus
@@ -399,8 +400,14 @@ class ReadOnlyGitHub:
         # second). That live feature outweighs a one-time, self-healing re-alert on a pre-upgrade seen file.
         legacy_dedupe_key = None
         if quota_active and real:
-            overall_q = max((c for c in candidates if (c.get("created_at") or "") == _qmax), key=_key)
-            legacy_dedupe_key = (_qmax or "") + "|" + (overall_q.get("url") or "")
+            # pick the QUOTA notice's url at _qmax — NOT a same-second review that outranks it. Keying off
+            # the quota url keeps the legacy key distinct from any review baseline, so it can't suppress a
+            # same-second inline-comment re-alert.
+            quota_at_qmax = [c for c in candidates if (c.get("created_at") or "") == _qmax
+                             and is_codex_quota_notice(c.get("body"))]
+            if quota_at_qmax:
+                overall_q = max(quota_at_qmax, key=_key)
+                legacy_dedupe_key = (_qmax or "") + "|" + (overall_q.get("url") or "")
         if not real:
             overall = max(candidates, key=_key)   # only quota notices from Codex -> signal, no review
             return {
