@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from typing import Optional
 
 PACKET_JSON_NAME = "implementation-packet.json"
@@ -152,11 +153,16 @@ def _is_safe_rel_path(p) -> bool:
     return not any(seg.strip() in ("", "..", ".") for seg in q.split("/"))
 
 
+# Collapses the FULL set of line/paragraph separators that Python treats as line breaks (str.split-
+# lines), not just \r\n — so untrusted text can't start a new Markdown block via U+2028/U+2029/NEL/etc.
+_LINE_BREAKS_RE = re.compile("[\r\n\u2028\u2029\x85\x0b\x0c]+")
+
+
 def _md_safe(s) -> str:
-    """Neutralize untrusted text for Markdown rendering: collapse newlines so the content can't
-    start a new block (e.g. a forged ``## Safety boundaries`` heading) and trim. The JSON packet
-    keeps the raw, faithful value — only the human-readable Markdown is sanitized."""
-    return str(s).replace("\r", " ").replace("\n", " ").strip()
+    """Neutralize untrusted text for Markdown rendering: collapse any line/paragraph separator so the
+    content can't start a new block (e.g. a forged ``## Safety boundaries`` heading) and trim. The
+    JSON packet keeps the raw, faithful value — only the human-readable Markdown is sanitized."""
+    return _LINE_BREAKS_RE.sub(" ", str(s)).strip()
 
 
 def build_packet(state: dict, gate: str, decision: str, generated_at: str) -> dict:
@@ -415,3 +421,338 @@ def write_packet(base_dir: str, thread_id: str, packet: dict,
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(markdown if markdown is not None else render_markdown(packet))
     return {"dir": pkt_dir, "slug": slug, "json_path": json_path, "md_path": md_path}
+
+
+# ======================================================================================
+# Manual (human-provided) scope packets — created directly from a Markdown scope file,
+# WITHOUT a prior advisory/checkpoint. Source is marked ``manual_human_scope`` so a generic
+# simulated-advisory packet can never be mistaken for a concrete, human-approved scope.
+# ======================================================================================
+MANUAL_SOURCE = "manual_human_scope"
+
+# Maps a scope-file heading (lower-cased, '#'s stripped) to a canonical section key. Defensive +
+# forgiving: unknown headings are ignored, missing sections default to empty.
+_SCOPE_SECTION_ALIASES = {
+    "task": "task",
+    "approved scope": "approved_scope", "scope": "approved_scope",
+    "tasks": "tasks", "tasks to perform": "tasks",
+    "files likely touched": "files", "files": "files",
+    "out of scope": "out_of_scope", "out-of-scope": "out_of_scope",
+    "checks to run": "checks", "checks": "checks",
+    "tests to run": "checks", "tests": "checks",
+    "tests/checks to run": "checks", "tests / checks to run": "checks",
+    "safety rules": "safety", "safety": "safety", "safety boundaries": "safety",
+}
+
+
+def parse_scope_markdown(text: str) -> dict:
+    """Parse a simple Markdown scope file into section lists. Intentionally tiny + defensive (no
+    Markdown library): top-level ``#`` headings start sections; bullet/plain lines become items;
+    unrecognized headings are ignored. Returns a dict with keys: task (str|None), approved_scope,
+    tasks, files, out_of_scope, checks, safety (all lists)."""
+    sections: dict = {}
+    unknown_headings: list = []
+    current = None
+    for raw in (text or "").splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("#"):
+            level = len(stripped) - len(stripped.lstrip("#"))
+            if level == 1:                         # only a top-level "# Heading" starts a section
+                heading = stripped.lstrip("#").strip()
+                current = _SCOPE_SECTION_ALIASES.get(heading.lower())
+                if current:
+                    sections.setdefault(current, [])
+                elif heading:
+                    unknown_headings.append(heading)   # surfaced (CLI warns) so its body isn't lost silently
+                continue
+            # a sub-heading ("## …") inside a section is CONTENT, not a section break — keep its text
+            stripped = stripped.lstrip("#").strip()
+        if current and stripped:
+            # strip a leading bullet marker: - , * , + , or •
+            item = (stripped[2:].strip()
+                    if len(stripped) > 1 and stripped[0] in "-*+•" and stripped[1] == " "
+                    else stripped)
+            if item:
+                sections.setdefault(current, []).append(item)
+    task_lines = sections.pop("task", [])
+    out = {"task": task_lines[0] if task_lines else None, "unknown_headings": unknown_headings}
+    for key in ("approved_scope", "tasks", "files", "out_of_scope", "checks", "safety"):
+        out[key] = sections.get(key, [])
+    return out
+
+
+# Allow-list of safe check-command prefixes. A manual scope's "# Checks to run" is promoted into the
+# packet's runnable instructions, so only well-known *validation* commands pass through verbatim; an
+# out-of-policy/destructive command (rm -rf, gh pr merge, git push, curl|sh, ...) is quarantined.
+_SAFE_CHECK_PREFIXES = (
+    "pytest", "py.test", "unittest",
+    "npm test", "npm run ", "yarn ", "pnpm ", "make ", "tox", "nox",
+    "ruff", "flake8", "pylint", "mypy", "black --check", "isort --check",
+    "pre-commit run", "cargo test", "cargo check", "go test", "go vet",
+)
+# `python -m <module>` is only a CHECK when <module> is a known validation runner — otherwise it can
+# launch arbitrary code (`python -m http.server`, `python -m pip`, `python -m venv`, `python -m this`).
+_PY_RUNNERS = ("python -m", "python3 -m", "py -m")
+_PY_VALIDATION_MODULES = {"pytest", "unittest", "mypy", "ruff", "flake8", "pylint", "black", "isort",
+                          "tox", "nox", "coverage", "doctest", "compileall", "pyflakes", "pytype", "bandit"}
+
+
+_SHELL_META = ("&&", "||", ";", "|", "&", "`", "$(", "${", ">", "<", "\n", "\r")
+# mutating / network sub-actions that must never be promoted into a "check" instruction, even under
+# an allow-listed prefix (e.g. "npm run deploy", "pip install …", "ruff --fix").
+# mutating / network sub-actions that must never be promoted into a "check" instruction, even under
+# an allow-listed prefix (e.g. "make push", "npm run deploy", "make clean", "npm start", "ruff --fix").
+# Word-bounded so a benign substring (e.g. "clean" in a test path "test_cleanup") doesn't trip it.
+_SIDE_EFFECT_RE = re.compile(
+    r"\b(install|uninstall|deploy|publish|release|upgrade|push|clean|delete|remove|merge|start|serve)\b",
+    re.I)
+_SIDE_EFFECT_FLAGS = ("--write", "--fix", "--apply")
+
+
+def _check_is_allowlisted(cmd) -> bool:
+    c = str(cmd).strip().lower()
+    # reject shell chaining/redirection/substitution so an allow-listed prefix can't smuggle a second
+    # command (e.g. "pytest && gh pr merge", "python -m x; rm -rf .", "make $(curl ...)").
+    if any(meta in c for meta in _SHELL_META):
+        return False
+    if _SIDE_EFFECT_RE.search(c) or any(f in c for f in _SIDE_EFFECT_FLAGS):  # mutating sub-action -> not a check
+        return False
+    # 'python -m <module>': only a check if <module> is a known validation runner (not http.server/pip/venv).
+    for runner in _PY_RUNNERS:
+        if c == runner or c.startswith(runner + " "):
+            rest = c[len(runner):].strip()
+            return bool(rest) and rest.split()[0] in _PY_VALIDATION_MODULES
+    # exact match OR prefix followed by a space — a bare-word boundary so "pytestfoo" / "makefile…"
+    # can't sneak through a startswith on "pytest" / "make".
+    return any(c == p.strip() or c.startswith(p.strip() + " ") for p in _SAFE_CHECK_PREFIXES)
+
+
+# Words that PERMIT/override an action paired with a protected action = a scope rule trying to weaken
+# a hard boundary (e.g. "commits are allowed", "ignore the no-push rule"). Such rules are quarantined.
+_SAFETY_PERMISSIVE = (
+    "allow", "allowed", "ok to", "okay to", "fine to", "is fine", "are fine", "is ok", "is okay",
+    "are ok", "can ", "may ", "enable", "permit", "permitted", "ignore", "skip", "disable",
+    "override", "no need", "no restriction", "no limit", "not required", "no requirement",
+    "not necessary", "not mandatory", "optional", "feel free", "you can", "it's ok",
+    "without restriction", "go ahead",
+)
+# Verbs/markers that make a protected-action rule a genuine PROHIBITION (it reinforces a boundary)
+# rather than a permission. Permissive markers are checked FIRST, so "no restriction on pushing" is
+# caught as permissive before "no" here would (mis)read it as prohibitive.
+_SAFETY_PROHIBITIVE_RE = re.compile(
+    r"\b(do\s+not|don'?t|never|no|not|disallow|must\s+not|may\s+not|cannot|can'?t|avoid|forbid|"
+    r"prohibit|refuse|reject)\b", re.I)
+# Protected git/PR/secret actions, with common INFLECTIONS (commit/commits/committed/committing,
+# push/pushes, merge/merging, PR/PRs, …) — a permissive rule mentioning any of these would weaken a
+# hard boundary. Inflection-aware so "commits are allowed" / "pushes are fine" are caught, not just
+# the bare singular.
+_SAFETY_PROTECTED_RE = re.compile(
+    r"\b(commit(s|ted|ting)?|push(es|ed|ing)?|merg(e|es|ed|ing)|branch(es)?|delet(e|es|ed|ing)|"
+    r"force[-\s]?push(es|ed|ing)?|secrets?|api[-\s]?keys?|tokens?|destructive|shell|"
+    r"tests?|checks?|refactor(s|ing|ed)?|rewrite(s|ing)?|scope|"          # non-git hard boundaries too
+    r"prs?|pull[-\s]?requests?)\b", re.I)
+
+
+def _scope_safety_rule_conflicts(rule) -> bool:
+    """True if a scope-file safety rule must NOT be appended to the canonical boundaries. It is
+    PROTECTED-ACTION-driven: any rule naming a protected action (push/merge/commit/branch-delete/
+    force-push/secret/PR…) is quarantined UNLESS it is clearly PROHIBITIVE. So permissive overrides
+    ('push to origin when done', 'merging is ok', 'you can push') AND ambiguous protected-action rules
+    are quarantined, while genuine prohibitions ('do not push', 'never delete branches', 'no secrets')
+    are kept. When intent is unclear, quarantine — the canonical SAFETY_BOUNDARIES still apply."""
+    low = str(rule).lower()
+    if not _SAFETY_PROTECTED_RE.search(low):
+        return False                                       # not about a protected action -> keep as-is
+    if any(w in (" " + low + " ") for w in _SAFETY_PERMISSIVE):
+        return True                                        # explicit permission -> quarantine
+    if _SAFETY_PROHIBITIVE_RE.search(low):
+        return False                                       # explicit prohibition -> keep (reinforces boundary)
+    return True                                            # protected action, ambiguous intent -> quarantine
+
+
+# A task line that IS itself a prohibited git/PR action (e.g. "merge the PR", "git push",
+# "open a pull request") must not be handed to Claude Code as work — it's quarantined to out-of-scope.
+_PROHIBITED_TASK_RE = re.compile(
+    r"\b("
+    r"git\s+(commit|push|merge|rebase|cherry-?pick)"                       # git <subcommand> (command form)
+    r"|git\s+branch\s+(-[dD]\b|--delete\b)"                                # git branch -D / -d / --delete
+    r"|gh\s+pr\s+(merge|create|ready|review|close)"                        # gh pr <subcommand>
+    r"|gh\s+(release|workflow|run|api)\b"                                  # gh release/workflow/run/api
+    r"|push(es|ing)?\s+(\w+\s+){0,2}(branch|changes|commits?|code|origin|remote|upstream)"
+    r"|force[-\s]?push(es|ing)?"
+    r"|(?<!pre-)commit(s|ting)?\b"                                         # bare 'commit' (NOT 'pre-commit')
+    r"|merg(e|es|ing)\s+(the\s+|this\s+)?(pr|pull[-\s]request|branch)"
+    r"|(open|create|raise|submit)\s+(a\s+|the\s+)?(pr|pull[-\s]request)"
+    r"|delete\s+(the\s+)?branch|rebase|cherry[-\s]?pick"
+    r"|github\s*actions|actions?\s+workflow|workflow\s+(file|yaml|yml)"    # GitHub Actions (boundary: never add)
+    r"|ci\s+(workflow|pipeline)"
+    r")", re.I)
+
+
+# a workflow path can appear bare in a task (".github/workflows/...") where the leading \b of the
+# alternation above can't anchor (the path starts with '.'); match it independently.
+_WORKFLOW_PATH_RE = re.compile(r"\.github[/\\]workflows", re.I)
+
+
+def _task_is_prohibited(t) -> bool:
+    s = str(t)
+    return bool(_PROHIBITED_TASK_RE.search(s)) or bool(_WORKFLOW_PATH_RE.search(s))
+
+
+def _is_bare_unsafe_path(t) -> bool:
+    """True if a task/scope item is ITSELF a bare unsafe path ('/etc/passwd', '../x.py', 'C:\\…')
+    rather than prose — so it is never handed off as an edit target. Path-SHAPED only: ordinary prose
+    (which also fails _is_safe_rel_path on a '%' or 'A:' substring) is NOT quarantined."""
+    s = str(t).strip()
+    looks_path = ("/" in s or "\\" in s or s.startswith(("~", "..", "$", "%"))
+                  or (len(s) >= 3 and s[0].isalpha() and s[1] == ":" and s[2] in "\\/"))
+    return bool(s) and looks_path and not _is_safe_rel_path(s)
+
+
+def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
+                        scope_file: Optional[str] = None) -> dict:
+    """Build an Implementation Packet from explicit human-provided scope (source = manual_human_scope).
+
+    The canonical SAFETY_BOUNDARIES are ALWAYS enforced — an incomplete scope file can add rules but
+    can never remove them. File paths are filtered (no absolute/``..``) just like the export path."""
+    scope = scope if isinstance(scope, dict) else {}
+    # coerce every section to a list (a hand-written/foreign scope dict may carry None or a bare str)
+    approved_scope = [s for s in _as_list(scope.get("approved_scope")) if str(s).strip()]
+    tasks = [t for t in _as_list(scope.get("tasks")) if str(t).strip()] or list(approved_scope)
+    # quarantine any scope item that IS a prohibited git/PR action — it must never be handed off as work;
+    # sanitize a 'PATH: detail' unsafe-path prefix out of the kept items so a manual scope can't direct
+    # edits outside the repo (mirrors how advisory-derived tasks are sanitized).
+    prohibited = [t for t in (tasks + approved_scope) if _task_is_prohibited(t)]
+    unsafe_tasks = [t for t in (tasks + approved_scope)
+                    if not _task_is_prohibited(t) and _is_bare_unsafe_path(t)]
+    _bad = lambda t: _task_is_prohibited(t) or _is_bare_unsafe_path(t)
+    tasks = [_strip_unsafe_path_prefix(str(t)) for t in tasks if not _bad(t)]
+    approved_scope = [_strip_unsafe_path_prefix(str(s)) for s in approved_scope if not _bad(s)]
+    # if an explicit Tasks section existed but EVERY entry was quarantined, fall back to the (filtered)
+    # approved scope as tasks — never emit an empty 'do ONLY the listed tasks' handoff.
+    if not tasks and approved_scope:
+        tasks = list(approved_scope)
+
+    raw_files = [str(f) for f in _as_list(scope.get("files")) if str(f).strip()]
+    # devflow must never add/modify GitHub Actions — a workflow file is repo-relative (passes the
+    # path filter) but is quarantined as an edit target.
+    def _is_workflow(p):
+        # match the workflows DIRECTORY itself (bare, no trailing slash) AND any file under it, so a
+        # bare ".github/workflows" target can't slip past a trailing-slash-only check.
+        pn = p.replace("\\", "/").lower()
+        return pn.rstrip("/").endswith(".github/workflows") or ".github/workflows/" in pn
+    files = sorted({p for p in raw_files if _is_safe_rel_path(p) and not _is_workflow(p)})
+    unsafe = sorted({p for p in raw_files if not _is_safe_rel_path(p)})
+    workflows = sorted({p for p in raw_files if _is_safe_rel_path(p) and _is_workflow(p)})
+
+    out_of_scope = [str(s) for s in _as_list(scope.get("out_of_scope")) if str(s).strip()]
+    out_of_scope += [f"(ignored unsafe path — outside repo, do NOT touch) {p}" for p in unsafe]
+    out_of_scope += [f"(ignored target — GitHub Actions workflow, do NOT touch) {p}" for p in workflows]
+    out_of_scope += [f"(ignored task — prohibited git/PR action, do NOT perform) {t}" for t in prohibited]
+    out_of_scope += [f"(ignored task — unsafe path outside repo, do NOT touch) {t}" for t in unsafe_tasks]
+
+    # Checks: only allow-listed validation commands are promoted into runnable instructions; an
+    # out-of-policy/destructive command is quarantined (kept visible, but NOT a runnable instruction).
+    raw_checks = [str(c).strip() for c in _as_list(scope.get("checks")) if str(c).strip()]
+    safe_checks = [c for c in raw_checks if _check_is_allowlisted(c)]
+    rejected_checks = [c for c in raw_checks if not _check_is_allowlisted(c)]
+    tests = safe_checks or ["python -m unittest discover -s tests"]
+    out_of_scope += [f"(ignored check — not auto-run; needs human approval) {c}" for c in rejected_checks]
+
+    # Safety: canonical boundaries are never removable; a scope rule that tries to PERMIT a hard
+    # prohibition is quarantined (it cannot weaken the boundaries), only genuine *extra* rules are added.
+    safety = list(SAFETY_BOUNDARIES)
+    rejected_rules = []
+    for r in _as_list(scope.get("safety")):
+        r = str(r).strip()
+        if not r:
+            continue
+        if _scope_safety_rule_conflicts(r):
+            rejected_rules.append(r)
+        elif r not in safety:
+            safety.append(r)
+    out_of_scope += [f"(ignored scope safety rule — cannot weaken hard boundaries) {r}"
+                     for r in rejected_rules]
+
+    # Relax the file clause when no safe files are listed, so an otherwise valid packet (tasks but no
+    # files, or all files filtered) isn't made impossible by "touch only the listed files".
+    file_clause = ("touch only the listed files, " if files
+                   else "keep changes minimal and scoped to the tasks, ")
+    suggested = (f"Implement the manual-scope Implementation Packet for task \"{task}\" "
+                 f"(thread {thread_id}). Do ONLY the listed tasks, {file_clause}run the listed "
+                 f"checks and paste the real output; do not commit/push/merge; ask before "
+                 f"expanding scope.")
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source": MANUAL_SOURCE,
+        "metadata": {
+            "thread_id": thread_id,
+            "task": task,
+            "repo": repo,
+            "generated_at": generated_at,
+            "source": MANUAL_SOURCE,
+            "scope_file": scope_file,
+        },
+        "approval": {
+            "source": MANUAL_SOURCE,
+            "approved_scope": approved_scope,
+        },
+        "implementation_instructions": {
+            "tasks": tasks,
+            "files_likely_touched": files,
+            "out_of_scope": out_of_scope,
+            "tests_to_run": tests,
+            "safety_rules": safety,
+        },
+        "safety_boundaries": safety,
+        "suggested_prompt": suggested,
+    }
+
+
+def render_manual_markdown(packet: dict) -> str:
+    """Render a manual-scope packet as Markdown. Untrusted scope text is sanitized via ``_md_safe``."""
+    m = packet.get("metadata", {})
+    ap = packet.get("approval", {})
+    ii = packet.get("implementation_instructions", {})
+    out = [
+        "# Implementation Packet (manual human scope)",
+        "",
+        f"> **Source: `{packet.get('source')}`** — created from a human-provided scope file, NOT a "
+        "Codex advisory. devflow does not edit repository files itself; Claude Code implements within "
+        "the scope and safety boundaries below.",
+        "",
+        "## Metadata",
+        f"- thread_id: `{_md_safe(m.get('thread_id'))}`",
+        f"- task: {_md_safe(m.get('task'))}",
+        f"- repo: {_md_safe(m.get('repo'))}",
+        f"- generated_at: {_md_safe(m.get('generated_at'))}",
+        f"- source: {_md_safe(m.get('source'))}",
+    ]
+    if m.get("scope_file"):
+        out.append(f"- scope_file: {_md_safe(m.get('scope_file'))}")
+    out += [
+        "",
+        "## Approved scope",
+        _md_list(ap.get("approved_scope")),
+        "",
+        "## Tasks",
+        _md_list(ii.get("tasks")),
+        "",
+        "## Files likely touched",
+        _md_list(ii.get("files_likely_touched")),
+        "",
+        "## Out of scope",
+        _md_list(ii.get("out_of_scope")),
+        "",
+        "## Tests / checks to run",
+        _md_list(ii.get("tests_to_run")),
+        "",
+        "## Safety boundaries",
+        _md_list(packet.get("safety_boundaries")),
+        "",
+        "## Suggested Claude Code prompt",
+        _md_safe(packet.get("suggested_prompt")),
+        "",
+    ]
+    return "\n".join(out)
