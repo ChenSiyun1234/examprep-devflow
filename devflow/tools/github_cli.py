@@ -294,6 +294,34 @@ class ReadOnlyGitHub:
                         "updated_at": pr.get("updatedAt"), "url": pr.get("url")})
         return out
 
+    def list_prs(self, state: str = "open", limit: int = 50) -> list:
+        """List PRs in a given state (open/merged/closed/all) with their branches — read-only
+        (``gh pr list``). Returns ``[{number,title,state,head_ref,base_ref}]``. Used by the
+        orchestrator to plan the OPEN stack and detect stacked children whose (MERGED) base branch
+        still exists. ``limit`` is clamped to >= 1."""
+        repo = self.resolve_repo()
+        data = _gh_json(["pr", "list", "-R", repo, "--state", state,
+                         "--json", "number,title,state,headRefName,baseRefName",
+                         "--limit", str(max(1, int(limit)))]) or []
+        return [{"number": pr.get("number"), "title": pr.get("title"), "state": pr.get("state"),
+                 "head_ref": pr.get("headRefName"), "base_ref": pr.get("baseRefName")} for pr in data]
+
+    def merged_heads(self, branches) -> dict:
+        """Of the given branch names, return ``{branch: base_ref}`` for those that are the HEAD of a MERGED
+        PR (read-only). Used to detect a stacked child whose parent PR already merged WITHOUT scanning the
+        whole merged history (a ``--state merged --limit N`` window can miss an OLDER merged parent). One
+        targeted ``gh pr list --head <branch>`` per candidate branch — bounded by the (small) set of stack
+        bases. The base_ref lets a child retarget to its merged parent's ACTUAL base (which may itself not
+        be the default branch in a multi-level stack), not blindly to the default branch."""
+        repo = self.resolve_repo()
+        out = {}
+        for b in {x for x in branches if x}:
+            data = _gh_json(["pr", "list", "-R", repo, "--state", "merged", "--head", str(b),
+                             "--json", "number,baseRefName", "--limit", "1"]) or []
+            if data:
+                out[b] = data[0].get("baseRefName")
+        return out
+
     # comments / reviews ----------------------------------------------------------------
     @staticmethod
     def _norm_comments(raw) -> list:
@@ -482,6 +510,48 @@ class ReadOnlyGitHub:
             "has_review": True,
             **packet,
         }
+
+    # orchestration reads (read-only; preserve fields the normalized helpers drop) ---------
+    def get_pr_meta(self, pr_number: int) -> dict:
+        """Read-only PR metadata + diffstat for orchestration: mergeable / base / head / draft +
+        additions/changedFiles (for the priority heuristic). Uses ``gh pr view --json`` — a read that
+        passes ``_assert_read_only``; NO mutation."""
+        repo = self.resolve_repo()
+        data = _gh_json(["pr", "view", str(int(pr_number)), "-R", repo, "--json",
+                         "number,title,state,mergeable,baseRefName,headRefName,headRefOid,isDraft,"
+                         "additions,deletions,changedFiles"]) or {}
+        return {
+            "number": data.get("number"), "title": data.get("title"), "state": data.get("state"),
+            "mergeable": data.get("mergeable"), "base_ref": data.get("baseRefName"),
+            "head_ref": data.get("headRefName"), "head_oid": data.get("headRefOid"),
+            "is_draft": data.get("isDraft"), "additions": int(data.get("additions") or 0),
+            "deletions": int(data.get("deletions") or 0),
+            "changed_files": int(data.get("changedFiles") or 0),
+        }
+
+    def get_pr_codex_signals(self, pr_number: int) -> dict:
+        """Read-only fetch of the three Codex review surfaces, PRESERVING the id / commit_id /
+        pull_request_review_id fields that the normalized helpers drop. The orchestrator needs them to
+        (a) match a review to the current head (commit_id) and (b) tie an inline finding to its OWN
+        review by ``pull_request_review_id`` so re-anchored comments from older reviews don't count.
+        Returns ``{reviews, inline, comments}``. All GET endpoints — passes ``_assert_read_only``."""
+        repo = self.resolve_repo()
+        n = int(pr_number)
+        reviews = [{
+            "author": (r.get("user") or {}).get("login"), "body": r.get("body") or "",
+            "state": r.get("state"), "created_at": r.get("submitted_at"),
+            "commit_id": r.get("commit_id"), "id": r.get("id"), "url": r.get("html_url"),
+        } for r in (_gh_json_paginated(f"repos/{repo}/pulls/{n}/reviews") or [])]
+        inline = [{
+            "author": (c.get("user") or {}).get("login"), "body": c.get("body") or "",
+            "created_at": c.get("created_at"), "commit_id": c.get("commit_id"),
+            "review_id": c.get("pull_request_review_id"), "id": c.get("id"), "url": c.get("html_url"),
+        } for c in (_gh_json_paginated(f"repos/{repo}/pulls/{n}/comments") or [])]
+        comments = [{
+            "author": (c.get("user") or {}).get("login"), "body": c.get("body") or "",
+            "created_at": c.get("created_at"), "id": c.get("id"), "url": c.get("html_url"),
+        } for c in (_gh_json_paginated(f"repos/{repo}/issues/{n}/comments") or [])]
+        return {"reviews": reviews, "inline": inline, "comments": comments}
 
 
 # ======================================================================================

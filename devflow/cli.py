@@ -36,6 +36,7 @@ from devflow.tools.packet_writer import (
     build_packet, write_packet, PacketError,
     parse_scope_markdown, build_manual_packet, render_manual_markdown,
 )
+from devflow.tools import review_orchestrator as orch
 from devflow._compat import HAS_LANGGRAPH
 
 # Windows GBK consoles otherwise mangle the report box-drawing / CJK text.
@@ -565,6 +566,103 @@ def cmd_watch_codex_reviews(args) -> int:
     return 0
 
 
+# ---- read-only cross-PR review ORCHESTRATOR (planner): recommends actions, never mutates GitHub ----
+def _print_plan_section(label: str, prs) -> None:
+    if prs:
+        print(f"  {label}: " + ", ".join(f"#{n}" for n in prs))
+
+
+def cmd_orchestrate_reviews(args) -> int:
+    """Read-only: compute the cross-PR Codex-review orchestration PLAN — a priority ranking plus who to
+    request review from (priority-ordered, head-aware, capped at 3 in-flight), which PRs are mergeable /
+    force-mergeable (>=3 rounds + only-minor P3) / need a CONFLICT resolved / need a stacked RETARGET to
+    main, which still have findings to fix, and whether Codex is rate-limited. Prints ORCHESTRATION_PLAN
+    (with the plan) or NO_ACTION_NEEDED.
+
+    RECOMMENDS only: it NEVER comments, merges, deletes, retargets, or pushes — execution stays with the
+    human (devflow's confirmation posture). The single side effect is the tool's OWN local tracking file
+    (head-aware in-flight + converged pins), which is NOT a GitHub artifact."""
+    rc = _require_gh()
+    if rc:
+        return rc
+    gh = ReadOnlyGitHub(args.repo)
+    now = int(datetime.now(timezone.utc).timestamp())
+    errors = []
+    try:
+        repo = gh.resolve_repo()
+    except GhError as e:
+        print(f"[devflow] gh error: {e}")
+        return 1
+    # default tracking state is namespaced by repo so a pin can't leak across forks/copies with
+    # overlapping PR numbers; an explicit --state-file always wins.
+    state_path = args.state_file or orch.state_path_for_repo(repo)
+    state = orch.load_state(state_path)
+    try:
+        default_branch = gh.get_repo_info().get("default_branch") or "main"   # not hardcoded 'main'
+        open_prs = gh.list_prs(state="open", limit=args.limit)   # --limit bounds the OPEN stack we inspect
+        # --mark-converged: pin the CURRENT head of the named PR(s) as agent-verified-clean (merge rule 3).
+        for num in (args.mark_converged or []):
+            meta = gh.get_pr_meta(num)
+            if meta.get("head_oid"):
+                state["converged"][str(num)] = meta["head_oid"]
+        classified = []
+        for p in open_prs:
+            num = p.get("number")
+            if num is None:
+                continue
+            try:
+                meta = gh.get_pr_meta(num)
+                signals = gh.get_pr_codex_signals(num)
+            except GhError as e:                     # one PR failing must not abort the whole sweep
+                errors.append((num, str(e)))
+                continue
+            classified.append(orch.classify(meta, signals, converged=state["converged"],
+                                             requested_head=state["requested_head"], now=now))
+        # detect merged parents by TARGETED lookup of exactly the stack's non-default base branches, so an
+        # OLDER merged parent isn't missed by a --limit-sized window over all merged PRs. EXCLUDE a base
+        # that is still the head of an OPEN PR (a live parent) — its branch name may also belong to an
+        # older MERGED PR, and that historical match must NOT trigger a spurious retarget of the child.
+        open_heads = {p.get("head_ref") for p in open_prs if p.get("head_ref")}
+        candidate_bases = {p.get("base_ref") for p in open_prs
+                           if p.get("base_ref") and p.get("base_ref") != default_branch
+                           and p.get("base_ref") not in open_heads}
+        merged_branches = gh.merged_heads(candidate_bases)
+    except GhError as e:
+        print(f"[devflow] gh error: {e}")
+        return 1
+
+    plan = orch.build_plan(classified, merged_branches=merged_branches, converged=state["converged"],
+                           requested_head=state["requested_head"], done=state["done"], now=now,
+                           default_branch=default_branch)
+    if not args.dry:                                  # persist head-aware in-flight tracking (tool state)
+        orch.save_state(state, state_path)
+
+    actionable = orch.has_actions(plan)
+    print("ORCHESTRATION_PLAN" if actionable else "NO_ACTION_NEEDED")
+    print(f"[orchestrate] repo={repo} open_prs={len(open_prs)} "
+          f"{'RATE-LIMITED' if plan['rate_limited'] else 'codex-ok'} (read-only; state={state_path})")
+    for e_num, e_msg in errors:
+        print(f"  ! PR #{e_num}: gh error: {e_msg}")
+    _print_plan_section("REQUEST REVIEW (priority-ordered, <=3 in-flight)", plan["request_review"])
+    _print_plan_section("MERGEABLE now (clean / converged)", plan["mergeable_now"])
+    _print_plan_section("FORCE-MERGEABLE (>=3 rounds, only-minor P3)", plan["force_mergeable"])
+    _print_plan_section("READY then MERGE (un-draft first)", plan["ready_then_merge"])
+    _print_plan_section(f"RESOLVE CONFLICT (merge {default_branch} in; never force-push)", plan["needs_conflict"])
+    if plan["needs_retarget"]:
+        targets = plan.get("retarget_to") or {}
+        print("  RETARGET (parent PR merged): " + ", ".join(
+            f"#{n}->{targets.get(str(n), default_branch)}" for n in plan["needs_retarget"]))
+    _print_plan_section("MERGEABILITY PENDING (GitHub still computing; re-run)", plan["mergeable_unknown"])
+    _print_plan_section("FINDINGS to fix (P1/P2 or early P3)", plan["findings_to_fix"])
+    if args.json:
+        print(json.dumps({"repo": repo, "marker": "ORCHESTRATION_PLAN" if actionable else "NO_ACTION_NEEDED",
+                          "plan": plan, "errors": [{"pr": n, "error": m} for n, m in errors]},
+                         ensure_ascii=False, indent=2))
+    if args.exit_actionable and actionable:
+        return 10   # opt-in: a distinct nonzero so shells can branch; default stays 0
+    return 0
+
+
 # ---- Implementation Packet export (safe handoff to Claude Code; NO repo edits, NO gh writes) ----
 PACKETS_DIR = os.path.join(".devflow", "packets")   # tool-state, gitignored — not tracked product data
 
@@ -797,6 +895,24 @@ def build_parser() -> argparse.ArgumentParser:
     wc.add_argument("--body-chars", type=_nonneg_int, default=600,
                     help="truncate each Codex item body preview to N chars (default 600)")
     wc.set_defaults(func=cmd_watch_codex_reviews)
+
+    oc = sub.add_parser("orchestrate-reviews",
+                        help="read-only: compute the cross-PR Codex-review PLAN (priority/requests/"
+                             "merge-readiness/conflicts) — RECOMMENDS only, never mutates GitHub")
+    oc.add_argument("--repo", default=None, help="owner/name (default: current repo)")
+    oc.add_argument("--limit", type=_pos_int, default=50,
+                    help="max PRs to inspect (must be >= 1)")
+    oc.add_argument("--state-file", default=None,
+                    help="local tracking state (default: <tmp>/devflow_runs/orchestrate_state.json)")
+    oc.add_argument("--mark-converged", type=int, action="append", metavar="PR",
+                    help="pin a PR's CURRENT head as agent-verified-clean (merge rule 3); repeatable")
+    oc.add_argument("--dry", action="store_true",
+                    help="compute the plan WITHOUT persisting the local tracking state")
+    oc.add_argument("--json", action="store_true",
+                    help="also print a machine-readable JSON plan")
+    oc.add_argument("--exit-actionable", action="store_true",
+                    help="return exit code 10 (not 0) when the plan recommends any action")
+    oc.set_defaults(func=cmd_orchestrate_reviews)
 
     # --- Implementation Packet export (handoff to Claude Code; local files only, no edits/writes) ---
     ep = sub.add_parser("export-implementation-packet",

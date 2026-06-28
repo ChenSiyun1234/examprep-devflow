@@ -288,6 +288,47 @@ gh unavailable/unauthenticated). Tests mock `gh` entirely
 (`tests/test_devflow_watch_codex.py`): actionable/none/dedupe/spoof/per-PR-error/init/json/
 exit-actionable plus an assertion that **every** spawned `gh` command is read-only.
 
+## Cross-PR review orchestrator (`orchestrate-reviews`)
+
+Where `watch-codex-reviews` reports *new feedback*, `orchestrate-reviews` computes a **deterministic
+plan over the whole open-PR stack** (`devflow/tools/review_orchestrator.py` — pure stdlib). It is a
+**strictly read-only planner**: it *recommends*, and a human (or an external executor) acts. There is
+no merge / comment / delete / push capability here — the same posture as `claude_execute_merge`, which
+is a no-op in every mode. This keeps it cleanly **alongside** the single-change workflow graph, never
+inside it; the graph, gates, and `request_human_decision` are untouched.
+
+**The plan** (printed under an `ORCHESTRATION_PLAN` / `NO_ACTION_NEEDED` first-line marker, `--json`
+for machine output):
+
+- **`ranking`** — deterministic `priority()`: `needs` (10 when unreviewed, decaying per Codex round,
+  −4 once the head is reviewed) × 6 + `impact` (additions + 30·files) × 4 + a type nudge (+1 feature,
+  −2 small bugfix). Unreviewed + big-feature ranks highest.
+- **`request_review`** — the next `@codex review` targets, priority-ordered behind an **`INFLIGHT_CAP`
+  = 3** cap. In-flight is **head-aware** (`is_inflight` = `awaiting AND requested_head[pr] == head`):
+  once a fix advances the head, the tracked request goes stale and the PR re-queues. This is the
+  *single gate* for all requests — initial and re-review-after-a-fix alike — so requests are never
+  poked out of band.
+- **`mergeable_now` / `force_mergeable`** — `ok_to_merge` = Codex-clean (rule 1) ∨ ≥`FORCE_MERGE_ROUNDS`
+  = 3 rounds with only minor **P3** findings (rule 2; severity read from Codex's P1/P2/P3 badges, with
+  inline findings matched to their *own* review by `pull_request_review_id` so re-anchored older
+  comments don't count) ∨ an agent-pinned `--mark-converged` head (rule 3).
+- **`needs_conflict` / `needs_retarget`** — a merge-ready PR that `CONFLICTING`s with `main` (resolve by
+  merging `main` in — never force-push) or a stacked child whose base PR already merged (retarget to
+  `main`).
+- **`findings_to_fix`** — has a head review that isn't merge-ready (P1/P2, or early P3).
+- **`rate_limited`** — Codex's globally-most-recent signal is a usage-limit notice (single source of
+  truth; a stale per-PR notice can't gate the others).
+
+The only side effect is the tool's own local tracking file
+(`<tmp>/devflow_runs/orchestrate_state.json`: `requested_head` for head-aware in-flight + `converged`
+pins) — **not** a GitHub artifact. `--dry` computes the plan without persisting it. The classify
+derivation is pure (data in, dict out) and unit-tested with fixtures; GitHub reads use two additive
+**read-only** `ReadOnlyGitHub` methods (`get_pr_meta`, `get_pr_codex_signals`) that preserve the
+`commit_id` / `pull_request_review_id` fields the normalized helpers drop. Tests
+(`tests/test_devflow_orchestrate.py`) cover the heuristics, classify (clean / findings / re-anchoring
+defense / spoof / quota / awaiting), the merge predicates, the full plan, state I/O, and assert every
+spawned `gh` command is read-only.
+
 ## Implementation Packet (handoff to Claude Code)
 
 The packet is the **boundary between orchestration and editing**: devflow summarizes the
