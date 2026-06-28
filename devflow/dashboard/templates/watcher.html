@@ -1,0 +1,20 @@
+<h1>Codex review watcher <span class="muted">(read-only)</span></h1>
+<p class="muted">Runs the same read-only sweep as <code>watch-codex-reviews</code>: scans open PRs for
+new trusted-Codex reviews and prints a marker. It only reads GitHub via <code>gh</code> and updates
+a local seen-file — it never comments, merges, or mutates anything.</p>
+$notice
+$result
+<form method="post" action="/watcher" class="card">
+  <label for="repo">repo <span class="muted">(required, owner/name)</span></label>
+  <input type="text" id="repo" name="repo" placeholder="e.g. ChenSiyun1234/examprep-devflow" required>
+
+  <div class="checkbox">
+    <input type="checkbox" id="init" name="init" value="1">
+    <label for="init" style="margin:0;font-weight:400;">init baseline (record current state, emit no markers)</label>
+  </div>
+  <p class="note">Markers: <code>ACTIONABLE_CODEX_REVIEWS</code> &gt;
+  <code>CODEX_WATCH_INCOMPLETE</code> &gt; <code>CODEX_QUOTA_LIMITED</code> &gt;
+  <code>NO_NEW_CODEX_REVIEWS</code>. Requires <code>gh</code> to be installed and authenticated.</p>
+
+  <p><button type="submit">Run watcher</button></p>
+</form>

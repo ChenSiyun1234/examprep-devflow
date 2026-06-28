@@ -190,6 +190,38 @@ Implement a safe, allowlisted check runner for devflow.
 On success it prints `MANUAL_IMPLEMENTATION_PACKET_CREATED`, the two paths, the thread id, the task,
 and the suggested next Claude Code message.
 
+## Dashboard (local web UI)
+
+A tiny **local** dashboard to drive the common safe workflow from buttons/forms instead of typing
+`python -m devflow.cli …`. It is pure Python standard library — **no install or dependency needed**:
+
+```bash
+python -m devflow.dashboard.app        # then open http://127.0.0.1:8765
+# options: --host 127.0.0.1 (default; localhost-only) --port 8765
+```
+
+Pages: **Runs** (list local checkpoints — thread id, status, paused gate) · **Run detail** (state
+fields, event log, errors, and — when paused — the gate payload with **Approve / Reject / Export
+Implementation Packet** buttons) · **New run** (create a dry-run run, optionally paused at a gate) ·
+**Manual packet** (build an Implementation Packet from a Markdown scope form — same as
+`create-implementation-packet` — and see the paths + suggested Claude Code handoff) · **Codex
+watcher** (run the read-only `watch-codex-reviews` sweep and show its marker).
+
+**Safe by default — what it does / does not do.**
+
+- It is **local-only**: binds `127.0.0.1` by default and rejects requests whose `Host` header is not
+  a localhost name (DNS-rebinding defense). It is **not** exposed publicly and has no authentication —
+  do not bind it to a public interface.
+- Every action is **read-only or dry-run**: runs use the pure-stdlib fallback backend with
+  `real_github` forced off, so it performs **no** real GitHub writes; packets are the same local
+  files the CLI writes; the watcher is the CLI's read-only sweep.
+- It **cannot** merge, delete branches, force-push, add GitHub Actions, run arbitrary shell commands
+  (there is no such endpoint), or edit code. The CLI remains fully supported and is the source of
+  truth; the dashboard only calls the same functions (see `devflow/dashboard/service.py`).
+
+**Not yet (out of scope for this MVP):** the real LangGraph backend (the dashboard always uses the
+stdlib fallback), authentication, public deployment, and any real GitHub write buttons.
+
 ## LangGraph Studio (`langgraph dev`)
 
 The graph is Studio-loadable: `langgraph.json` (repo root) points Studio at the
@@ -234,6 +266,7 @@ devflow/
   _compat.py        LangGraph/stdlib interrupt shim
   nodes/            dry-run workflow nodes (environment / advisory / approval / pr_review / merge)
   tools/github_cli.py   DryRunGitHub (write no-ops) + ReadOnlyGitHub + guarded GitHubWriter
+  dashboard/        local web UI (stdlib http.server): app.py + service.py + templates/ (localhost-only)
 docs/devflow-langgraph.md   design notes: state machine, approval gates, safety boundaries, roadmap
 tests/                lightweight tests (gh fully mocked; no network)
 ```

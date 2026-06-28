@@ -1,0 +1,35 @@
+<h1>Manual-scope Implementation Packet</h1>
+<p class="muted">Generates the same packet as <code>create-implementation-packet</code> from a
+human-provided Markdown scope — no prior advisory needed. Writes two local files
+(<code>.devflow/packets/&lt;thread&gt;/</code>); never touches GitHub or the repo.</p>
+$notice
+$result
+<form method="post" action="/manual" class="card">
+  <label for="thread_id">thread_id <span class="muted">(required)</span></label>
+  <input type="text" id="thread_id" name="thread_id" placeholder="e.g. manual-1" required>
+
+  <label for="task">task title</label>
+  <input type="text" id="task" name="task" placeholder="short title (or first '# Task' line)">
+
+  <label for="repo">repo</label>
+  <input type="text" id="repo" name="repo" placeholder="owner/name">
+
+  <label for="scope_markdown">approved scope (Markdown)</label>
+  <textarea id="scope_markdown" name="scope_markdown" placeholder="# Approved scope
+- Add X to module Y
+
+# Tasks
+- Implement X
+- Add tests for X
+
+# Files likely touched
+- devflow/y.py
+
+# Tests to run
+- python -m unittest discover -s tests"></textarea>
+  <p class="note">Need a <code># Approved scope</code> or <code># Tasks</code> section (files alone
+  aren't enough). Unsafe paths, prohibited git/PR actions, and non-validation check commands are
+  quarantined automatically; the canonical safety boundaries are always enforced.</p>
+
+  <p><button type="submit">Create packet</button></p>
+</form>
