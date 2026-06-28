@@ -206,11 +206,10 @@ def is_codex_quota_notice(body: Optional[str]) -> bool:
     t = (body or "").strip().lower()
     if not t:
         return False
-    # Key off the ACTUAL notice OPENER at the START of the body ("You have reached your Codex usage
-    # limits …"), NOT a substring anywhere — so a real review that QUOTES the notice while discussing
-    # this quota code (and is under 600 chars) isn't misclassified and dropped as a rate-limit notice.
-    i = t.find("reached your codex usage limits")
-    return i != -1 and i <= 12 and len(t) < 600        # <=12 allows a short lead-in ("you have ")
+    # Match ONLY the real notice opener at the very START ("You have reached your Codex usage limits …")
+    # — not the phrase after ANY short lead-in — so a real review that opens with a prefix while quoting
+    # the notice ("Bug: reached your Codex usage limits parsing…") isn't dropped as a rate-limit notice.
+    return t.startswith("you have reached your codex usage limits") and len(t) < 600
 
 
 # Tie-break for "latest" when GitHub's 1-second timestamps collide (Codex posts a review plus
@@ -390,14 +389,14 @@ class ReadOnlyGitHub:
         _max_ts = max((c.get("created_at") or "") for c in _basis)
         dedupe_key = _max_ts + "|" + ",".join(sorted(
             (c.get("url") or "") for c in _basis if (c.get("created_at") or "") == _max_ts))
-        # Legacy compatibility: an OLDER watcher computed the dedupe key over ALL candidates (including
-        # the quota notice). When a newer quota notice exists (quota_active), expose that legacy key so
-        # an upgraded seen file that stored it is recognized as already-seen — no spurious re-alert of
-        # the same older review just because quota notices are now excluded from the key.
+        # Legacy compatibility: the OLDER watcher stored the SINGLE winning `created_at|url` of the
+        # latest signal (the quota notice when it wins the tie). When a newer quota notice exists
+        # (quota_active), expose that exact single key so an upgraded seen file holding it is recognized
+        # as already-seen — no spurious re-alert of the older review just because quota is now excluded.
         legacy_dedupe_key = None
         if quota_active and real:
-            legacy_dedupe_key = _qmax + "|" + ",".join(sorted(
-                (c.get("url") or "") for c in candidates if (c.get("created_at") or "") == _qmax))
+            overall_q = max((c for c in candidates if (c.get("created_at") or "") == _qmax), key=_key)
+            legacy_dedupe_key = (_qmax or "") + "|" + (overall_q.get("url") or "")
         if not real:
             overall = max(candidates, key=_key)   # only quota notices from Codex -> signal, no review
             return {

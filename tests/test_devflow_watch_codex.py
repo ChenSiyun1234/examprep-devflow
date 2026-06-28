@@ -214,6 +214,21 @@ class TestWatchCodexBehavior(WatchCodexBase):
         self.assertEqual(out.splitlines()[0], "CODEX_WATCH_INCOMPLETE")
         self.assertIn("! PR #1", out)
 
+    def test_incomplete_marker_outranks_quota(self):
+        # Codex r5 P2: when one PR read fails AND another only has a quota notice, the incomplete sweep
+        # must win the first-line marker — a consumer must not back off for quota having missed a PR
+        prs = [{"number": 1, "title": "A", "updatedAt": "z", "url": "p1"},
+               {"number": 2, "title": "B", "updatedAt": "z", "url": "p2"}]
+        rc, out, _ = self.run_watch(prs, error_prs={1},
+                                    comments_by_pr={2: [codex_quota("2026-01-04T00:00:00Z", "p2#q1")]})
+        self.assertEqual(out.splitlines()[0], "CODEX_WATCH_INCOMPLETE")   # errors outrank quota
+        self.assertIn("! PR #1", out)
+
+    def test_quota_notice_rejects_prefixed_phrase(self):
+        # Codex r5 P2: a review that opens with a PREFIX before the phrase is NOT a quota notice
+        self.assertFalse(G.is_codex_quota_notice("Bug: reached your Codex usage limits parsing the body."))
+        self.assertTrue(G.is_codex_quota_notice("You have reached your Codex usage limits for code reviews."))
+
     def test_init_surfaces_errored_prs_not_baselined(self):
         # --init must report PRs it could NOT baseline (else the next poll re-alerts on them) (Codex r1 #3)
         prs = [{"number": 1, "title": "A", "updatedAt": "z", "url": "p1"},

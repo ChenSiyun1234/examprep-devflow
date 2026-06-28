@@ -471,12 +471,12 @@ def cmd_watch_codex_reviews(args) -> int:
     # Marker FIRST (a bare line) so strict consumers can match it; human details + optional JSON
     # follow. ACTIONABLE/NO_NEW is carried by this string, NOT the exit code (exit stays 0 like
     # read-pr, unless --exit-actionable is requested).
-    # Precedence: real new feedback to act on > rate-limited (back off) > nothing new.
-    # Precedence: real feedback to act on > rate-limited (back off) > partial-failure (unknown, retry)
-    # > nothing new. A read failure must NOT surface as a clean NO_NEW.
+    # Precedence: real feedback to act on > partial-failure (incomplete sweep) > rate-limited (back off)
+    # > nothing new. INCOMPLETE outranks QUOTA: a failed PR read may hide actionable feedback, so a
+    # consumer must NOT back off for quota when the sweep didn't actually inspect everything.
     marker = ("ACTIONABLE_CODEX_REVIEWS" if actionable
-              else "CODEX_QUOTA_LIMITED" if quota_prs
               else "CODEX_WATCH_INCOMPLETE" if errors
+              else "CODEX_QUOTA_LIMITED" if quota_prs
               else "NO_NEW_CODEX_REVIEWS")
     print(marker)
     print(f"[watch-codex] repo={repo} open_prs={len(prs)} checked={len(checked)} "
