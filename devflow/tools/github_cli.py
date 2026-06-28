@@ -300,21 +300,37 @@ class ReadOnlyGitHub:
         return out
 
     def list_prs(self, state: str = "open", limit: int = 50) -> list:
-        """List PRs with SIZE metadata for ranking (read-only). ``state`` in {open, closed, merged,
-        all}. Returns ``[{number,title,branch,head,state,additions,deletions,changed_files,url}]``."""
+        """List PRs in a given state (open/merged/closed/all) with branches + size metadata — read-only
+        (``gh pr list``). Returns dicts carrying BOTH the orchestrator's fields (head_ref, base_ref) and
+        the ranker's (branch, head, additions, deletions, changed_files). Used to plan the OPEN stack /
+        detect stacked children whose (MERGED) base branch still exists, and to score review priority.
+        ``limit`` is clamped to >= 1."""
         repo = self.resolve_repo()
         st = state if state in ("open", "closed", "merged", "all") else "open"
-        data = _gh_json(["pr", "list", "-R", repo, "--state", st,
-                         "--json", "number,title,headRefName,headRefOid,state,additions,deletions,"
-                                   "changedFiles,url",
+        data = _gh_json(["pr", "list", "-R", repo, "--state", st, "--json",
+                         "number,title,state,headRefName,baseRefName,headRefOid,additions,deletions,"
+                         "changedFiles,url",
                          "--limit", str(max(1, int(limit)))]) or []
-        out = []
-        for pr in data:
-            out.append({"number": pr.get("number"), "title": pr.get("title"),
-                        "branch": pr.get("headRefName"), "head": pr.get("headRefOid"),
-                        "state": pr.get("state"),
-                        "additions": pr.get("additions") or 0, "deletions": pr.get("deletions") or 0,
-                        "changed_files": pr.get("changedFiles") or 0, "url": pr.get("url")})
+        return [{"number": pr.get("number"), "title": pr.get("title"), "state": pr.get("state"),
+                 "head_ref": pr.get("headRefName"), "base_ref": pr.get("baseRefName"),
+                 "branch": pr.get("headRefName"), "head": pr.get("headRefOid"),
+                 "additions": pr.get("additions") or 0, "deletions": pr.get("deletions") or 0,
+                 "changed_files": pr.get("changedFiles") or 0, "url": pr.get("url")} for pr in data]
+
+    def merged_heads(self, branches) -> dict:
+        """Of the given branch names, return ``{branch: base_ref}`` for those that are the HEAD of a MERGED
+        PR (read-only). Used to detect a stacked child whose parent PR already merged WITHOUT scanning the
+        whole merged history (a ``--state merged --limit N`` window can miss an OLDER merged parent). One
+        targeted ``gh pr list --head <branch>`` per candidate branch — bounded by the (small) set of stack
+        bases. The base_ref lets a child retarget to its merged parent's ACTUAL base (which may itself not
+        be the default branch in a multi-level stack), not blindly to the default branch."""
+        repo = self.resolve_repo()
+        out = {}
+        for b in {x for x in branches if x}:
+            data = _gh_json(["pr", "list", "-R", repo, "--state", "merged", "--head", str(b),
+                             "--json", "number,baseRefName", "--limit", "1"]) or []
+            if data:
+                out[b] = data[0].get("baseRefName")
         return out
 
     # comments / reviews ----------------------------------------------------------------
@@ -514,34 +530,28 @@ class ReadOnlyGitHub:
     def codex_review_rounds(self, pr_number: int, head: Optional[str] = None) -> dict:
         """Count SUBSTANTIVE (non-quota) trusted-Codex reviews on a PR, whether the given ``head`` SHA
         is already reviewed, and whether the PR is CURRENTLY rate-limited (latest Codex signal — review
-        OR comment — is a usage-limits notice). Read-only.
-        Returns ``{rounds, reviewed_on_head, quota_limited}``."""
+        OR comment — is a usage-limits notice). Read-only. Returns ``{rounds, reviewed_on_head,
+        quota_limited}``."""
         reviews = self.get_pr_reviews(pr_number)
         comments = self.get_pr_comments(pr_number)
         inline = self.get_pr_review_comments(pr_number)
-        # a substantive review = non-quota Codex review with a body OR a meaningful state (an
-        # empty-body COMMENTED/CHANGES_REQUESTED/APPROVED review whose content is in inline comments
-        # still counts as a review round).
+        # a substantive review = non-quota Codex review with a body OR a meaningful state (an empty-body
+        # COMMENTED/CHANGES_REQUESTED/APPROVED review whose content is in inline comments still counts).
         revs = [r for r in reviews
                 if is_codex_author(r.get("author"))
                 and not is_codex_quota_notice(r.get("body"))
                 and ((r.get("body") or "").strip()
                      or (r.get("state") or "").upper() in ("APPROVED", "CHANGES_REQUESTED", "COMMENTED"))]
-        # a PR can also be "reviewed" via a Codex CONVERSATION comment (which find_latest_codex_review
-        # treats as a review) — count substantive non-quota ones so such a PR isn't mis-scored rounds=0
-        # and re-recommended as never-reviewed.
+        # a PR can also be "reviewed" via a Codex CONVERSATION comment (find_latest_codex_review treats
+        # those as reviews) — count substantive non-quota ones so it isn't mis-scored rounds=0.
         crevs = [c for c in comments if is_codex_author(c.get("author"))
                  and not is_codex_quota_notice(c.get("body")) and (c.get("body") or "").strip()]
-        # file-level INLINE review comments are Codex review coverage too (find_latest_codex_review counts
-        # them). Count them only when no review object/conversation comment already represents the round
-        # — inline always belongs to a review object, so a +1 floor when revs+crevs==0 avoids overcounting
-        # while ensuring inline-ONLY feedback isn't mis-scored as never-reviewed.
+        # file-level INLINE review comments are review coverage too; count via a +1 floor only when no
+        # review/comment already represents the round, so inline-ONLY feedback isn't mis-scored as 0.
         codex_inline = [c for c in inline if is_codex_author(c.get("author"))
                         and not is_codex_quota_notice(c.get("body"))]
-        # count comment-only coverage by RUN (distinct timestamp), not per comment — one Codex run that
-        # leaves several conversation comments is ONE round. Also EXCLUDE timestamps already covered by a
-        # review object: a single run that posts both a review AND a same-second comment is one round, not
-        # two (else needs_review decays twice as fast and the PR is wrongly pushed out of recommend_next).
+        # count comment-only coverage by RUN (distinct timestamp), EXCLUDING timestamps already covered
+        # by a review object: one run that posts a review + a same-second comment is ONE round, not two.
         rev_times = {r.get("created_at") for r in revs}
         crev_runs = len({c.get("created_at") for c in crevs} - rev_times)
         rounds = len(revs) + crev_runs
@@ -550,11 +560,9 @@ class ReadOnlyGitHub:
         # current head is reviewed if a review OBJECT or an INLINE-only comment carries head's commit_id.
         on_head = bool(head) and (any((r.get("commit_id") or "") == head for r in revs)
                                   or any((c.get("commit_id") or "") == head for c in codex_inline))
-        # quota state from the latest Codex signal — review OR conversation comment OR INLINE comment
-        # (inline is review coverage too, so a later inline review must be able to clear an earlier quota
-        # notice's latest-signal status). If a real signal and a quota notice SHARE the max one-second
-        # timestamp, treat the PR as rate-limited (ANY max-ts quota wins, like the watcher). But only
-        # while the notice is RECENT, so a stale quota doesn't suppress the PR forever after the reset.
+        # quota state from the latest Codex signal — review OR conversation comment OR INLINE comment (a
+        # later inline review must be able to clear an earlier quota notice). ANY max-ts quota wins the
+        # tie (like the watcher), but only while RECENT so a stale quota doesn't suppress forever.
         sigs = [(r.get("created_at"), r.get("body")) for r in reviews if is_codex_author(r.get("author"))]
         sigs += [(c.get("created_at"), c.get("body")) for c in comments if is_codex_author(c.get("author"))]
         sigs += [(c.get("created_at"), c.get("body")) for c in inline if is_codex_author(c.get("author"))]
@@ -570,6 +578,48 @@ class ReadOnlyGitHub:
                     age = 0
                 quota_limited = age < _QUOTA_ACTIVE_TTL_SECS
         return {"rounds": rounds, "reviewed_on_head": on_head, "quota_limited": quota_limited}
+
+    # orchestration reads (read-only; preserve fields the normalized helpers drop) ---------
+    def get_pr_meta(self, pr_number: int) -> dict:
+        """Read-only PR metadata + diffstat for orchestration: mergeable / base / head / draft +
+        additions/changedFiles (for the priority heuristic). Uses ``gh pr view --json`` — a read that
+        passes ``_assert_read_only``; NO mutation."""
+        repo = self.resolve_repo()
+        data = _gh_json(["pr", "view", str(int(pr_number)), "-R", repo, "--json",
+                         "number,title,state,mergeable,baseRefName,headRefName,headRefOid,isDraft,"
+                         "additions,deletions,changedFiles"]) or {}
+        return {
+            "number": data.get("number"), "title": data.get("title"), "state": data.get("state"),
+            "mergeable": data.get("mergeable"), "base_ref": data.get("baseRefName"),
+            "head_ref": data.get("headRefName"), "head_oid": data.get("headRefOid"),
+            "is_draft": data.get("isDraft"), "additions": int(data.get("additions") or 0),
+            "deletions": int(data.get("deletions") or 0),
+            "changed_files": int(data.get("changedFiles") or 0),
+        }
+
+    def get_pr_codex_signals(self, pr_number: int) -> dict:
+        """Read-only fetch of the three Codex review surfaces, PRESERVING the id / commit_id /
+        pull_request_review_id fields that the normalized helpers drop. The orchestrator needs them to
+        (a) match a review to the current head (commit_id) and (b) tie an inline finding to its OWN
+        review by ``pull_request_review_id`` so re-anchored comments from older reviews don't count.
+        Returns ``{reviews, inline, comments}``. All GET endpoints — passes ``_assert_read_only``."""
+        repo = self.resolve_repo()
+        n = int(pr_number)
+        reviews = [{
+            "author": (r.get("user") or {}).get("login"), "body": r.get("body") or "",
+            "state": r.get("state"), "created_at": r.get("submitted_at"),
+            "commit_id": r.get("commit_id"), "id": r.get("id"), "url": r.get("html_url"),
+        } for r in (_gh_json_paginated(f"repos/{repo}/pulls/{n}/reviews") or [])]
+        inline = [{
+            "author": (c.get("user") or {}).get("login"), "body": c.get("body") or "",
+            "created_at": c.get("created_at"), "commit_id": c.get("commit_id"),
+            "review_id": c.get("pull_request_review_id"), "id": c.get("id"), "url": c.get("html_url"),
+        } for c in (_gh_json_paginated(f"repos/{repo}/pulls/{n}/comments") or [])]
+        comments = [{
+            "author": (c.get("user") or {}).get("login"), "body": c.get("body") or "",
+            "created_at": c.get("created_at"), "id": c.get("id"), "url": c.get("html_url"),
+        } for c in (_gh_json_paginated(f"repos/{repo}/issues/{n}/comments") or [])]
+        return {"reviews": reviews, "inline": inline, "comments": comments}
 
 
 # ======================================================================================
