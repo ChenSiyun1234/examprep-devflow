@@ -342,10 +342,14 @@ class ReadOnlyGitHub:
             _gh_json_paginated(f"repos/{repo}/issues/{int(pr_number)}/comments"))
 
     def get_pr_review_comments(self, pr_number: int) -> list:
-        # file-level (inline) review comments — a separate endpoint from conversation comments
+        # file-level (inline) review comments — a separate endpoint from conversation comments.
+        # Preserve commit_id (the reviewed SHA) so coverage can tell whether the CURRENT head was
+        # reviewed via inline-ONLY feedback. (Additive vs _norm_comments; other callers ignore it.)
         repo = self.resolve_repo()
-        return self._norm_comments(
-            _gh_json_paginated(f"repos/{repo}/pulls/{int(pr_number)}/comments"))
+        raw = _gh_json_paginated(f"repos/{repo}/pulls/{int(pr_number)}/comments")
+        return [{"author": (c.get("user") or {}).get("login"), "body": c.get("body") or "",
+                 "created_at": c.get("created_at"), "commit_id": c.get("commit_id"),
+                 "url": c.get("html_url")} for c in (raw or [])]
 
     def get_pr_reviews(self, pr_number: int) -> list:
         repo = self.resolve_repo()
@@ -534,10 +538,16 @@ class ReadOnlyGitHub:
         # while ensuring inline-ONLY feedback isn't mis-scored as never-reviewed.
         codex_inline = [c for c in inline if is_codex_author(c.get("author"))
                         and not is_codex_quota_notice(c.get("body"))]
-        rounds = len(revs) + len(crevs)
+        # count comment-only coverage by RUN (distinct timestamp), not per comment — one Codex run that
+        # leaves several conversation comments is ONE round, else its needs_review decays too fast and the
+        # PR is wrongly pushed out of recommend_next.
+        crev_runs = len({c.get("created_at") for c in crevs})
+        rounds = len(revs) + crev_runs
         if rounds == 0 and codex_inline:
             rounds = 1
-        on_head = bool(head) and any((r.get("commit_id") or "") == head for r in revs)
+        # current head is reviewed if a review OBJECT or an INLINE-only comment carries head's commit_id.
+        on_head = bool(head) and (any((r.get("commit_id") or "") == head for r in revs)
+                                  or any((c.get("commit_id") or "") == head for c in codex_inline))
         # quota state from the latest Codex signal (review OR comment). If a real review and a quota
         # notice SHARE the max one-second timestamp, treat the PR as rate-limited (ANY max-ts quota wins,
         # like the watcher) — a review listed first must not hide a co-timestamped quota notice. But only

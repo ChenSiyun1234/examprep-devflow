@@ -304,6 +304,35 @@ class TestRankCodexBehavior(RankCodexBase):
             cov = gh.codex_review_rounds(1)
         self.assertFalse(cov["quota_limited"])    # stale -> not currently rate-limited
 
+    def test_inline_only_marks_reviewed_on_head(self):
+        # Codex r6 P2: inline-only feedback carrying head's commit_id must set reviewed_on_head
+        gh = G.ReadOnlyGitHub("o/r")
+        with mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[
+                 {"author": CODEX, "body": "nit", "created_at": "2026-02-01T00:00:00Z", "commit_id": "HEADSHA"}]):
+            cov = gh.codex_review_rounds(1, head="HEADSHA")
+        self.assertTrue(cov["reviewed_on_head"])
+        self.assertEqual(cov["rounds"], 1)
+
+    def test_comment_only_run_counts_once(self):
+        # Codex r6 P2: several conversation comments from ONE run (same timestamp) = ONE round, not N
+        gh = G.ReadOnlyGitHub("o/r")
+        with mock.patch.object(gh, "get_pr_reviews", return_value=[]), \
+             mock.patch.object(gh, "get_pr_review_comments", return_value=[]), \
+             mock.patch.object(gh, "get_pr_comments", return_value=[
+                 {"author": CODEX, "body": "comment A", "created_at": "2026-02-01T00:00:00Z"},
+                 {"author": CODEX, "body": "comment B", "created_at": "2026-02-01T00:00:00Z"}]):
+            cov = gh.codex_review_rounds(1)
+        self.assertEqual(cov["rounds"], 1)        # one run, not two
+
+    def test_partial_lookup_failure_marks_incomplete(self):
+        # Codex r6 P2: if ANY coverage lookup fails, the ranking is INCOMPLETE even if others ranked
+        prs = [pr(1, "feat: a", "feat/a", 200, files=3), pr(2, "feat: b", "feat/b", 200, files=3)]
+        _, out, _ = self.run_rank(prs, error_prs={1})     # #1 errors, #2 ranks fine
+        self.assertIn("RANK_CODEX_INCOMPLETE", out)
+        self.assertNotIn("RANKED_CODEX_REVIEW_QUEUE", out)
+
     def test_json_output_parses_and_has_ranking(self):
         prs = [pr(1, "feat: a", "feat/a", 400, files=4), pr(2, "fix: b", "fix/b", 30, files=1)]
         _, out, _ = self.run_rank(prs, as_json=True)

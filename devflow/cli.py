@@ -620,10 +620,11 @@ def cmd_rank_codex_reviews(args) -> int:
     # review now; such PRs are still shown in the table but kept out of recommend_next.
     top = [r["number"] for r in ranked if not r.get("quota_limited")][:args.top]
 
-    # distinct marker when the ranking is empty ONLY because every coverage lookup errored, so a driver
-    # treats it as unknown/incomplete (retry/alert) rather than a definitive "nothing to rank".
-    marker = ("RANKED_CODEX_REVIEW_QUEUE" if ranked
-              else "RANK_CODEX_INCOMPLETE" if errors
+    # ANY coverage-lookup failure makes the ranking INCOMPLETE — a failed (possibly highest-priority) PR
+    # is silently absent from recommend_next, so a driver must retry/alert rather than spend slots on a
+    # partial batch. Errors take precedence over a non-empty (but incomplete) ranking.
+    marker = ("RANK_CODEX_INCOMPLETE" if errors
+              else "RANKED_CODEX_REVIEW_QUEUE" if ranked
               else "NO_PRS_TO_RANK")
     print(marker)
     print(f"[rank-codex] repo={repo} ranked={len(ranked)} recommend_next={top} "
