@@ -577,6 +577,7 @@ def cmd_orchestrate_reviews(args) -> int:
     _print_plan_section("READY then MERGE (un-draft first)", plan["ready_then_merge"])
     _print_plan_section("RESOLVE CONFLICT (merge main in; never force-push)", plan["needs_conflict"])
     _print_plan_section("RETARGET to main (base PR merged)", plan["needs_retarget"])
+    _print_plan_section("MERGEABILITY PENDING (GitHub still computing; re-run)", plan["mergeable_unknown"])
     _print_plan_section("FINDINGS to fix (P1/P2 or early P3)", plan["findings_to_fix"])
     if args.json:
         print(json.dumps({"repo": repo, "marker": "ORCHESTRATION_PLAN" if actionable else "NO_ACTION_NEEDED",

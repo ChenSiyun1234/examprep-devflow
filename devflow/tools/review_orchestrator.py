@@ -190,7 +190,8 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
         "num": n, "branch": meta.get("head_ref"), "head": head, "merged": merged,
         "state": meta.get("state"), "mergeable": meta.get("mergeable"), "base_ref": meta.get("base_ref"),
         "is_draft": bool(meta.get("is_draft")),
-        "rounds": rounds, "reviewed_on_head": on_head, "review_key": review_key,
+        "rounds": rounds, "rounds_on_head": len(head_real), "reviewed_on_head": on_head,
+        "review_key": review_key,
         "has_head_review": bool(latest_real), "awaiting": awaiting, "req_age": req_age, "pending": pending,
         "latest_quota": latest_quota, "latest_sig_ts": latest_sig_ts, "responded_after_req": responded,
         "findings_on_head": findings_on_head, "clean": clean, "max_severity": max_severity,
@@ -199,9 +200,11 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
 
 
 def force_mergeable(c: dict) -> bool:
-    """Rule 2: ≥FORCE_MERGE_ROUNDS rounds AND the latest review's findings are all minor (worst P3)."""
+    """Rule 2: the CURRENT head has been reviewed >=FORCE_MERGE_ROUNDS times (rounds_on_head, NOT the
+    PR's all-time rounds — stale rounds from previous heads must not let a barely-reviewed new revision
+    force-merge) AND its latest review's findings are all minor (worst P3)."""
     return (c["findings_on_head"] > 0 and c["max_severity"] is not None
-            and c["max_severity"] >= 3 and c["rounds"] >= FORCE_MERGE_ROUNDS)
+            and c["max_severity"] >= 3 and c.get("rounds_on_head", 0) >= FORCE_MERGE_ROUNDS)
 
 
 def ok_to_merge(c: dict, converged: dict) -> bool:
@@ -216,6 +219,10 @@ def is_inflight(c: dict, requested_head: dict) -> bool:
     advances the head, the tracked request goes stale -> the PR re-enters the priority gate. Untracked
     (no entry) falls back to the bare 'awaiting' signal so an advisory run without local tracking still
     avoids re-recommending an obviously-outstanding request."""
+    # a request ANSWERED with a quota notice (latest_quota) did NOT get a review -> it must not keep
+    # holding a slot, else after the global rate-limit clears the PR is stuck (skipped, never re-asked).
+    if c.get("latest_quota"):
+        return False
     rh = requested_head.get(str(c["num"]))
     if rh is None:
         return c["awaiting"]
@@ -243,8 +250,8 @@ def build_plan(classified: list, *, converged: dict, requested_head: dict, done,
         "ranking": [{"pr": c["num"], "priority": c["priority"], "rounds": c["rounds"],
                      "clean": c["clean"], "state": c["state"]} for c in cls],
         "request_review": [], "mergeable_now": [], "force_mergeable": [], "ready_then_merge": [],
-        "needs_conflict": [], "needs_retarget": [], "findings_to_fix": [], "in_flight": [],
-        "rate_limited": False,
+        "needs_conflict": [], "needs_retarget": [], "mergeable_unknown": [], "findings_to_fix": [],
+        "in_flight": [], "rate_limited": False,
     }
 
     # 1) RETARGET (INDEPENDENT of review state): ANY open PR whose base branch's parent PR has merged
@@ -272,6 +279,10 @@ def build_plan(classified: list, *, converged: dict, requested_head: dict, done,
                 plan["mergeable_now"].append(c["num"])
                 if force_mergeable(c):
                     plan["force_mergeable"].append(c["num"])
+        else:
+            # GitHub reports UNKNOWN/None while still COMPUTING mergeability (e.g. right after a push) —
+            # surface the ready PR as pending-recheck instead of silently dropping it to NO_ACTION.
+            plan["mergeable_unknown"].append(c["num"])
 
     # 3) fresh findings to fix — but NOT a PR that must retarget first (re-review against main may change
     #    its findings); not merge-ready.
@@ -289,7 +300,9 @@ def build_plan(classified: list, *, converged: dict, requested_head: dict, done,
     # 5) request review: the SINGLE gate for ALL @codex requests (initial AND re-review-after-fix),
     #    priority-ordered and capped at INFLIGHT_CAP. A post-fix PR is no longer is_inflight (head
     #    advanced past the tracked request), so it re-queues here. Skip PRs that must retarget first.
-    in_flight = [c["num"] for c in active if is_inflight(c, requested_head)]
+    # a PR that must RETARGET first holds no review slot — its outstanding request is against a stale
+    # base, so it must not crowd unrelated PRs out of the in-flight cap.
+    in_flight = [c["num"] for c in active if is_inflight(c, requested_head) and c["num"] not in retarget]
     if not plan["rate_limited"]:
         for c in cls:
             if len(in_flight) >= INFLIGHT_CAP:
@@ -307,7 +320,8 @@ def build_plan(classified: list, *, converged: dict, requested_head: dict, done,
 
 def has_actions(plan: dict) -> bool:
     return any(plan.get(k) for k in ("request_review", "mergeable_now", "ready_then_merge",
-                                     "needs_conflict", "needs_retarget", "findings_to_fix"))
+                                     "needs_conflict", "needs_retarget", "mergeable_unknown",
+                                     "findings_to_fix"))
 
 
 # ---- tool-local tracking state (NOT a GitHub artifact: head-aware in-flight + converged pins) ----

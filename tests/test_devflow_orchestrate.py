@@ -196,18 +196,22 @@ class TestClassify(unittest.TestCase):
 class TestMergePredicates(unittest.TestCase):
     def _c(self, **kw):
         base = {"num": 5, "head": "h", "findings_on_head": 0, "max_severity": None, "rounds": 0,
-                "clean": False, "awaiting": False}
+                "rounds_on_head": 0, "clean": False, "awaiting": False, "latest_quota": False}
         base.update(kw)
         return base
 
-    def test_force_mergeable_only_minor_after_rounds(self):
-        self.assertTrue(orch.force_mergeable(self._c(findings_on_head=2, max_severity=3, rounds=3)))
-        self.assertFalse(orch.force_mergeable(self._c(findings_on_head=2, max_severity=2, rounds=5)))  # P2
-        self.assertFalse(orch.force_mergeable(self._c(findings_on_head=2, max_severity=3, rounds=2)))  # <3 rounds
+    def test_force_mergeable_only_minor_after_head_rounds(self):
+        # rounds counted on the CURRENT head (Codex r3 P2): >=3 head reviews + only-minor
+        self.assertTrue(orch.force_mergeable(self._c(findings_on_head=2, max_severity=3, rounds_on_head=3)))
+        self.assertFalse(orch.force_mergeable(self._c(findings_on_head=2, max_severity=2, rounds_on_head=5)))  # P2
+        self.assertFalse(orch.force_mergeable(self._c(findings_on_head=2, max_severity=3, rounds_on_head=2)))  # <3
+        # stale all-time rounds must NOT satisfy the threshold for a barely-reviewed new head
+        self.assertFalse(orch.force_mergeable(self._c(findings_on_head=1, max_severity=3, rounds=9,
+                                                      rounds_on_head=1)))
 
     def test_ok_to_merge_three_paths(self):
         self.assertTrue(orch.ok_to_merge(self._c(clean=True), {}))
-        self.assertTrue(orch.ok_to_merge(self._c(findings_on_head=1, max_severity=3, rounds=3), {}))
+        self.assertTrue(orch.ok_to_merge(self._c(findings_on_head=1, max_severity=3, rounds_on_head=3), {}))
         self.assertTrue(orch.ok_to_merge(self._c(head="h"), {"5": "h"}))     # converged pin
         self.assertFalse(orch.ok_to_merge(self._c(head="h"), {"5": "other"}))
 
@@ -218,12 +222,18 @@ class TestMergePredicates(unittest.TestCase):
         self.assertTrue(orch.is_inflight(c, {}))                   # untracked -> falls back to awaiting
         self.assertFalse(orch.is_inflight(self._c(awaiting=False), {}))
 
+    def test_quota_reply_drops_out_of_inflight(self):
+        # Codex r3 P2: a request answered with a quota notice must not keep holding a slot
+        self.assertFalse(orch.is_inflight(self._c(awaiting=True, head="h2", latest_quota=True), {"5": "h2"}))
+        self.assertTrue(orch.is_inflight(self._c(awaiting=True, head="h2", latest_quota=False), {"5": "h2"}))
+
 
 class TestBuildPlan(unittest.TestCase):
     def _classified(self, **kw):
         base = {"num": 1, "branch": "b1", "head": "h1", "merged": False, "state": "OPEN",
                 "mergeable": "MERGEABLE", "base_ref": "main", "is_draft": False, "rounds": 0,
-                "reviewed_on_head": False, "review_key": "", "has_head_review": False, "awaiting": False,
+                "rounds_on_head": 0, "reviewed_on_head": False, "review_key": "",
+                "has_head_review": False, "awaiting": False,
                 "req_age": 0, "pending": 0, "latest_quota": False, "latest_sig_ts": "",
                 "responded_after_req": False, "findings_on_head": 0, "clean": False,
                 "max_severity": None, "priority": 50, "needs": 10}
@@ -246,11 +256,30 @@ class TestBuildPlan(unittest.TestCase):
 
     def test_mergeable_and_force_mergeable(self):
         cs = [self._classified(num=1, clean=True),
-              self._classified(num=2, findings_on_head=1, max_severity=3, rounds=3, has_head_review=True)]
+              self._classified(num=2, findings_on_head=1, max_severity=3, rounds_on_head=3,
+                               has_head_review=True)]
         plan = orch.build_plan(cs, converged={}, requested_head={}, done=[], now=1, merged_branches=set())
         self.assertIn(1, plan["mergeable_now"])
         self.assertIn(2, plan["mergeable_now"])
         self.assertEqual(plan["force_mergeable"], [2])
+
+    def test_retarget_pr_does_not_fill_inflight_cap(self):
+        # Codex r3 P2: a needs_retarget PR's stale-base request must not occupy an in-flight slot
+        cs = [self._classified(num=1, head="h1", base_ref="feat/parent", awaiting=True),
+              self._classified(num=2, head="h2", priority=40)]
+        plan = orch.build_plan(cs, converged={}, requested_head={"1": "h1"}, done=[], now=1,
+                               merged_branches={"feat/parent"})
+        self.assertEqual(plan["needs_retarget"], [1])
+        self.assertNotIn(1, plan["in_flight"])      # the stale-base request doesn't fill a slot
+        self.assertIn(2, plan["request_review"])    # so the unrelated PR still gets one
+
+    def test_unknown_mergeability_surfaced_not_dropped(self):
+        # Codex r3 P2: a clean PR whose mergeability GitHub is still computing (UNKNOWN) is surfaced
+        cs = [self._classified(num=1, clean=True, mergeable="UNKNOWN")]
+        plan = orch.build_plan(cs, converged={}, requested_head={}, done=[], now=1, merged_branches=set())
+        self.assertEqual(plan["mergeable_unknown"], [1])
+        self.assertEqual(plan["mergeable_now"], [])
+        self.assertTrue(orch.has_actions(plan))
 
     def test_conflict_wakes_for_merge_ready_pr(self):
         cs = [self._classified(num=1, clean=True, mergeable="CONFLICTING")]
