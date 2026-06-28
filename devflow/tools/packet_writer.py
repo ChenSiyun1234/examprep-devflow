@@ -458,11 +458,16 @@ def parse_scope_markdown(text: str) -> dict:
 # packet's runnable instructions, so only well-known *validation* commands pass through verbatim; an
 # out-of-policy/destructive command (rm -rf, gh pr merge, git push, curl|sh, ...) is quarantined.
 _SAFE_CHECK_PREFIXES = (
-    "python -m ", "python3 -m ", "py -m ", "pytest", "py.test", "unittest",
+    "pytest", "py.test", "unittest",
     "npm test", "npm run ", "yarn ", "pnpm ", "make ", "tox", "nox",
     "ruff", "flake8", "pylint", "mypy", "black --check", "isort --check",
     "pre-commit run", "cargo test", "cargo check", "go test", "go vet",
 )
+# `python -m <module>` is only a CHECK when <module> is a known validation runner — otherwise it can
+# launch arbitrary code (`python -m http.server`, `python -m pip`, `python -m venv`, `python -m this`).
+_PY_RUNNERS = ("python -m", "python3 -m", "py -m")
+_PY_VALIDATION_MODULES = {"pytest", "unittest", "mypy", "ruff", "flake8", "pylint", "black", "isort",
+                          "tox", "nox", "coverage", "doctest", "compileall", "pyflakes", "pytype", "bandit"}
 
 
 _SHELL_META = ("&&", "||", ";", "|", "&", "`", "$(", "${", ">", "<", "\n", "\r")
@@ -485,6 +490,11 @@ def _check_is_allowlisted(cmd) -> bool:
         return False
     if _SIDE_EFFECT_RE.search(c) or any(f in c for f in _SIDE_EFFECT_FLAGS):  # mutating sub-action -> not a check
         return False
+    # 'python -m <module>': only a check if <module> is a known validation runner (not http.server/pip/venv).
+    for runner in _PY_RUNNERS:
+        if c == runner or c.startswith(runner + " "):
+            rest = c[len(runner):].strip()
+            return bool(rest) and rest.split()[0] in _PY_VALIDATION_MODULES
     # exact match OR prefix followed by a space — a bare-word boundary so "pytestfoo" / "makefile…"
     # can't sneak through a startswith on "pytest" / "make".
     return any(c == p.strip() or c.startswith(p.strip() + " ") for p in _SAFE_CHECK_PREFIXES)
@@ -562,6 +572,16 @@ def _task_is_prohibited(t) -> bool:
     return bool(_PROHIBITED_TASK_RE.search(s)) or bool(_WORKFLOW_PATH_RE.search(s))
 
 
+def _is_bare_unsafe_path(t) -> bool:
+    """True if a task/scope item is ITSELF a bare unsafe path ('/etc/passwd', '../x.py', 'C:\\…')
+    rather than prose — so it is never handed off as an edit target. Path-SHAPED only: ordinary prose
+    (which also fails _is_safe_rel_path on a '%' or 'A:' substring) is NOT quarantined."""
+    s = str(t).strip()
+    looks_path = ("/" in s or "\\" in s or s.startswith(("~", "..", "$", "%"))
+                  or (len(s) >= 3 and s[0].isalpha() and s[1] == ":" and s[2] in "\\/"))
+    return bool(s) and looks_path and not _is_safe_rel_path(s)
+
+
 def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
                         scope_file: Optional[str] = None) -> dict:
     """Build an Implementation Packet from explicit human-provided scope (source = manual_human_scope).
@@ -576,8 +596,11 @@ def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
     # sanitize a 'PATH: detail' unsafe-path prefix out of the kept items so a manual scope can't direct
     # edits outside the repo (mirrors how advisory-derived tasks are sanitized).
     prohibited = [t for t in (tasks + approved_scope) if _task_is_prohibited(t)]
-    tasks = [_strip_unsafe_path_prefix(str(t)) for t in tasks if not _task_is_prohibited(t)]
-    approved_scope = [_strip_unsafe_path_prefix(str(s)) for s in approved_scope if not _task_is_prohibited(s)]
+    unsafe_tasks = [t for t in (tasks + approved_scope)
+                    if not _task_is_prohibited(t) and _is_bare_unsafe_path(t)]
+    _bad = lambda t: _task_is_prohibited(t) or _is_bare_unsafe_path(t)
+    tasks = [_strip_unsafe_path_prefix(str(t)) for t in tasks if not _bad(t)]
+    approved_scope = [_strip_unsafe_path_prefix(str(s)) for s in approved_scope if not _bad(s)]
     # if an explicit Tasks section existed but EVERY entry was quarantined, fall back to the (filtered)
     # approved scope as tasks — never emit an empty 'do ONLY the listed tasks' handoff.
     if not tasks and approved_scope:
@@ -599,6 +622,7 @@ def build_manual_packet(thread_id, task, repo, generated_at, scope: dict,
     out_of_scope += [f"(ignored unsafe path — outside repo, do NOT touch) {p}" for p in unsafe]
     out_of_scope += [f"(ignored target — GitHub Actions workflow, do NOT touch) {p}" for p in workflows]
     out_of_scope += [f"(ignored task — prohibited git/PR action, do NOT perform) {t}" for t in prohibited]
+    out_of_scope += [f"(ignored task — unsafe path outside repo, do NOT touch) {t}" for t in unsafe_tasks]
 
     # Checks: only allow-listed validation commands are promoted into runnable instructions; an
     # out-of-policy/destructive command is quarantined (kept visible, but NOT a runnable instruction).

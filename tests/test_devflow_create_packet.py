@@ -346,6 +346,29 @@ class TestBuildManualPacket(unittest.TestCase):
         self.assertEqual(ii["tests_to_run"], ["python -m pytest"])
         self.assertTrue(any("uninstall" in s for s in ii["out_of_scope"]))
 
+    def test_python_m_check_restricted_to_validation_modules(self):
+        # 'python -m <module>' is a check only for known validation modules (Codex r4 P2)
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"approved_scope": ["x"],
+                                  "checks": ["python -m http.server", "python -m unittest discover -s tests",
+                                             "python -m mypy devflow"]})["implementation_instructions"]
+        self.assertEqual(ii["tests_to_run"], ["python -m unittest discover -s tests", "python -m mypy devflow"])
+        self.assertTrue(any("http.server" in s for s in ii["out_of_scope"]))
+
+    def test_bare_unsafe_path_task_quarantined(self):
+        # a task that IS a bare unsafe path must be quarantined, not handed off (Codex r4 P1)
+        bad = ["/etc/passwd", "../escape.py"]
+        ii = build_manual_packet("t", "x", "o/r", "T0",
+                                 {"tasks": bad + ["refactor the parser"]})["implementation_instructions"]
+        self.assertEqual(ii["tasks"], ["refactor the parser"])
+        oos = " ".join(ii["out_of_scope"])
+        self.assertIn("/etc/passwd", oos)
+        self.assertIn("../escape.py", oos)
+        # ...but prose with a path-ish substring ('80%') is preserved, not quarantined
+        keep = build_manual_packet("t", "x", "o/r", "T0",
+                                   {"tasks": ["Increase coverage to 80%"]})["implementation_instructions"]
+        self.assertIn("Increase coverage to 80%", keep["tasks"])
+
     def test_pre_commit_task_not_quarantined(self):
         # 'pre-commit' is a tool, not a git commit -> must NOT be quarantined (Codex r6)
         ii = build_manual_packet("t", "x", "o/r", "T0",
