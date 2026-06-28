@@ -32,7 +32,10 @@ from devflow.state import (
     GATE_ADVISORY, GATE_FIX, GATE_MERGE,
 )
 from devflow.tools.github_cli import ReadOnlyGitHub, check_gh_available, GhError
-from devflow.tools.packet_writer import build_packet, write_packet, PacketError
+from devflow.tools.packet_writer import (
+    build_packet, write_packet, PacketError,
+    parse_scope_markdown, build_manual_packet, render_manual_markdown,
+)
 from devflow._compat import HAS_LANGGRAPH
 
 # Windows GBK consoles otherwise mangle the report box-drawing / CJK text.
@@ -568,6 +571,55 @@ def cmd_export_implementation_packet(args) -> int:
     return 0
 
 
+def cmd_create_implementation_packet(args) -> int:
+    """Create an Implementation Packet from a HUMAN-PROVIDED Markdown scope file.
+
+    Unlike ``export-implementation-packet`` (which reads a paused checkpoint), this needs no prior
+    advisory — the human supplies a concrete scope directly, so it never produces the generic packet
+    a simulated dry-run advisory would. Read-only w.r.t. GitHub + the repo: it reads one local file
+    and writes the two packet files. No gh, no workflow, no code edits.
+    """
+    try:
+        with open(args.scope_file, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        print(f"[devflow] could not read scope file '{args.scope_file}': {e}\n"
+              f"  provide a Markdown scope file (see README: create-implementation-packet).")
+        return 1
+
+    scope = parse_scope_markdown(text)
+    for h in scope.get("unknown_headings", []):
+        print(f"[devflow] note: ignored unrecognized scope section '# {h}' (its lines were dropped)")
+    task = args.task or scope.get("task") or "(untitled task)"
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    packet = build_manual_packet(thread_id=args.thread_id, task=task, repo=args.repo,
+                                 generated_at=generated_at, scope=scope, scope_file=args.scope_file)
+    # Refuse a scope with no concrete WORK: a files-only scope (paths but no approved scope/tasks) is
+    # not enough — it would recreate the unusable generic-packet failure mode this command exists to
+    # avoid. Require an approved scope or tasks (files alone, or only quarantined items, don't count).
+    ii = packet["implementation_instructions"]
+    if not (packet["approval"]["approved_scope"] or ii["tasks"]):
+        print(f"[devflow] scope file '{args.scope_file}' has no concrete implementation work "
+              f"(needs a '# Approved scope' or '# Tasks' section, not just files). Not writing a packet.")
+        return 1
+    out_dir = args.out_dir or PACKETS_DIR
+    try:
+        paths = write_packet(out_dir, args.thread_id, packet,
+                             markdown=render_manual_markdown(packet))
+    except PacketError as e:
+        print(f"[devflow] {e}")
+        return 1
+
+    print("MANUAL_IMPLEMENTATION_PACKET_CREATED")
+    print(f"  markdown:  {paths['md_path']}")
+    print(f"  json:      {paths['json_path']}")
+    print(f"  thread_id: {args.thread_id}")
+    print(f"  task:      {task}")
+    print("\nNext (hand off to Claude Code):")
+    print(f"  {packet['suggested_prompt']}")
+    return 0
+
+
 def cmd_run_docs_advisory(args) -> int:
     """Advisory flow up to the human-approval gate. Real mode does the issue + @codex writes, then
     bounded-polls for the advisory, summarizes, and PAUSES for approval before any repo edits."""
@@ -689,6 +741,17 @@ def build_parser() -> argparse.ArgumentParser:
     ep.add_argument("--out-dir", default=None,
                     help="output base dir (default: .devflow/packets, which is gitignored)")
     ep.set_defaults(func=cmd_export_implementation_packet)
+
+    # --- create a packet from a HUMAN-provided scope file (no advisory/checkpoint needed) ---
+    cp = sub.add_parser("create-implementation-packet",
+                        help="create an Implementation Packet from a human-provided Markdown scope file")
+    cp.add_argument("--thread-id", required=True, help="thread id (names the packet output dir)")
+    cp.add_argument("--scope-file", required=True, help="path to a Markdown scope file")
+    cp.add_argument("--task", default=None, help="task title (overrides the scope file's '# Task')")
+    cp.add_argument("--repo", default="ZeKaiNie/universal-examprep-skill", help="owner/name")
+    cp.add_argument("--out-dir", default=None,
+                    help="output base dir (default: .devflow/packets, which is gitignored)")
+    cp.set_defaults(func=cmd_create_implementation_packet)
 
     # --- advisory flow up to human approval (dry-run by default; --real-github opts in) ---
     rda = sub.add_parser("run-docs-advisory",

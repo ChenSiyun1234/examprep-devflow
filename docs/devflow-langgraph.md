@@ -356,6 +356,40 @@ Markdown-injection neutralization, symlink-dir refusal, thread-id path sanitizat
 required Markdown sections, that `.devflow/` is gitignored, and that export performs no GitHub writes
 / never references the write layer.
 
+### Manual scope: `create-implementation-packet`
+
+`export-implementation-packet` is only as good as the underlying advisory — a **simulated/dry-run**
+advisory yields a generic packet (no files, no concrete tasks) that must **not** be used for real
+implementation. `create-implementation-packet` closes that gap: the human owner writes the scope in a
+Markdown file and devflow builds a packet directly from it — no checkpoint/advisory required.
+
+```bash
+python -m devflow.cli create-implementation-packet \
+  --thread-id check-runner-1 --task "Add allowlisted check runner" \
+  --scope-file scope.md --repo ChenSiyun1234/examprep-devflow
+```
+
+**When to use which:**
+- **`export-implementation-packet`** — hand off the scope from a real advisory/review at a paused gate.
+- **`create-implementation-packet`** — hand off a concrete scope you wrote yourself, no advisory.
+
+The scope file is parsed by a tiny, defensive parser (`parse_scope_markdown` — top-level `#` headings
+→ sections; unknown headings ignored; missing sections defaulted). Recognized sections: Task, Approved
+scope, Tasks (optional; falls back to Approved scope), Files likely touched, Out of scope, Checks to
+run, Safety rules. The resulting packet is marked **`source: manual_human_scope`** (top-level and in
+metadata) so it can never be mistaken for a generic simulated-advisory packet.
+
+Same safety posture as the export path and then some: **no GitHub calls, no shell, no code edits**;
+only the two local packet files are written (via the shared `write_packet`, which still refuses a
+symlinked output dir). The **canonical `SAFETY_BOUNDARIES` are always embedded** — a scope file may
+*add* rules but can never remove the hard ones (no secrets/keys, no commit/push/PR, no merge, no
+branch-delete, no force-push, no false "tests passed"). Scope file paths are filtered (absolute / `..`
+rejected and surfaced under out-of-scope), and untrusted scope text is `_md_safe`-sanitized in the
+Markdown. The CLI prints `MANUAL_IMPLEMENTATION_PACKET_CREATED` + paths + thread id + task + the
+suggested Claude Code prompt. Tested in `tests/test_devflow_create_packet.py` (parse, build, manual
+source marking, unsafe-path filtering, non-removable safety, missing-file error, valid JSON, required
+Markdown sections, parser wiring, no-gh, writes-only-under-out-dir).
+
 ## GitHub write mode (guarded, opt-in)
 
 `GitHubWriter` adds the only *write* path devflow has. It is **off by default** and limited to four
