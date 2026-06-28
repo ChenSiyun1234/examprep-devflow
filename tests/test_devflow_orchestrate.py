@@ -178,6 +178,20 @@ class TestClassify(unittest.TestCase):
         req = comment("@codex review", "2026-01-03T00:00:00Z", author=ME)   # an actual review request IS
         self.assertTrue(classify(meta(head="aaaaaaa"), signals(reviews=[base], comments=[req]))["awaiting"])
 
+    def test_negated_blocking_body_is_clean(self):
+        # Codex r2 P2: a clean verdict body containing the word 'blocking' ("No blocking issues found")
+        # must still be clean (negation-aware), not pushed to findings_to_fix
+        s = signals(reviews=[review("No blocking issues found.", "aaaaaaa", 3, "2026-01-01T00:00:00Z")])
+        self.assertTrue(classify(meta(head="aaaaaaa"), s)["clean"])
+
+    def test_outstanding_changes_requested_survives_later_comment(self):
+        # Codex r2 P2: a CHANGES_REQUESTED review stays blocking even after a later COMMENTED review with
+        # no inline — GitHub keeps it blocking until an approval/dismissal
+        s = signals(reviews=[
+            review("please fix", "aaaaaaa", 1, "2026-01-01T00:00:00Z", state="CHANGES_REQUESTED"),
+            review("Codex Review", "aaaaaaa", 2, "2026-01-02T00:00:00Z", state="COMMENTED")])
+        self.assertFalse(classify(meta(head="aaaaaaa"), s)["clean"])
+
 
 class TestMergePredicates(unittest.TestCase):
     def _c(self, **kw):
@@ -265,6 +279,17 @@ class TestBuildPlan(unittest.TestCase):
         plan = orch.build_plan(cs, converged={}, requested_head={}, done=[], now=1, merged_branches=set())
         self.assertEqual(plan["ready_then_merge"], [1])
         self.assertEqual(plan["mergeable_now"], [])
+
+    def test_default_branch_not_hardcoded_main(self):
+        # Codex r2 P2: a clean PR based on the repo's DEFAULT branch (e.g. 'master') is mergeable
+        cs = [self._classified(num=1, clean=True, base_ref="master")]
+        plan = orch.build_plan(cs, converged={}, requested_head={}, done=[], now=1,
+                               merged_branches=set(), default_branch="master")
+        self.assertEqual(plan["mergeable_now"], [1])
+        # ...but with the default 'main', a 'master'-based PR is NOT treated as merge-ready
+        plan2 = orch.build_plan([self._classified(num=1, clean=True, base_ref="master")],
+                                converged={}, requested_head={}, done=[], now=1, merged_branches=set())
+        self.assertEqual(plan2["mergeable_now"], [])
 
     def test_findings_to_fix(self):
         cs = [self._classified(num=1, has_head_review=True, review_key="k", findings_on_head=1,
@@ -385,6 +410,14 @@ class TestReadOnlyOrchestrationReads(unittest.TestCase):
         self.assertTrue(self.calls)
         for cmd in self.calls:
             _assert_read_only(cmd[1:])      # must not raise for any spawned command
+
+    def test_merged_heads_targeted_and_read_only(self):
+        # Codex r2 F4: merged_heads checks SPECIFIC branches (not a limited window). The setUp fake
+        # returns a PR for any `pr list`, so feat/x is detected as a merged head.
+        heads = ReadOnlyGitHub("o/r").merged_heads({"feat/x"})
+        self.assertIn("feat/x", heads)
+        for cmd in self.calls:
+            _assert_read_only(cmd[1:])
 
 
 def _raw_view(num=5, head="aaaaaaa", mergeable="MERGEABLE", base="main", state="OPEN",

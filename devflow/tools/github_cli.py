@@ -289,6 +289,20 @@ class ReadOnlyGitHub:
         return [{"number": pr.get("number"), "title": pr.get("title"), "state": pr.get("state"),
                  "head_ref": pr.get("headRefName"), "base_ref": pr.get("baseRefName")} for pr in data]
 
+    def merged_heads(self, branches) -> set:
+        """Of the given branch names, return those that are the HEAD of a MERGED PR (read-only). Used to
+        detect a stacked child whose parent PR already merged WITHOUT scanning the whole merged history
+        (a ``--state merged --limit N`` window can miss an OLDER merged parent). One targeted
+        ``gh pr list --head <branch>`` per candidate branch — bounded by the (small) set of stack bases."""
+        repo = self.resolve_repo()
+        out = set()
+        for b in {x for x in branches if x}:
+            data = _gh_json(["pr", "list", "-R", repo, "--state", "merged", "--head", str(b),
+                             "--json", "number", "--limit", "1"]) or []
+            if data:
+                out.add(b)
+        return out
+
     # comments / reviews ----------------------------------------------------------------
     @staticmethod
     def _norm_comments(raw) -> list:

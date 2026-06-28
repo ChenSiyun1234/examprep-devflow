@@ -28,7 +28,7 @@ import tempfile
 import time
 from typing import Optional
 
-from devflow.tools.github_cli import is_codex_author
+from devflow.tools.github_cli import is_codex_author, parse_review_packet
 
 # ---- tuning constants (the load-bearing ones from the watcher; vestigial ones intentionally dropped) ----
 INFLIGHT_CAP = 3            # max concurrent outstanding "@codex review" requests recommended at once
@@ -45,9 +45,8 @@ def state_path_for_repo(repo: str) -> str:
     return os.path.join(STATE_DIR, f"orchestrate_{safe}.json")
 
 # ---- pure heuristics / parsing ----
-# A severity marker in a REVIEW BODY denies "clean" (P1/P2/P3 or imperative blocking language).
-_SEVERITY_RE = re.compile(r"\bP[123]\b|must[-\s]?fix|blocking|should fix|needs? fix|changes? requested", re.I)
-# Codex tags each inline finding with a P1/P2/P3 badge; read it so the planner can tell merge-vs-fix.
+# Codex tags each inline finding with a P1/P2/P3 badge; read it so the planner can tell merge-vs-fix
+# (and to deny "clean" when the summary body itself carries an explicit badge).
 _BADGE_RE = re.compile(r"\bP([123])\b")
 _BUGFIX_RE = re.compile(r"\b(fix|bugfix|hotfix|patch|typo|regression|revert)\b|修复|修正", re.I)
 _FEATURE_RE = re.compile(r"\b(feat|feature|add|adds|implement|support|introduce)\b|新增|实现|支持", re.I)
@@ -146,9 +145,18 @@ def classify(meta: dict, signals: dict, *, converged: dict, requested_head: dict
             findings_on_head = len(own)
             sev = [finding_severity(c.get("body")) for c in own]
             max_severity = min(sev) if sev else None       # 1=P1 (worst) … 3=P3; None = no findings
-            requested_changes = (latest_real.get("state") or "").upper() == "CHANGES_REQUESTED"
+            # a CHANGES_REQUESTED review stays blocking until a NEWER APPROVED on head clears it — a
+            # later COMMENTED review does NOT. So look at the newest STATEFUL review, not just latest_real.
+            sf = [r for r in head_real if (r.get("state") or "").upper() in ("CHANGES_REQUESTED", "APPROVED")]
+            newest_sf = max(sf, key=lambda r: r.get("created_at") or "") if sf else None
+            requested_changes = bool(newest_sf and (newest_sf.get("state") or "").upper() == "CHANGES_REQUESTED")
+            # the body must not indicate problems — but a NEGATED phrase ("no blocking issues found") is
+            # clean, so use devflow's negation-aware parser instead of a bare keyword match; also reject an
+            # explicit P1/P2/P3 badge in the summary body.
+            body = latest_real.get("body") or ""
+            body_blocking = bool(parse_review_packet(body, latest_real.get("state")).get("blocking"))
             clean_review = (findings_on_head == 0 and not requested_changes
-                            and not _SEVERITY_RE.search((latest_real.get("body") or "")))
+                            and not body_blocking and not _BADGE_RE.search(body))
         clean = clean_comment or clean_review
 
     # our own outstanding "@codex review" REQUESTS (a non-Codex review/re-review ask, not just any
@@ -215,15 +223,17 @@ def is_inflight(c: dict, requested_head: dict) -> bool:
 
 
 def build_plan(classified: list, *, converged: dict, requested_head: dict, done, now: int,
-               merged_branches=None) -> dict:
+               merged_branches=None, default_branch: str = "main") -> dict:
     """Compute the cross-PR action plan from classified OPEN PRs + tracking state. PURE: recommends,
     never executes. ``requested_head`` is mutated in place to record recommended requests (head-aware
     in-flight across runs); the caller decides whether to persist it. ``merged_branches`` is the set of
     head branches of MERGED PRs (for stacked-child retarget detection); if omitted it is derived from
-    any merged entries in ``classified``.
+    any merged entries in ``classified``. ``default_branch`` is the repo's real base (``main`` /
+    ``master`` / ``develop``) — a PR is merge-ready only once its base is that branch.
     """
     cls = sorted(classified, key=lambda c: (-c["priority"], c["num"]))
     done = set(done or [])
+    base_branch = default_branch or "main"
     if merged_branches is None:
         merged_branches = {c.get("branch") for c in cls if c["merged"] and c.get("branch")}
     else:
@@ -238,19 +248,20 @@ def build_plan(classified: list, *, converged: dict, requested_head: dict, done,
     }
 
     # 1) RETARGET (INDEPENDENT of review state): ANY open PR whose base branch's parent PR has merged
-    #    must be repointed to main FIRST — otherwise we'd request review / fixes against a stale base.
+    #    must be repointed to the default branch FIRST — else we'd request review / fixes against a
+    #    stale base.
     for c in cls:
         if (c["num"] not in done and c["state"] == "OPEN" and c["base_ref"]
-                and c["base_ref"] != "main" and c["base_ref"] in merged_branches):
+                and c["base_ref"] != base_branch and c["base_ref"] in merged_branches):
             plan["needs_retarget"].append(c["num"])
     retarget = set(plan["needs_retarget"])
 
-    # 2) merge-ready PRs (clean / force-mergeable / converged) whose base is already main: a CONFLICTING
-    #    one is flagged for the human to resolve (merge main in, never force-push); a still-DRAFT one goes
-    #    to ready_then_merge (un-draft first); otherwise it's mergeable now.
+    # 2) merge-ready PRs (clean / force-mergeable / converged) whose base is already the default branch:
+    #    a CONFLICTING one is flagged for the human to resolve (merge the base in, never force-push); a
+    #    still-DRAFT one goes to ready_then_merge (un-draft first); otherwise it's mergeable now.
     for c in cls:
         if (c["num"] in done or c["state"] != "OPEN" or c["num"] in retarget
-                or c["base_ref"] != "main" or not ok_to_merge(c, converged)):
+                or c["base_ref"] != base_branch or not ok_to_merge(c, converged)):
             continue
         if c["mergeable"] == "CONFLICTING":
             plan["needs_conflict"].append(c["num"])

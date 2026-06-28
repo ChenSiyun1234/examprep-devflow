@@ -530,10 +530,8 @@ def cmd_orchestrate_reviews(args) -> int:
     state_path = args.state_file or orch.state_path_for_repo(repo)
     state = orch.load_state(state_path)
     try:
-        # fetch the OPEN stack and MERGED history SEPARATELY so --limit bounds the open PRs we promise to
-        # inspect (a long closed/merged history can't crowd out open PRs from a single all-state result).
-        open_prs = gh.list_prs(state="open", limit=args.limit)
-        merged_prs = gh.list_prs(state="merged", limit=args.limit)
+        default_branch = gh.get_repo_info().get("default_branch") or "main"   # not hardcoded 'main'
+        open_prs = gh.list_prs(state="open", limit=args.limit)   # --limit bounds the OPEN stack we inspect
         # --mark-converged: pin the CURRENT head of the named PR(s) as agent-verified-clean (merge rule 3).
         for num in (args.mark_converged or []):
             meta = gh.get_pr_meta(num)
@@ -552,13 +550,18 @@ def cmd_orchestrate_reviews(args) -> int:
                 continue
             classified.append(orch.classify(meta, signals, converged=state["converged"],
                                              requested_head=state["requested_head"], now=now))
+        # detect merged parents by TARGETED lookup of exactly the stack's non-default base branches, so an
+        # OLDER merged parent isn't missed by a --limit-sized window over all merged PRs.
+        candidate_bases = {p.get("base_ref") for p in open_prs
+                           if p.get("base_ref") and p.get("base_ref") != default_branch}
+        merged_branches = gh.merged_heads(candidate_bases)
     except GhError as e:
         print(f"[devflow] gh error: {e}")
         return 1
 
-    merged_branches = {p.get("head_ref") for p in merged_prs if p.get("head_ref")}
     plan = orch.build_plan(classified, merged_branches=merged_branches, converged=state["converged"],
-                           requested_head=state["requested_head"], done=state["done"], now=now)
+                           requested_head=state["requested_head"], done=state["done"], now=now,
+                           default_branch=default_branch)
     if not args.dry:                                  # persist head-aware in-flight tracking (tool state)
         orch.save_state(state, state_path)
 
