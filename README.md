@@ -210,7 +210,9 @@ watcher** (run the read-only `watch-codex-reviews` sweep and show its marker).
 **Safe by default — what it does / does not do.**
 
 - It is **local-only**: binds `127.0.0.1` by default and rejects requests whose `Host` header is not
-  a localhost name (DNS-rebinding defense). It is **not** exposed publicly and has no authentication —
+  a localhost name (DNS-rebinding defense). State-changing POSTs additionally require a same-origin
+  request (`Sec-Fetch-Site` / `Origin` validation), so another site you have open can't forge an
+  action against the dashboard (CSRF defense). It is **not** exposed publicly and has no authentication —
   do not bind it to a public interface.
 - Every action is **read-only or dry-run**: runs use the pure-stdlib fallback backend with
   `real_github` forced off, so it performs **no** real GitHub writes; packets are the same local

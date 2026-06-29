@@ -83,6 +83,21 @@ class Handler(BaseHTTPRequestHandler):
             host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
         return host in self.server.allowed_hosts
 
+    def _same_origin_ok(self) -> bool:
+        """CSRF defense for state-changing POSTs. The Host check stops DNS-rebinding, but a plain
+        cross-origin ``<form>`` POST still carries an allowed ``Host: 127.0.0.1``, so also require the
+        request to be same-origin when it comes from a browser: modern browsers send ``Sec-Fetch-Site``
+        on every request and an attacker page cannot suppress it. Non-browser clients (curl/scripts)
+        send neither header and are the operator's own tools — not a cross-site vector."""
+        site = self.headers.get("Sec-Fetch-Site")
+        if site is not None:
+            return site in ("same-origin", "none")
+        origin = self.headers.get("Origin")
+        if origin:
+            host = (self.headers.get("Host") or "").strip().lower()
+            return origin.strip().lower() in ("http://" + host, "https://" + host)
+        return True
+
     def _read_form(self) -> dict:
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -122,6 +137,12 @@ class Handler(BaseHTTPRequestHandler):
                                      "localhost name. Open it via "
                                      "<code>http://127.0.0.1</code>.</p>"), code=403)
 
+    def _forbidden_csrf(self) -> None:
+        self._send_html(_render("message.html", title="Forbidden",
+                                heading="403 — cross-site request blocked",
+                                body="<p>State-changing requests must come from the dashboard itself "
+                                     "(same-origin). Cross-site POSTs are rejected.</p>"), code=403)
+
     def _not_found(self) -> None:
         self._send_html(_render("message.html", title="Not found", heading="404",
                                 body="<p>No such page. <a href='/'>Back to runs</a>.</p>"), code=404)
@@ -152,6 +173,8 @@ class Handler(BaseHTTPRequestHandler):
         form = self._read_form()
         if not self._host_ok():
             return self._forbidden_host()
+        if not self._same_origin_ok():        # CSRF: reject cross-site browser POSTs
+            return self._forbidden_csrf()
         path = urllib.parse.urlparse(self.path).path
         if path == "/new":
             return self._post_new_run(form)
@@ -184,7 +207,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             table = ("<p class='muted'>No local runs yet. "
                      "<a href='/new'>Create a dry-run run</a>.</p>")
-        self._send_html(_render("runs.html", title="Runs", rows=table))
+        done = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("done", [""])[0]
+        notice = _alert("ok", "Run %s completed (no checkpoint to display)." % done) if done else ""
+        self._send_html(_render("runs.html", title="Runs", rows=table, notice=notice))
 
     def _page_run_detail(self, thread_id: str):
         state = service.get_run(thread_id)
@@ -252,7 +277,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as ex:
             return self._page_new_run(notice=_alert("err", str(ex)))
         tid = final.get("thread_id") or form.get("thread_id", "")
-        self._redirect("/run/" + urllib.parse.quote(tid, safe=""))
+        self._redirect_for_run(tid)
 
     def _post_decide(self, form):
         tid = form.get("thread_id", "")
@@ -260,7 +285,16 @@ class Handler(BaseHTTPRequestHandler):
             service.decide_gate(tid, form.get("gate", ""), form.get("decision", ""))
         except ValueError:
             pass                                       # stale/invalid -> just re-render the detail page
-        self._redirect("/run/" + urllib.parse.quote(tid, safe=""))
+        self._redirect_for_run(tid)
+
+    def _redirect_for_run(self, tid: str) -> None:
+        """Detail page if the run still has a checkpoint (paused); else the runs page with a completion
+        notice — a completed run's checkpoint is removed, so /run/<id> would 404."""
+        quoted = urllib.parse.quote(tid, safe="")
+        if service.get_run(tid) is None:
+            self._redirect("/?done=" + quoted)
+        else:
+            self._redirect("/run/" + quoted)
 
     def _post_export(self, form):
         tid = form.get("thread_id", "")

@@ -69,7 +69,9 @@ def list_runs() -> list:
                 s = json.load(f)
         except (OSError, ValueError):
             continue                                  # skip unreadable / non-JSON checkpoints
-        if not isinstance(s, dict):
+        # only real devflow checkpoints (always carry thread_id + status) — skips the watcher's
+        # codex_seen.json, which also lives in CKPT_DIR but is not a run.
+        if not (isinstance(s, dict) and s.get("thread_id") and s.get("status")):
             continue
         try:
             mtime = os.path.getmtime(path)
@@ -111,6 +113,10 @@ def create_run(thread_id: str, task_type: str = "docs-advisory", repo: str = "",
     thread_id = (thread_id or "").strip()
     if not thread_id:
         raise ValueError("thread_id is required")
+    # thread_id is unique: refuse rather than silently clobber an existing run's paused gate / scope.
+    if get_run(thread_id) is not None:
+        raise ValueError("a run with thread_id %r already exists — choose a unique id "
+                         "(or remove the existing run first)" % (thread_id,))
     pause_gate = None
     if pause_at:
         if pause_at not in GATE_ALIASES:

@@ -67,6 +67,20 @@ class ImportAndListTests(DashboardBase):
         self.assertEqual(r["status"], "paused")
         self.assertEqual(r["paused_gate_alias"], "advisory")
 
+    def test_list_runs_skips_watcher_seen_file(self):
+        with _quiet():
+            service.create_run("real-run", "docs-advisory", "owner/x", pause_at="advisory")
+        # the watcher writes codex_seen.json into the SAME CKPT_DIR — it must not appear as a run
+        with open(os.path.join(_cli.CKPT_DIR, "codex_seen.json"), "w", encoding="utf-8") as f:
+            json.dump({"owner/repo": {"1": {"key": "abc"}}}, f)
+        self.assertEqual([r["thread_id"] for r in service.list_runs()], ["real-run"])
+
+    def test_create_run_refuses_duplicate_thread_id(self):
+        with _quiet():
+            service.create_run("dup-1", "docs-advisory", "owner/x", pause_at="advisory")
+        with self.assertRaises(ValueError):
+            service.create_run("dup-1", "docs-advisory", "owner/x", pause_at="advisory")
+
 
 class DryRunSafetyTests(DashboardBase):
     def test_create_run_is_dry_run_and_makes_no_real_gh_calls(self):
@@ -321,6 +335,19 @@ class HttpIntegrationTests(DashboardBase):
         self.addCleanup(c.close)
         return c
 
+    def _post(self, path, fields, extra_headers=None):
+        """POST a form, optionally with extra headers (e.g. Sec-Fetch-Site / Origin)."""
+        body = urllib.parse.urlencode(fields).encode()
+        c = self._conn()
+        c.putrequest("POST", path)                    # default: sends Host: 127.0.0.1:<port>
+        c.putheader("Content-Type", "application/x-www-form-urlencoded")
+        c.putheader("Content-Length", str(len(body)))
+        for k, v in (extra_headers or {}).items():
+            c.putheader(k, v)
+        c.endheaders()
+        c.send(body)
+        return c.getresponse()
+
     def test_runs_page_ok(self):
         c = self._conn()
         c.request("GET", "/")
@@ -433,6 +460,37 @@ class HttpIntegrationTests(DashboardBase):
         self.assertEqual(resp.status, 200)
         self.assertNotIn("<script>alert(1)</script>", body)  # not reflected raw
         self.assertIn("&lt;script&gt;", body)                # HTML-escaped
+
+    def test_csrf_cross_site_post_rejected(self):
+        resp = self._post("/new", {"thread_id": "csrf-x", "pause_at": "advisory"},
+                          {"Sec-Fetch-Site": "cross-site"})
+        resp.read()
+        self.assertEqual(resp.status, 403)
+        self.assertIsNone(service.get_run("csrf-x"))         # cross-site POST had no effect
+
+    def test_csrf_same_origin_post_allowed(self):
+        with _quiet():
+            resp = self._post("/new", {"thread_id": "csrf-ok", "pause_at": "advisory"},
+                              {"Sec-Fetch-Site": "same-origin"})
+            resp.read()
+        self.assertEqual(resp.status, 303)
+        self.assertIsNotNone(service.get_run("csrf-ok"))
+
+    def test_csrf_foreign_origin_rejected(self):
+        resp = self._post("/new", {"thread_id": "csrf-o", "pause_at": "advisory"},
+                          {"Origin": "http://evil.example.com"})
+        resp.read()
+        self.assertEqual(resp.status, 403)
+        self.assertIsNone(service.get_run("csrf-o"))
+
+    def test_completed_run_redirects_to_runs_page_not_404(self):
+        with _quiet():
+            resp = self._post("/new", {"thread_id": "f2-done", "task_type": "docs-advisory",
+                                       "repo": "o/x", "pause_at": ""})
+            resp.read()
+        self.assertEqual(resp.status, 303)
+        self.assertTrue(resp.getheader("Location").startswith("/?done="))
+        self.assertIsNone(service.get_run("f2-done"))        # completed -> checkpoint cleared
 
 
 if __name__ == "__main__":
