@@ -25,6 +25,7 @@ import datetime
 import io
 import json
 import os
+import threading
 from typing import Optional
 
 from devflow import cli as _cli
@@ -38,6 +39,10 @@ from devflow.tools.packet_writer import (
 # First-line markers cmd_watch_codex_reviews can emit (read-only watcher).
 WATCH_MARKERS = ("ACTIONABLE_CODEX_REVIEWS", "CODEX_WATCH_INCOMPLETE",
                  "CODEX_QUOTA_LIMITED", "NO_NEW_CODEX_REVIEWS")
+
+# run_watcher captures stdout by swapping the PROCESS-global sys.stdout; the dashboard's
+# ThreadingHTTPServer can dispatch two /watcher requests at once, so serialize that capture.
+_WATCHER_LOCK = threading.Lock()
 
 # gate alias <-> full gate name, reused from the CLI so the dashboard can't drift from it.
 GATE_ALIASES = dict(_cli._GATE_ALIASES)            # {"advisory": "advisory_implementation", ...}
@@ -250,8 +255,9 @@ def run_watcher(repo: str, init: bool = False, limit: int = 50) -> dict:
     ns = argparse.Namespace(repo=repo, limit=int(limit), seen_file=None, reset=False,
                             init=bool(init), json=False, body_chars=400, exit_actionable=False)
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        rc = _cli.cmd_watch_codex_reviews(ns)
+    with _WATCHER_LOCK:                            # serialize the process-global stdout swap below
+        with contextlib.redirect_stdout(buf):
+            rc = _cli.cmd_watch_codex_reviews(ns)
     output = buf.getvalue()
     marker = next((m for line in output.splitlines()
                    for m in WATCH_MARKERS if line.strip() == m), None)

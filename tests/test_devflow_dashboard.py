@@ -268,6 +268,29 @@ class WatcherTests(DashboardBase):
         with self.assertRaises(ValueError):
             service.run_watcher("")
 
+    def test_watcher_serializes_global_stdout_capture(self):
+        # the process-global stdout swap must be guarded (ThreadingHTTPServer -> concurrent /watcher)
+        self.assertTrue(hasattr(service, "_WATCHER_LOCK"))
+        entered = []
+        real = service._WATCHER_LOCK
+
+        class Tracking:
+            def __enter__(s):
+                entered.append(1)
+                return real.__enter__()
+
+            def __exit__(s, *a):
+                return real.__exit__(*a)
+
+        seen = os.path.join(self.tmp, "seen.json")
+        with mock.patch.object(service, "_WATCHER_LOCK", Tracking()), \
+             mock.patch.object(_cli, "check_gh_available",
+                               return_value={"available": True, "authenticated": True}), \
+             mock.patch.object(_cli, "ReadOnlyGitHub", side_effect=lambda repo: _FakeReadOnlyGitHub(repo)), \
+             mock.patch.object(_cli, "_codex_seen_path", return_value=seen):
+            service.run_watcher("owner/repo")
+        self.assertTrue(entered)             # the lock guarded the stdout capture
+
 
 class NoShellExecutionTests(unittest.TestCase):
     def test_dashboard_layer_has_no_shell_execution(self):
@@ -287,6 +310,32 @@ class NoShellExecutionTests(unittest.TestCase):
         src = inspect.getsource(app.Handler.do_POST)
         for route in ('"/new"', '"/manual"', '"/watcher"', '"/decide"', '"/export"'):
             self.assertIn(route, src)
+
+
+class PayloadRenderTests(unittest.TestCase):
+    def test_payload_html_renders_full_gate_context(self):
+        out = app._payload_html({"question": "ok?", "advisory": "do the thing",
+                                 "blocking_comments": [{"path": "a.py", "note": "fix import"}],
+                                 "pr_url": "https://example.test/pr/1",
+                                 "review_summary": {"blocking": 1}})
+        self.assertIn("do the thing", out)
+        self.assertIn("a.py: fix import", out)
+        self.assertIn("https://example.test/pr/1", out)
+        self.assertIn("blocking", out)
+
+    def test_payload_html_escapes_untrusted_text(self):
+        out = app._payload_html({"advisory": "<b>x</b>"})
+        self.assertIn("&lt;b&gt;", out)
+        self.assertNotIn("<b>x</b>", out)
+
+
+class PackagingTests(unittest.TestCase):
+    def test_dashboard_package_and_templates_declared(self):
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(repo, "pyproject.toml"), encoding="utf-8") as f:
+            toml = f.read()
+        self.assertIn("devflow.dashboard", toml)          # package shipped
+        self.assertIn("templates/*.html", toml)           # templates shipped as package data
 
 
 class ServerTests(unittest.TestCase):

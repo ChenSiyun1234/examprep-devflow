@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import os
 import string
 import sys
@@ -60,6 +61,38 @@ def _li(items) -> str:
     if not items:
         return "<p class='muted'>(none)</p>"
     return "<ul>" + "".join("<li>%s</li>" % e(i) for i in items) + "</ul>"
+
+
+def _fmt_item(x) -> str:
+    if isinstance(x, dict):
+        path = x.get("path")
+        note = x.get("note") or x.get("body") or x.get("summary")
+        if path and note:
+            return "%s: %s" % (path, note)
+        return str(path or note or x)
+    return str(x)
+
+
+def _payload_html(payload: dict) -> str:
+    """Render the approval-gate CONTEXT (beyond the bare question) so the operator sees WHAT they are
+    approving: the advisory, blocking comments, PR url, and review summary carried in interrupt_payload."""
+    if not isinstance(payload, dict):
+        return ""
+    out = []
+    for key, label in (("advisory", "advisory"), ("blocking_comments", "blocking comments"),
+                       ("non_blocking_comments", "non-blocking comments"),
+                       ("pr_url", "PR url"), ("review_summary", "review summary")):
+        v = payload.get(key)
+        if v in (None, "", [], {}):
+            continue
+        if isinstance(v, list):
+            body = _li([_fmt_item(i) for i in v])
+        elif isinstance(v, dict):
+            body = "<pre>%s</pre>" % e(json.dumps(v, ensure_ascii=False, indent=2))
+        else:
+            body = "<div>%s</div>" % e(v)
+        out.append("<div class='payload'><div class='muted'>%s:</div>%s</div>" % (e(label), body))
+    return "".join(out)
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -238,6 +271,7 @@ class Handler(BaseHTTPRequestHandler):
                 "<div class='card gate'>"
                 "<h3>Paused at gate: %s</h3>"
                 "<p>%s</p>"
+                "%s"                              # full approval context (advisory / blocking / PR / review)
                 "<form method='post' action='/decide' class='inline'>"
                 "<input type='hidden' name='thread_id' value='%s'>"
                 "<input type='hidden' name='gate' value='%s'>"
@@ -249,7 +283,8 @@ class Handler(BaseHTTPRequestHandler):
                 "<button name='decision' value='approved'>Export Implementation Packet</button>"
                 "</form>"
                 "</div>"
-                % (e(gate_alias), e(q), e(thread_id), e(gate_alias), e(thread_id)))
+                % (e(gate_alias), e(q), _payload_html(payload), e(thread_id), e(gate_alias),
+                   e(thread_id)))
         else:
             gate_section = ("<p class='muted'>This run is <strong>%s</strong> — not paused at an "
                             "approval gate, so there is nothing to approve/reject.</p>" % e(status))
