@@ -154,6 +154,13 @@ def decide_gate(thread_id: str, gate: str, decision: str) -> dict:
         raise ValueError("no checkpoint for thread %r" % (thread_id,))
     if state.get("status") != "paused":
         raise ValueError("thread %r is not paused (status=%r)" % (thread_id, state.get("status")))
+    # the dashboard is DRY-RUN only; resuming a live (--real-github) checkpoint would force it back to
+    # dry-run and re-persist over the real provenance, breaking a later `devflow resume --real-github`.
+    # Refuse it (the run is still inspectable/exportable, just not resumable from here).
+    if state.get("real_github"):
+        raise ValueError("run %r was started with --real-github (a live flow); the dashboard is "
+                         "dry-run only and will not resume it — use the CLI: "
+                         "devflow resume --real-github" % (thread_id,))
     full_gate = GATE_ALIASES[gate]
     paused_gate = state.get("paused_at_gate")
     # FAIL CLOSED: a paused checkpoint with no recorded gate (truncated / hand-edited / foreign) must

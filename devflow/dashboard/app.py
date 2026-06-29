@@ -21,6 +21,7 @@ import argparse
 import html
 import json
 import os
+import socket
 import string
 import sys
 import urllib.parse
@@ -99,6 +100,10 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, addr, handler, allowed_hosts):
+        # bind an IPv6 socket for an IPv6 host literal (e.g. ::1) — the default family is IPv4, so
+        # without this `--host ::1` (advertised as a localhost name) would fail with an address error.
+        if ":" in (addr[0] or ""):
+            self.address_family = socket.AF_INET6
         super().__init__(addr, handler)
         self.allowed_hosts = set(allowed_hosts)
 
@@ -154,6 +159,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        # deny framing so a hostile page can't frame the dashboard and clickjack a same-origin POST
+        # past the CSRF check.
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(data)
 
@@ -244,7 +253,7 @@ class Handler(BaseHTTPRequestHandler):
         notice = _alert("ok", "Run %s completed (no checkpoint to display)." % done) if done else ""
         self._send_html(_render("runs.html", title="Runs", rows=table, notice=notice))
 
-    def _page_run_detail(self, thread_id: str):
+    def _page_run_detail(self, thread_id: str, notice: str = ""):
         state = service.get_run(thread_id)
         if state is None:
             return self._not_found()
@@ -266,31 +275,37 @@ class Handler(BaseHTTPRequestHandler):
 
         if status == "paused" and gate_alias:
             payload = state.get("interrupt_payload") or {}
-            q = payload.get("question") or ""
-            gate_section = (
-                "<div class='card gate'>"
-                "<h3>Paused at gate: %s</h3>"
-                "<p>%s</p>"
-                "%s"                              # full approval context (advisory / blocking / PR / review)
-                "<form method='post' action='/decide' class='inline'>"
-                "<input type='hidden' name='thread_id' value='%s'>"
-                "<input type='hidden' name='gate' value='%s'>"
-                "<button name='decision' value='approved' class='ok'>Approve</button>"
-                "<button name='decision' value='rejected' class='danger'>Reject</button>"
-                "</form>"
+            export_form = (
                 "<form method='post' action='/export' class='inline'>"
                 "<input type='hidden' name='thread_id' value='%s'>"
                 "<button name='decision' value='approved'>Export Implementation Packet</button>"
-                "</form>"
-                "</div>"
-                % (e(gate_alias), e(q), _payload_html(payload), e(thread_id), e(gate_alias),
-                   e(thread_id)))
+                "</form>" % e(thread_id))
+            if state.get("real_github"):
+                # a live (--real-github) checkpoint is read-only here — resuming it would clobber its
+                # real provenance. Offer inspect + export only; Approve/Reject are disabled.
+                gate_section = (
+                    "<div class='card gate'><h3>Paused at gate: %s</h3>%s"
+                    "<p class='note'>This run was started with <code>--real-github</code> (a live flow). "
+                    "The dashboard is dry-run only — Approve/Reject are disabled; resume it via the CLI "
+                    "(<code>devflow resume --real-github</code>). You can still export a packet.</p>"
+                    "%s</div>"
+                    % (e(gate_alias), _payload_html(payload), export_form))
+            else:
+                gate_section = (
+                    "<div class='card gate'><h3>Paused at gate: %s</h3><p>%s</p>%s"
+                    "<form method='post' action='/decide' class='inline'>"
+                    "<input type='hidden' name='thread_id' value='%s'>"
+                    "<input type='hidden' name='gate' value='%s'>"
+                    "<button name='decision' value='approved' class='ok'>Approve</button>"
+                    "<button name='decision' value='rejected' class='danger'>Reject</button></form>%s</div>"
+                    % (e(gate_alias), e(payload.get("question") or ""), _payload_html(payload),
+                       e(thread_id), e(gate_alias), export_form))
         else:
             gate_section = ("<p class='muted'>This run is <strong>%s</strong> — not paused at an "
                             "approval gate, so there is nothing to approve/reject.</p>" % e(status))
 
         self._send_html(_render(
-            "run_detail.html", title="Run %s" % thread_id, thread_id=e(thread_id),
+            "run_detail.html", title="Run %s" % thread_id, thread_id=e(thread_id), notice=notice,
             fields=fields_html, event_log=event_log, errors=errors_html, gate_section=gate_section))
 
     def _page_new_run(self, notice: str = ""):
@@ -334,10 +349,17 @@ class Handler(BaseHTTPRequestHandler):
     def _post_export(self, form):
         tid = form.get("thread_id", "")
         try:
-            service.export_packet(tid, decision=form.get("decision", "approved"))
-        except (ValueError, PacketError):
-            pass
-        self._redirect("/run/" + urllib.parse.quote(tid, safe=""))
+            res = service.export_packet(tid, decision=form.get("decision", "approved"))
+        except (ValueError, PacketError) as ex:
+            return self._page_run_detail(tid, notice=_alert("err", "Export failed: %s" % ex))
+        paths = res["paths"]
+        notice = (_alert("ok", "Implementation Packet exported.")
+                  + "<div class='card'><table class='kv'>"
+                    "<tr><th>markdown</th><td><code>%s</code></td></tr>"
+                    "<tr><th>json</th><td><code>%s</code></td></tr></table>"
+                    "<p>%s</p></div>"
+                    % (e(paths.get("md_path")), e(paths.get("json_path")), e(res.get("handoff"))))
+        self._page_run_detail(tid, notice=notice)
 
     def _post_manual(self, form):
         try:

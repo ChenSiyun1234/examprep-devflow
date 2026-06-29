@@ -20,6 +20,7 @@ import urllib.parse
 from unittest import mock
 
 from devflow import cli as _cli
+from devflow.tools.packet_writer import PacketError
 import devflow.dashboard.app as app
 import devflow.dashboard.service as service
 
@@ -149,6 +150,16 @@ class DecideGateTests(DashboardBase):
                          "paused_at_node": None, "approvals": {}})
         with self.assertRaises(ValueError):
             service.decide_gate("corrupt", "merge", "approved")
+
+    def test_decide_refuses_real_github_checkpoint(self):
+        # a live (--real-github) checkpoint must not be resumed as dry-run (would clobber provenance)
+        with _quiet():
+            service.create_run("rg-1", "docs-advisory", "owner/x", pause_at="advisory")
+        st = service.get_run("rg-1")
+        st["real_github"] = True
+        _cli._save_ckpt(st)
+        with self.assertRaises(ValueError):
+            service.decide_gate("rg-1", "advisory", "approved")
 
 
 class PacketTests(DashboardBase):
@@ -357,6 +368,18 @@ class ServerTests(unittest.TestCase):
         self.assertIn("localhost", allowed)
         self.assertNotIn("0.0.0.0", app._LOCALHOST_NAMES)   # 0.0.0.0 is a bind addr, not a loopback name
 
+    def test_ipv6_host_binds_ipv6_family(self):
+        import socket as _socket
+        try:
+            httpd = app.run_server("::1", 0)
+        except OSError:
+            self.skipTest("IPv6 not available on this host")
+        try:
+            self.assertEqual(httpd.address_family, _socket.AF_INET6)
+            self.assertIn("::1", httpd.allowed_hosts)
+        finally:
+            httpd.server_close()
+
     def test_main_warns_on_non_localhost_bind(self):
         # mock run_server so no public bind happens; serve_forever returns immediately
         fake = mock.Mock()
@@ -481,7 +504,7 @@ class HttpIntegrationTests(DashboardBase):
         r2.read()
         self.assertEqual(r2.status, 200)
 
-    def test_export_over_http_writes_packet(self):
+    def test_export_over_http_writes_packet_and_surfaces_result(self):
         with _quiet():
             service.create_run("http-exp", "docs-advisory", "owner/x", pause_at="advisory")
         c = self._conn()
@@ -490,11 +513,50 @@ class HttpIntegrationTests(DashboardBase):
                       body=urllib.parse.urlencode({"thread_id": "http-exp", "decision": "approved"}),
                       headers={"Content-Type": "application/x-www-form-urlencoded"})
             resp = c.getresponse()
-            resp.read()
-        self.assertEqual(resp.status, 303)
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)                   # renders the result, not a bare redirect
+        self.assertIn("exported", body.lower())
         slugs = os.listdir(self.packets)                     # PACKETS_DIR redirected by DashboardBase
         self.assertTrue(slugs)
-        self.assertTrue(os.path.isfile(os.path.join(self.packets, slugs[0], "implementation-packet.md")))
+        md = os.path.join(self.packets, slugs[0], "implementation-packet.md")
+        self.assertTrue(os.path.isfile(md))
+        self.assertIn("implementation-packet.md", body)      # path surfaced in the UI
+
+    def test_export_failure_is_surfaced(self):
+        with _quiet():
+            service.create_run("exp-fail", "docs-advisory", "owner/x", pause_at="advisory")
+        with mock.patch.object(service, "export_packet", side_effect=PacketError("symlink refused")):
+            c = self._conn()
+            c.request("POST", "/export",
+                      body=urllib.parse.urlencode({"thread_id": "exp-fail", "decision": "approved"}),
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+            resp = c.getresponse()
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("Export failed", body)
+
+    def test_responses_deny_framing(self):
+        c = self._conn()
+        c.request("GET", "/")
+        resp = c.getresponse()
+        resp.read()
+        self.assertEqual(resp.getheader("X-Frame-Options"), "DENY")
+        self.assertIn("frame-ancestors", resp.getheader("Content-Security-Policy") or "")
+
+    def test_real_github_run_is_export_only(self):
+        with _quiet():
+            service.create_run("rg-detail", "docs-advisory", "owner/x", pause_at="advisory")
+        st = service.get_run("rg-detail")
+        st["real_github"] = True
+        _cli._save_ckpt(st)
+        c = self._conn()
+        c.request("GET", "/run/rg-detail")
+        resp = c.getresponse()
+        body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("real-github", body)
+        self.assertNotIn("action='/decide'", body)            # no Approve/Reject form
+        self.assertIn("Export Implementation Packet", body)    # export still offered
 
     def test_manual_packet_html_is_escaped(self):
         c = self._conn()
