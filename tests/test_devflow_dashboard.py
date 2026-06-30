@@ -497,6 +497,33 @@ class GptPromptHelperTests(unittest.TestCase):
         self.assertIn("addressed", v["prompt"])
         self.assertNotEqual(g["prompt"], s["prompt"])
 
+    def test_body_truncation_is_flagged(self):
+        res = self._build(_gpt_gh(body="B" * 3000))      # > BODY_BUDGET (2000)
+        self.assertTrue(res["body_truncated"])
+        self.assertIn("PR description was truncated", res["prompt"])
+
+    def test_feedback_count_cap_flags_truncation(self):
+        many = [{"author": _CODEX, "body": "![P2 Badge] f%d" % i, "path": "foo.py",
+                 "created_at": "2026-01-01T00:00:%02dZ" % i} for i in range(15)]   # > 10 inline cap
+        res = self._build(_gpt_gh(codex_inline=many), include_existing_feedback=True)
+        self.assertTrue(res["feedback_truncated"])       # dropped older items -> flagged
+        self.assertIn("older signals omitted", res["prompt"])
+
+    def test_private_warning_fails_closed_on_unknown_visibility(self):
+        res = self._build(_gpt_gh(private=None))          # isPrivate absent/null -> warn anyway
+        self.assertTrue(res["private_repo_warning"])
+        self.assertIn("PRIVATE", res["prompt"])
+
+    def test_verify_fix_forces_feedback_and_notes_when_none(self):
+        res = self._build(_gpt_gh(codex_inline=[]), focus="verify-fix", include_existing_feedback=False)
+        self.assertIn("Existing Codex feedback", res["prompt"])       # included despite checkbox off
+        self.assertIn("No prior review comments were found to verify against", res["prompt"])
+
+    def test_focus_and_budget_clamped_for_invalid_input(self):
+        res = self._build(_gpt_gh(), focus="bogus", diff_budget="enormous")
+        self.assertEqual(res["focus"], "general")
+        self.assertEqual(res["diff_budget"], "compact")
+
 
 class NoShellExecutionTests(unittest.TestCase):
     # the dashboard layer + the new read-only prompt helper
@@ -953,6 +980,26 @@ class HttpIntegrationTests(DashboardBase):
             self.assertNotIn(forbidden, body)
         self.assertEqual(body.count("<form"), 1)              # only the build-prompt form
         self.assertNotIn("action='/decide'", body)
+
+    def test_gpt_review_metadata_shows_truncation_flags(self):
+        canned = {"repo": "o/r", "pr_number": 11, "pr_url": "", "title": "t", "base": "main",
+                  "head": "h", "head_sha": "s", "changed_files": [], "diff_chars": 10,
+                  "diff_truncated": True, "feedback_truncated": True, "body_truncated": True,
+                  "private_repo_warning": False, "focus": "general", "diff_budget": "compact",
+                  "prompt": "p"}
+        with mock.patch.object(service, "build_gpt_review_prompt", return_value=canned):
+            resp = self._post("/gpt-review", {"repo": "o/r", "pr_number": "11"})
+            body = resp.read().decode("utf-8")
+        self.assertIn("feedback truncated", body)
+        self.assertIn("description truncated", body)
+
+    def test_gpt_review_form_preselects_focus_and_budget(self):
+        # an invalid build (missing repo) re-renders the form and must keep the chosen focus/budget
+        resp = self._post("/gpt-review", {"repo": "", "pr_number": "11", "focus": "safety",
+                                          "diff_budget": "large"})
+        body = resp.read().decode("utf-8")
+        self.assertIn("<option value='safety' selected>", body)
+        self.assertIn("<option value='large' selected>", body)
 
     def test_review_queue_links_to_gpt_review_readonly(self):
         canned = {"marker": "ORCHESTRATION_PLAN", "repo": "o/r", "default_branch": "main",
