@@ -124,6 +124,31 @@ def _codex_write_forms(repo, nums, prs_by_num, limit=50) -> str:
             "head still matches and the confirmation is exact.</p>" + "".join(rows))
 
 
+def _mark_ready_forms(repo, nums, prs_by_num, limit=50) -> str:
+    """Strongly-confirmed 'mark draft ready' forms (one per ready_then_merge PR). Each runs EXACTLY
+    ``gh pr ready`` for that PR — never merges. The head SHA is pinned and a PR-specific confirmation
+    phrase is required. ``limit`` is carried through so the POST-time candidate recompute matches."""
+    rows = []
+    for n in nums:
+        head = (prs_by_num.get(n) or {}).get("head") or ""
+        conf = "MARK #%s READY" % n
+        rows.append(
+            "<form method='post' action='/mark-ready' style='margin:8px 0'>"
+            "<input type='hidden' name='repo' value='%s'>"
+            "<input type='hidden' name='pr_number' value='%s'>"
+            "<input type='hidden' name='expected_head_sha' value='%s'>"
+            "<input type='hidden' name='limit' value='%s'>"
+            "<strong>#%s</strong> <span class='muted'>head <code>%s</code></span> — type "
+            "<code>%s</code>: <input type='text' name='confirmation' autocomplete='off' size='24' "
+            "placeholder='%s' required> <button type='submit'>Mark ready for review</button></form>"
+            % (e(repo), e(n), e(head), e(limit), e(n), e((head or "")[:8]), e(conf), e(conf)))
+    return ("<p class='note'>Each button performs a <strong>real</strong> GitHub write — it marks the "
+            "DRAFT PR <strong>ready for review</strong> and nothing else. It does <strong>not</strong> "
+            "merge, request reviewers, retarget, push, or delete branches. It is refused unless the PR is "
+            "still a draft, still OPEN, its head still matches, and the confirmation is exact.</p>"
+            + "".join(rows))
+
+
 def _render_orchestration(result: dict, allow_writes: bool = False, limit: int = 50) -> str:
     """Render the read-only orchestration plan as escaped cards + a ranking table + a raw debug blob.
     Recommends actions only; emits NO merge/comment/retarget buttons."""
@@ -238,9 +263,17 @@ def _render_orchestration(result: dict, allow_writes: bool = False, limit: int =
         body = (_codex_write_forms(result.get("repo"), rr, prs_by_num, limit) if rr
                 else "<p class='muted'>(no request_review PRs to post to)</p>")
         write_card = card("Post @codex review — REAL GitHub write (opt-in)", body)
-    banner = (_alert("info", "GitHub writes ENABLED (localhost, opt-in): you can post @codex review to "
-                             "request_review PRs below. This is the ONLY write — no merge/mark-ready/"
-                             "retarget/reviewer/close/push.") if allow_writes else "")
+
+    # the mark-ready write lives INSIDE the "Ready then merge" card — the only bucket it may target
+    rtm = plan.get("ready_then_merge") or []
+    rtm_html = chips(rtm)
+    if allow_writes and rtm:
+        rtm_html += _mark_ready_forms(result.get("repo"), rtm, prs_by_num, limit)
+
+    banner = (_alert("info", "GitHub writes ENABLED (localhost, opt-in): post @codex review to "
+                             "request_review PRs, and mark a ready_then_merge DRAFT ready for review. "
+                             "These are the ONLY writes — no merge/retarget/reviewer/close/push/delete.")
+              if allow_writes else "")
 
     return (
         banner
@@ -252,7 +285,7 @@ def _render_orchestration(result: dict, allow_writes: bool = False, limit: int =
         + card("Findings to fix (P1/P2 or early P3)", chips(plan.get("findings_to_fix"), extra=prompt_links))
         + card("Mergeable now (clean / converged)", mn_html)
         + card("Force-mergeable (≥3 rounds, only-minor P3)", chips(plan.get("force_mergeable")))
-        + card("Ready then merge (un-draft first)", chips(plan.get("ready_then_merge")))
+        + card("Ready then merge (un-draft first)", rtm_html)
         + card("Resolve conflict (merge base in; never force-push)", chips(plan.get("needs_conflict")))
         + card("Needs retarget (parent PR merged)", rt_html)
         + card("Mergeability pending (GitHub still computing; re-run)", chips(plan.get("mergeable_unknown")))
@@ -590,6 +623,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_packet_status(form)
         if path == "/codex-review-request":
             return self._post_codex_review_request(form)
+        if path == "/mark-ready":
+            return self._post_mark_ready(form)
         if path == "/decide":
             return self._post_decide(form)
         if path == "/export":
@@ -691,18 +726,19 @@ class Handler(BaseHTTPRequestHandler):
         # mode-aware copy: the page's own header/intro/note must NOT claim "read-only / never posts" when
         # the opt-in @codex review write button is live, or an operator could think the button is dry-run.
         if getattr(self.server, "allow_writes", False):
-            mode_tag = "(writes ENABLED — can post @codex review)"
+            mode_tag = "(writes ENABLED — post @codex review · mark draft ready)"
             intro = ("Shows the same cross-PR plan as <code>orchestrate-reviews</code>. The plan is "
-                     "advisory with <strong>one exception</strong>: GitHub writes are <strong>enabled</strong> "
-                     "for this localhost session, so each <em>request review</em> PR below has a "
-                     "<strong>Post @codex review</strong> button that posts a REAL comment whose body is "
-                     "exactly <code>@codex review</code> (typed confirmation + head-match required). It "
-                     "still never merges, marks ready, retargets, requests reviewers, closes, pushes, or "
-                     "deletes branches. This is not a merge UI.")
+                     "advisory with <strong>two exceptions</strong>: GitHub writes are "
+                     "<strong>enabled</strong> for this localhost session — each <em>request review</em> PR "
+                     "has a <strong>Post @codex review</strong> button (posts the exact comment "
+                     "<code>@codex review</code>), and each <em>ready then merge</em> DRAFT has a "
+                     "<strong>Mark ready for review</strong> button (runs <code>gh pr ready</code>). Both "
+                     "require a typed confirmation + head-match. Neither merges; it still never retargets, "
+                     "requests reviewers, closes, pushes, or deletes branches. This is not a merge UI.")
             form_note = ("Requires <code>gh</code> installed and authenticated. Computing the plan is "
-                         "read-only. For each <em>request review</em> PR you can post a REAL "
-                         "<code>@codex review</code> (typed confirmation required); for mergeable PRs it "
-                         "shows a human merge-preflight note, not a merge button.")
+                         "read-only. <em>Request review</em> PRs offer a real <code>@codex review</code> "
+                         "post; <em>ready then merge</em> drafts offer a real <strong>mark ready</strong> "
+                         "(not a merge). Mergeable PRs show a human merge-preflight note, not a merge button.")
         else:
             mode_tag = "(read-only orchestrator)"
             intro = ("Shows the same cross-PR plan as <code>orchestrate-reviews</code>: who to request "
@@ -824,7 +860,8 @@ class Handler(BaseHTTPRequestHandler):
                                 heading="403 — GitHub writes disabled",
                                 body="<p>GitHub-write controls are off. Restart the dashboard with "
                                      "<code>--allow-github-writes</code> on a localhost bind to enable the "
-                                     "single <code>@codex review</code> post.</p>"), code=403)
+                                     "opt-in writes (post <code>@codex review</code> · mark a draft "
+                                     "ready).</p>"), code=403)
 
     def _post_codex_review_request(self, form):
         # GATE: writes must be enabled at startup (--allow-github-writes + localhost bind). The Host check
@@ -852,8 +889,30 @@ class Handler(BaseHTTPRequestHandler):
             notice = _alert("err", "Post failed: %s" % res.get("error"))
         self._write_result_page(notice)
 
+    def _post_mark_ready(self, form):
+        # GATE: writes must be enabled at startup (--allow-github-writes + localhost bind). Host + CSRF
+        # checks already ran for this POST. Nothing is written unless allow_writes is True.
+        if not getattr(self.server, "allow_writes", False):
+            return self._forbidden_writes()
+        repo = form.get("repo", "")
+        try:
+            res = service.mark_ready_for_review(repo, form.get("pr_number", ""),
+                                                form.get("expected_head_sha", ""),
+                                                form.get("confirmation", ""),
+                                                limit=form.get("limit"))
+        except ValueError as ex:
+            return self._write_result_page(_alert("err", "Mark-ready refused: %s" % ex))
+        except GhError as ex:
+            return self._write_result_page(_alert("err", "gh error: %s" % ex))
+        if res.get("ok"):
+            notice = _alert("ok", "Marked #%s ready for review. (Not merged — merge stays manual.)"
+                            % res.get("pr_number"))
+        else:
+            notice = _alert("err", "Mark-ready failed: %s" % res.get("error"))
+        self._write_result_page(notice)
+
     def _write_result_page(self, notice):
-        self._send_html(_render("message.html", title="Codex review request", heading="GitHub write",
+        self._send_html(_render("message.html", title="GitHub write", heading="GitHub write",
                                 body=notice + "<p><a href='/orchestrator'>&larr; back to Review Queue</a></p>"))
 
     def _page_gpt_review(self, notice: str = "", result: str = "", repo: str = "", pr: str = "",

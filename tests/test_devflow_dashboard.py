@@ -768,40 +768,43 @@ class NoShellExecutionTests(unittest.TestCase):
         import inspect
         src = inspect.getsource(app.Handler.do_POST)
         for route in ('"/new"', '"/manual"', '"/watcher"', '"/orchestrator"', '"/gpt-review"',
-                      '"/codex-review-prompt"', '"/decide"', '"/export"', '"/codex-review-request"'):
+                      '"/codex-review-prompt"', '"/decide"', '"/export"', '"/codex-review-request"',
+                      '"/mark-ready"'):
             self.assertIn(route, src)
 
     def test_no_destructive_github_write_routes_or_buttons(self):
-        # the ONLY real GitHub write is the fixed '@codex review' post. The dashboard layer must not
-        # contain any other gh write-verb shape or GitHub Actions trigger. (Tokens are chosen to match
+        # the dashboard's only real writes are post '@codex review' and 'gh pr ready' (mark-ready). The
+        # layer must not contain any OTHER gh write-verb shape or GitHub Actions trigger. (Tokens match
         # real invocations, not the safety-disclaimer PROSE that legitimately mentions these words.)
         src = ""
         for path in (app.__file__, service.__file__, dw.__file__):
             with open(path, encoding="utf-8") as f:
                 src += f.read().lower()
-        for forbidden in ("gh pr merge", "gh pr ready", "gh pr edit", "gh pr close", "delete-branch",
+        for forbidden in ("gh pr merge", "gh pr edit", "gh pr close", "pr ready --undo", "delete-branch",
                           "--force", "force-with-lease", "gh workflow", "actions/workflows",
                           ".github/workflows"):
             self.assertNotIn(forbidden, src,
                              "dashboard layer must not contain destructive write %r" % forbidden)
 
     def test_post_handler_has_no_destructive_route_literals(self):
-        # the do_POST dispatcher must not route any destructive endpoint
+        # the do_POST dispatcher must not route any destructive endpoint (mark-ready is NOT destructive —
+        # it only un-drafts; merge/retarget/reviewer/close/delete/push remain forbidden)
         import inspect
         src = inspect.getsource(app.Handler.do_POST)
-        for route in ('"/merge"', '"/mark-ready"', '"/retarget"', '"/request-review"', '"/close"',
-                      '"/delete-branch"', '"/push"'):
+        for route in ('"/merge"', '"/retarget"', '"/request-review"', '"/request-reviewer"', '"/close"',
+                      '"/delete-branch"', '"/push"', '"/force-push"'):
             self.assertNotIn(route, src,
                              "do_POST must not route destructive endpoint %s" % route)
 
-    def test_codex_body_is_a_constant_not_a_parameter(self):
-        # no generic comment API: the body is a module constant, never a function argument
+    def test_dashboard_write_helpers_take_no_generic_body_or_action(self):
+        # no generic write API: the comment body is a module constant, and neither helper accepts an
+        # arbitrary body/action/command argument
         import inspect
         self.assertEqual(dw.CODEX_REVIEW_BODY, "@codex review")
-        params = inspect.signature(dw.post_codex_review_request).parameters
-        self.assertNotIn("body", params)
-        self.assertNotIn("message", params)
-        self.assertNotIn("comment", params)
+        for fn in (dw.post_codex_review_request, dw.mark_pr_ready_for_review):
+            params = inspect.signature(fn).parameters
+            for forbidden in ("body", "message", "comment", "action", "command", "cmd", "flags", "args"):
+                self.assertNotIn(forbidden, params, "%s must not take %r" % (fn.__name__, forbidden))
 
 
 class PayloadRenderTests(unittest.TestCase):
@@ -1012,6 +1015,14 @@ class HttpIntegrationTests(DashboardBase):
         resp = self._post("/codex-review-request",
                           {"repo": "owner/repo", "pr_number": "5", "expected_head_sha": "abc1234",
                            "confirmation": "POST @codex review to #5"})
+        resp.read()
+        self.assertEqual(resp.status, 403)
+
+    def test_mark_ready_post_forbidden_when_writes_disabled(self):
+        # the mark-ready route must also 403 on the default read-only server, even with valid fields
+        resp = self._post("/mark-ready",
+                          {"repo": "owner/repo", "pr_number": "9", "expected_head_sha": "abc1234",
+                           "confirmation": "MARK #9 READY"})
         resp.read()
         self.assertEqual(resp.status, 403)
 
@@ -1809,6 +1820,38 @@ class OrchestratorWriteRenderTests(unittest.TestCase):
         html = app._render_orchestration(_CannedOrchestration.make(), True, limit=120)
         self.assertIn("name='limit' value='120'", html)
 
+    def _with_ready_then_merge(self):
+        res = _CannedOrchestration.make()                  # request_review=[5]
+        res["plan"]["ready_then_merge"] = [9]
+        res["open_prs"].append({"number": 9, "title": "draft", "branch": "feat/y",
+                                "head": "draft99head01", "base_ref": "main"})
+        return res
+
+    def test_no_mark_ready_form_when_writes_disabled(self):
+        html = app._render_orchestration(self._with_ready_then_merge(), False, 50)
+        self.assertNotIn("/mark-ready", html)
+        self.assertNotIn("MARK #9 READY", html)
+
+    def test_mark_ready_form_only_for_ready_then_merge_when_enabled(self):
+        html = app._render_orchestration(self._with_ready_then_merge(), True, 50)
+        self.assertIn("action='/mark-ready'", html)
+        self.assertIn("name='pr_number' value='9'", html)
+        self.assertIn("draft99head01", html)               # head pinned
+        self.assertIn("MARK #9 READY", html)               # exact confirmation phrase
+        self.assertIn("name='limit' value='50'", html)
+        self.assertIn("Mark ready for review", html)
+        # the mark-ready form targets ONLY #9 (ready_then_merge), NEVER #5 (request_review)
+        self.assertNotIn("MARK #5 READY", html)
+        # and its copy disclaims merge
+        self.assertIn("does <strong>not</strong> merge", html)
+
+    def test_mark_ready_absent_for_request_review_and_mergeable(self):
+        res = _CannedOrchestration.make()                  # request_review=[5], ready_then_merge=[]
+        res["plan"]["mergeable_now"] = [5]
+        html = app._render_orchestration(res, True, 50)
+        self.assertNotIn("/mark-ready", html)              # nothing in ready_then_merge -> no mark-ready
+        self.assertIn("/codex-review-request", html)       # but the codex form still renders
+
 
 class CodexWriteFlagTests(unittest.TestCase):
     """`--allow-github-writes` enables the write path ONLY on a localhost bind."""
@@ -2068,6 +2111,142 @@ class CodexWriteHelperTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class MarkReadyHelperTests(unittest.TestCase):
+    """The narrow `mark_pr_ready_for_review` helper: gating, the fixed shape, audit effects, no merge."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mr_")
+        self.audit = os.path.join(self.tmp, "actions")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _fakes(self, head="abc1234", state="OPEN", is_draft=True, write_ok=True):
+        ro = mock.Mock()
+        ro_inst = mock.Mock()
+        ro_inst.get_pr_meta.return_value = {"number": 9, "head_oid": head, "state": state,
+                                            "is_draft": is_draft}
+        ro.return_value = ro_inst
+        calls = []
+
+        class _Writer:
+            def __init__(self, repo, live=False, logger=None):
+                self.repo, self.live = repo, live
+
+            def mark_pr_ready(self, n):
+                calls.append((n, self.live))
+                return {"executed": True} if write_ok else {"executed": False, "error": "boom"}
+        return ro, _Writer, calls
+
+    def _call(self, ro, writer, **over):
+        kw = dict(repo="owner/repo", pr_number=9, expected_head_sha="abc1234",
+                  confirmation="MARK #9 READY", live=True, audit_dir=self.audit)
+        kw.update(over)
+        with mock.patch.object(dw, "ReadOnlyGitHub", ro), mock.patch.object(dw, "GitHubWriter", writer):
+            return dw.mark_pr_ready_for_review(**kw)
+
+    def _audit_lines(self):
+        p = os.path.join(self.audit, dw.AUDIT_FILE)
+        if not os.path.exists(p):
+            return []
+        with open(p, encoding="utf-8") as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def test_marks_ready_on_success_via_narrow_writer(self):
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["action"], "mark_ready_for_review")
+        self.assertEqual(calls, [(9, True)])               # ONLY the narrow mark-ready writer, live
+        rec = self._audit_lines()[-1]
+        self.assertEqual(rec["action"], "mark_ready_for_review")
+        self.assertEqual(rec["result"], "success")
+        self.assertEqual(rec["actor"], "dashboard")
+        self.assertNotIn("body", rec)                      # mark-ready has no comment body
+
+    def test_rejects_wrong_confirmation(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError):
+            self._call(ro, writer, confirmation="mark #9 ready")   # wrong case
+        self.assertEqual(calls, [])
+        self.assertEqual(self._audit_lines()[-1]["result"], "refused")
+
+    def test_rejects_confirmation_with_whitespace(self):
+        ro, writer, calls = self._fakes()
+        for bad in ("MARK #9 READY ", " MARK #9 READY", "MARK  #9 READY"):
+            with self.assertRaises(ValueError):
+                self._call(ro, writer, confirmation=bad)
+        self.assertEqual(calls, [])                         # literal, whitespace-sensitive
+
+    def test_rejects_missing_expected_head(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError):
+            self._call(ro, writer, expected_head_sha="")
+        self.assertEqual(calls, [])
+
+    def test_rejects_head_mismatch(self):
+        ro, writer, calls = self._fakes(head="zzz9999")
+        with self.assertRaises(ValueError):
+            self._call(ro, writer)                          # expected abc1234 != zzz9999
+        self.assertEqual(calls, [])
+        self.assertEqual(self._audit_lines()[-1]["result"], "refused")
+
+    def test_rejects_non_open_pr(self):
+        ro, writer, calls = self._fakes(state="MERGED")
+        with self.assertRaises(ValueError):
+            self._call(ro, writer)
+        self.assertEqual(calls, [])
+
+    def test_rejects_non_draft_pr(self):
+        ro, writer, calls = self._fakes(is_draft=False)
+        with self.assertRaises(ValueError):
+            self._call(ro, writer)                          # already ready -> nothing to do
+        self.assertEqual(calls, [])
+        self.assertIn("not a draft", self._audit_lines()[-1]["reason"])
+
+    def test_rejects_pr_not_in_ready_then_merge(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError) as cm:
+            self._call(ro, writer, candidates=[3, 4])       # #9 not a candidate
+        self.assertIn("ready_then_merge", str(cm.exception))
+        self.assertEqual(calls, [])
+
+    def test_candidate_member_proceeds(self):
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer, candidates=[5, 9])     # #9 IS a candidate
+        self.assertTrue(res["ok"])
+        self.assertEqual(calls, [(9, True)])
+
+    def test_rejects_bad_pr_number(self):
+        ro, writer, _ = self._fakes()
+        for bad in ("0", "-1", "abc", ""):
+            with self.assertRaises(ValueError):
+                self._call(ro, writer, pr_number=bad, confirmation="MARK #%s READY" % bad)
+
+    def test_failed_write_audits_failure(self):
+        ro, writer, calls = self._fakes(write_ok=False)
+        res = self._call(ro, writer)
+        self.assertFalse(res["ok"])
+        self.assertEqual(calls, [(9, True)])                # attempted
+        self.assertEqual(self._audit_lines()[-1]["result"], "failure")
+
+    def test_audit_failure_does_not_mask_successful_mark_ready(self):
+        bogus = os.path.join(self.tmp, "audit_is_a_file")
+        with open(bogus, "w", encoding="utf-8") as f:
+            f.write("x")
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer, audit_dir=bogus)       # makedirs(bogus) raises -> swallowed
+        self.assertTrue(res["ok"])                          # success not masked by the audit failure
+        self.assertEqual(calls, [(9, True)])
+
+    def test_does_not_mutate_orchestrator_state(self):
+        # mark-ready must not write requested_head / converged / done — it touches NO orchestrator state
+        import devflow.tools.review_orchestrator as orch
+        ro, writer, calls = self._fakes()
+        with mock.patch.object(orch, "save_state") as save:
+            res = self._call(ro, writer)
+        self.assertTrue(res["ok"])
+        save.assert_not_called()
+
+
 class CodexReviewServiceCandidatesTests(unittest.TestCase):
     """`service.request_codex_review` recomputes the CURRENT request_review candidates and passes them
     to the guarded helper (least authority — a stale form can't target an arbitrary OPEN PR)."""
@@ -2099,6 +2278,17 @@ class CodexReviewServiceCandidatesTests(unittest.TestCase):
                                return_value={"ok": True}) as post:
             service.request_codex_review("o/r", "5", "abc", "POST @codex review to #5")
         self.assertEqual(list(post.call_args[1]["candidates"]), [])
+
+    def test_mark_ready_passes_ready_then_merge_candidates_and_limit(self):
+        # the mark-ready write may only target the CURRENT ready_then_merge set, recomputed at the page's limit
+        with mock.patch.object(service, "run_orchestrator",
+                               return_value={"plan": {"ready_then_merge": [9, 12]}}) as ro, \
+             mock.patch.object(service.dashboard_writes, "mark_pr_ready_for_review",
+                               return_value={"ok": True, "pr_number": 9}) as mk:
+            service.mark_ready_for_review("o/r", "9", "abc", "MARK #9 READY", limit="80")
+        ro.assert_called_once_with("o/r", limit="80")
+        self.assertEqual(list(mk.call_args[1]["candidates"]), [9, 12])
+        self.assertTrue(mk.call_args[1]["live"])
 
 
 class WritesEnabledHttpTests(DashboardBase):
@@ -2170,6 +2360,36 @@ class WritesEnabledHttpTests(DashboardBase):
         self.assertEqual(r.status, 200)
         self.assertIn("Already requested", html)
         self.assertNotIn("Posted @codex review to #5", html)     # honest: it did not re-post
+
+    def _post_path(self, path, fields):
+        body = urllib.parse.urlencode(fields).encode()
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        self.addCleanup(c.close)
+        c.request("POST", path, body=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        return c.getresponse()
+
+    def test_mark_ready_success_message(self):
+        with mock.patch.object(service, "mark_ready_for_review",
+                               return_value={"ok": True, "pr_number": 9, "head_sha": "abc1234"}) as m:
+            r = self._post_path("/mark-ready", {"repo": "owner/repo", "pr_number": "9",
+                                                "expected_head_sha": "abc1234",
+                                                "confirmation": "MARK #9 READY", "limit": "50"})
+            html = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Marked #9 ready for review", html)
+        self.assertIn("Not merged", html)                        # makes clear it did NOT merge
+        m.assert_called_once()
+
+    def test_mark_ready_refusal_is_shown_not_raised(self):
+        with mock.patch.object(service, "mark_ready_for_review",
+                               side_effect=ValueError("PR #9 is not a draft (already ready) — nothing to do")):
+            r = self._post_path("/mark-ready", {"repo": "owner/repo", "pr_number": "9",
+                                                "expected_head_sha": "abc1234",
+                                                "confirmation": "MARK #9 READY"})
+            html = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Mark-ready refused", html)
+        self.assertIn("not a draft", html)
 
 
 if __name__ == "__main__":

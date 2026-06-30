@@ -402,3 +402,25 @@ def request_codex_review(repo, pr_number, expected_head_sha, confirmation, *,
     return dashboard_writes.post_codex_review_request(
         repo, pr_number, expected_head_sha, confirmation,
         live=True, candidates=candidates, audit_dir=audit_dir)
+
+
+def _current_ready_then_merge_candidates(repo, limit=None) -> list:
+    """Recompute (READ-ONLY) the PR numbers the orchestrator CURRENTLY lists under ``ready_then_merge``
+    (converged DRAFT PRs that need un-drafting before merge). The mark-ready write may only target one of
+    these (least authority). ``limit`` MUST be the window the Review Queue page was rendered with."""
+    result = run_orchestrator(repo, limit=limit if limit is not None else ORCH_LIMIT_DEFAULT)
+    return list((result.get("plan") or {}).get("ready_then_merge") or [])
+
+
+def mark_ready_for_review(repo, pr_number, expected_head_sha, confirmation, *,
+                          limit=None, audit_dir=None) -> dict:
+    """Mark a DRAFT PR ready for review. The APP gates this on --allow-github-writes + localhost BEFORE
+    calling here; this recomputes the CURRENT ready_then_merge candidate set server-side (using the SAME
+    ``limit`` the page was rendered with, so a stale/tampered form can only target a PR still listed
+    ready-then-merge) and delegates the confirmation / head / OPEN / DRAFT / fixed-shape gating to the
+    guarded writer. This does NOT merge. Returns the helper result; raises ValueError on a gate failure,
+    GhError on gh."""
+    candidates = _current_ready_then_merge_candidates(repo, limit=limit)
+    return dashboard_writes.mark_pr_ready_for_review(
+        repo, pr_number, expected_head_sha, confirmation,
+        live=True, candidates=candidates, audit_dir=audit_dir)

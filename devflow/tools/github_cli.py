@@ -670,10 +670,12 @@ _ALLOWED_WRITE_PREFIXES = {
     ("issue", "comment"),
     ("pr", "create"),
     ("pr", "comment"),
+    ("pr", "ready"),          # mark a DRAFT pr ready for review — un-draft only (NEVER --undo / draft)
 }
 _FORBIDDEN_WRITE_TOKENS = {
     "merge", "delete", "--delete", "-d", "-D", "--force", "-f",
     "--force-with-lease", "push", "close", "--admin",
+    "undo", "--undo",        # `pr ready --undo` converts BACK to draft — forbidden (mark-ready is one-way)
 }
 # obvious secret/token shapes — refuse to post content that looks like a credential.
 # Covers all GitHub token prefixes (ghp_/gho_/ghu_/ghs_/ghr_ + fine-grained github_pat_),
@@ -809,3 +811,11 @@ class GitHubWriter:
         args = ["pr", "comment", str(int(pr_number)), "-R", self.repo, "--body", body]
         sim = {"posted": False, "simulated": True}
         return self._exec(args, "comment_on_pr", f"comment on PR #{pr_number}", sim)
+
+    def mark_pr_ready(self, pr_number: int) -> dict:
+        """Mark a DRAFT pull request ready for review: EXACTLY ``gh pr ready <pr> -R <repo>`` and nothing
+        else. A single fixed write shape — no ``--undo`` (convert-to-draft), no other flags, no merge /
+        close / edit. Passes ``_assert_write_allowed`` via the ``(pr, ready)`` prefix."""
+        args = ["pr", "ready", str(int(pr_number)), "-R", self.repo]
+        sim = {"ready": True, "simulated": True}
+        return self._exec(args, "mark_pr_ready", f"mark PR #{pr_number} ready for review", sim)

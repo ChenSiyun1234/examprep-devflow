@@ -207,10 +207,11 @@ devflow-dashboard --open               # same, via the console script once the p
 (the warning still prints) and changes nothing about the read-only / dry-run safety posture.
 
 `--allow-github-writes` is **off by default**. Without it the dashboard performs **no** real GitHub writes
-at all (every button is read-only or dry-run). With it — and **only** on a localhost bind — the Review Queue
-gains the single opt-in write described below; passing it with a non-localhost `--host` is **refused** (a
-`REFUSED:` line prints and writes stay disabled). It enables exactly one action — posting the fixed comment
-`@codex review` — and nothing else.
+at all (every button is read-only or dry-run). With it — and **only** on a localhost bind (enforced in the
+server factory) — the Review Queue gains **two** narrow opt-in write controls described below; passing it
+with a non-localhost `--host` is **refused** (a `REFUSED:` line prints and writes stay disabled). The two
+controls are: (1) post the fixed comment `@codex review`, and (2) mark a draft PR ready for review. Both
+require a typed confirmation; **neither merges** — and there is **no** other GitHub write.
 
 Pages: **Runs** (list local checkpoints — thread id, status, paused gate) · **Run detail** (state
 fields, event log, errors, and — when paused — the gate payload with **Approve / Reject / Export
@@ -244,24 +245,29 @@ state). Both the CLI and the page call one structured helper
 (`devflow/tools/review_orchestrator_runner.build_orchestration_result`), so there is no stdout scraping
 and no behavioural drift.
 
-**The one opt-in write — `Post @codex review` (off unless `--allow-github-writes` on localhost).** When,
-and only when, the dashboard was started with `--allow-github-writes` on a localhost bind, each
-*request review* PR in the Review Queue gains a small confirm form. Submitting it posts a **real** GitHub
-PR comment whose body is **exactly** `@codex review` — the body is a hard-coded constant, never an input,
-so there is no arbitrary-comment box. To guard against fat-finger and stale-plan mistakes the post is
-refused unless **(a)** you type the exact PR-specific phrase `POST @codex review to #<PR>`, **(b)** the
-PR's current head SHA still matches the one the page rendered (otherwise: refresh and retry), and **(c)**
-the PR is OPEN. It still **cannot** merge / mark ready / retarget / request reviewers / close / delete
-branches / push / force-push / invoke GitHub Actions itself / post the guided prompt or any other text.
-(One honest caveat: like *any* PR comment, posting `@codex review` can trigger the **target repo's own**
-`on: issue_comment` workflows if it defines them — that is inherent to commenting, not something the
-dashboard does or can prevent; the dashboard itself never calls `gh workflow` / `workflow_dispatch`.)
-Each attempt (success, failure, or refused) appends one line to a **local** audit log,
-`.devflow/actions/dashboard-writes.jsonl` (timestamp, action, repo, PR, head SHA, the fixed body, result —
-no secrets, no GitHub content), and a successful post stamps the local orchestrator's `requested_head`
-(serialized so concurrent posts don't double-request) so the read-only planner stops re-recommending it. The mutation goes through the existing guarded
-`GitHubWriter` (write-shape allow-list + secret scan); the narrow helper is
-`devflow/tools/dashboard_writes.post_codex_review_request`.
+**The opt-in writes (off unless `--allow-github-writes` on localhost).** When, and only when, the
+dashboard was started with `--allow-github-writes` on a localhost bind, the Review Queue gains two — and
+only two — confirm forms. Every attempt (success, failure, or refused) appends one line to a **local**
+audit log, `.devflow/actions/dashboard-writes.jsonl` (timestamp, action, repo, PR, head SHA, result, and
+for the comment its fixed body — no secrets, no GitHub content). Both mutations go through the existing
+guarded `GitHubWriter` (write-shape allow-list + secret scan); the narrow helpers are in
+`devflow/tools/dashboard_writes`. **Neither merges** — merge stays a human/manual step, out of scope.
+
+1. **`Post @codex review`** (each *request review* PR). Posts a **real** PR comment whose body is
+   **exactly** `@codex review` — the body is a hard-coded constant, never an input, so there is no
+   arbitrary-comment box. Refused unless you type the exact phrase `POST @codex review to #<PR>`, the PR's
+   current head still matches the page, and the PR is OPEN. A successful post stamps the local
+   orchestrator's `requested_head` (serialized so concurrent posts don't double-request) so the planner
+   stops re-recommending it. (Honest caveat: like *any* PR comment, this can trigger the **target repo's
+   own** `on: issue_comment` workflows if defined — inherent to commenting; the dashboard itself never
+   calls `gh workflow` / `workflow_dispatch`.)
+
+2. **`Mark ready for review`** (each *ready then merge* DRAFT PR). Runs **exactly** `gh pr ready <PR>` —
+   it un-drafts the PR and nothing else (no `--undo`/convert-to-draft, no flags, no merge). Refused unless
+   you type the exact phrase `MARK #<PR> READY`, the PR is still a member of the current `ready_then_merge`
+   set, its head still matches the page, and it is still OPEN **and still a draft**. It does **not** merge,
+   request reviewers, retarget, close, push, or delete branches, and it touches no orchestrator state.
+   Helper: `devflow/tools/dashboard_writes.mark_pr_ready_for_review` → the narrow `GitHubWriter.mark_pr_ready`.
 
 **GPT fallback prompt builder (`/gpt-review`) — read-only text builder.** Creates a copyable
 GPT/ChatGPT code-review prompt for a PR from read-only GitHub data (PR metadata, changed files, a capped
@@ -283,18 +289,20 @@ Backed by `devflow/tools/fallback_review_prompt.build_fallback_review_prompt` (r
   do not bind it to a public interface.
 - Every action is **read-only or dry-run by default**: runs use the pure-stdlib fallback backend with
   `real_github` forced off, so it performs **no** real GitHub writes; packets are the same local
-  files the CLI writes; the watcher is the CLI's read-only sweep. The **one** exception is the opt-in
-  `Post @codex review` button, which exists only under `--allow-github-writes` on a localhost bind
-  (see the Review Queue section above) and can post **only** the fixed comment `@codex review`.
-- It **cannot** merge, mark ready, retarget, request reviewers, delete branches, force-push, add GitHub
-  Actions, run arbitrary shell commands (there is no such endpoint), edit code, or post any comment other
-  than the single fixed `@codex review` (and that only when explicitly opted in). The CLI remains fully
-  supported and is the source of truth; the dashboard only calls the same functions (see
-  `devflow/dashboard/service.py` and the narrow `devflow/tools/dashboard_writes.py`).
+  files the CLI writes; the watcher is the CLI's read-only sweep. The **only** exceptions are the two
+  opt-in controls — `Post @codex review` and `Mark ready for review` — which exist only under
+  `--allow-github-writes` on a localhost bind (see the Review Queue section above).
+- It **cannot** merge, retarget, request reviewers, close PRs, delete branches, force-push, push, add
+  GitHub Actions, run arbitrary shell commands (there is no such endpoint), edit code, post any comment
+  other than the fixed `@codex review`, or perform any GitHub write other than those two opt-in controls
+  (and only when explicitly opted in). The CLI remains fully supported and is the source of truth; the
+  dashboard only calls the same functions (see `devflow/dashboard/service.py` and the narrow
+  `devflow/tools/dashboard_writes.py`).
 
 **Not yet (out of scope for this MVP):** the real LangGraph backend (the dashboard always uses the
-stdlib fallback), authentication, public deployment, and any GitHub write beyond the single opt-in,
-localhost-only, strongly-confirmed `@codex review` post.
+stdlib fallback), authentication, public deployment, and any GitHub write beyond the two opt-in,
+localhost-only, strongly-confirmed controls (post `@codex review` · mark a draft ready). **Merge stays a
+human/manual step** — there is no merge button.
 
 ## LangGraph Studio (`langgraph dev`)
 
