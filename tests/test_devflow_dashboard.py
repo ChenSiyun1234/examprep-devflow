@@ -1561,6 +1561,38 @@ class PacketStoreTests(unittest.TestCase):
         self.assertIn("<span class='marker'>created</span>", html)   # marker renders
         self.assertNotIn("&lt;span class='marker'&gt;", html)        # not shown as literal markup
 
+    def test_status_reset_when_packet_regenerated(self):
+        slug = _make_packet(self.base, "regen1")
+        packet_store.write_status(self.base, slug, "implemented")
+        self.assertEqual(packet_store.read_status(self.base, slug), "implemented")
+        # regenerate the packet under the SAME slug with a NEW generated_at
+        jp = os.path.join(self.base, slug, "implementation-packet.json")
+        with open(jp, encoding="utf-8") as f:
+            pkt = json.load(f)
+        pkt["metadata"]["generated_at"] = "2026-07-01T12:00:00Z"
+        with open(jp, "w", encoding="utf-8") as f:
+            json.dump(pkt, f)
+        self.assertEqual(packet_store.read_status(self.base, slug), "created")   # stale status reset
+
+    def test_status_writes_are_serialized(self):
+        self.assertTrue(hasattr(packet_store, "_STATUS_LOCK"))
+        slug = _make_packet(self.base, "lock1")
+        entered = []
+        real = packet_store._STATUS_LOCK
+
+        class Tracking:
+            def __enter__(s):
+                entered.append(1)
+                return real.__enter__()
+
+            def __exit__(s, *a):
+                return real.__exit__(*a)
+
+        with mock.patch.object(packet_store, "_STATUS_LOCK", Tracking()):
+            packet_store.write_status(self.base, slug, "in_progress")
+        self.assertTrue(entered)                                                  # write guarded by the lock
+        self.assertEqual(packet_store.read_status(self.base, slug), "in_progress")
+
     def test_detail_render_escapes_untrusted_fields(self):
         slug = _make_packet(self.base, "t6", task="<script>alert(1)</script>")
         p = packet_store.get_packet(self.base, slug)

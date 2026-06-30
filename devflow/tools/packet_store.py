@@ -14,8 +14,13 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import threading
 
 from devflow.tools.packet_writer import PACKET_JSON_NAME, PACKET_MD_NAME, MANUAL_SOURCE
+
+# serialize status writes: the dashboard's ThreadingHTTPServer can run two /packet-status POSTs for the
+# same packet at once, and they would otherwise both write the same '<final>.tmp' and clobber each other.
+_STATUS_LOCK = threading.Lock()
 
 STATUS_FILE = "handoff-status.json"
 # packet handoff lifecycle (local-only).
@@ -111,43 +116,57 @@ def _normalize(packet: dict) -> dict:
     }
 
 
+def _packet_generated_at(pkt_dir: str):
+    pkt = _read_packet_json(pkt_dir) or {}
+    return (pkt.get("metadata") if isinstance(pkt.get("metadata"), dict) else {}).get("generated_at")
+
+
 def read_status(base_dir: str, slug: str) -> str:
-    """Current handoff status (default ``created``). Read-only; tolerant of a missing/garbled file."""
+    """Current handoff status (default ``created``). Read-only; tolerant of a missing/garbled file. A
+    status recorded for a DIFFERENT packet generation is treated as stale and reset to ``created`` — so a
+    packet re-exported under the same slug doesn't inherit the previous run's ``implemented``/``abandoned``."""
     pkt_dir = _packet_dir(base_dir, slug)
     sp = os.path.join(pkt_dir, STATUS_FILE)
     if os.path.islink(sp) or not os.path.isfile(sp):   # missing / symlink / FIFO -> default, don't open
         return DEFAULT_STATUS
     try:
         with open(sp, encoding="utf-8") as f:
-            data = json.load(f)
-        status = (data or {}).get("status") if isinstance(data, dict) else None
+            record = json.load(f)
     except (OSError, ValueError):
-        status = None
-    return status if status in STATUSES else DEFAULT_STATUS
+        return DEFAULT_STATUS
+    if not isinstance(record, dict) or record.get("status") not in STATUSES:
+        return DEFAULT_STATUS
+    gen, rec_gen = _packet_generated_at(pkt_dir), record.get("packet_generated_at")
+    if gen is not None and rec_gen is not None and str(rec_gen) != str(gen):
+        return DEFAULT_STATUS                          # status was for an earlier generation -> stale
+    return record["status"]
 
 
 def write_status(base_dir: str, slug: str, status: str) -> dict:
-    """Write the LOCAL handoff status file ONLY (the single side effect). Validates slug + status; the
-    packet dir must already exist (a status can't be set for a non-existent packet). Returns the record."""
+    """Write the LOCAL handoff status file ONLY (the single side effect). Validates slug + status; the dir
+    must be a real packet. Stamps the packet's generated_at so a later regeneration invalidates it.
+    Serialized + symlink/hardlink-guarded. Returns the record."""
     pkt_dir = _packet_dir(base_dir, slug)
     if status not in STATUSES:
         raise ValueError("invalid status %r (allowed: %s)" % (status, ", ".join(STATUSES)))
     if not os.path.isdir(pkt_dir) or _read_packet_json(pkt_dir) is None:
         # a safe-named but non-packet sibling dir must NOT receive a stray handoff-status.json
         raise ValueError("not a packet directory %r (no valid implementation-packet.json)" % (slug,))
-    record = {"status": status, "updated_at": _now_iso()}
+    record = {"status": status, "updated_at": _now_iso(),
+              "packet_generated_at": _packet_generated_at(pkt_dir)}
     final = os.path.join(pkt_dir, STATUS_FILE)
     tmp = final + ".tmp"
-    for p in (tmp, final):
-        # never follow a planted symlink, or truncate a hard-linked / non-regular target (open(w) would
-        # write THROUGH to a shared inode) — the endpoint promises to write only the local status file.
-        if os.path.islink(p):
-            raise ValueError("refusing to write through a symlinked status file: %s" % p)
-        if os.path.exists(p) and (not os.path.isfile(p) or os.stat(p).st_nlink > 1):
-            raise ValueError("refusing to write a hard-linked or non-regular status file: %s" % p)
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(record, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, final)
+    with _STATUS_LOCK:                                  # serialize: concurrent /packet-status share <final>.tmp
+        for p in (tmp, final):
+            # never follow a planted symlink, or truncate a hard-linked / non-regular target (open(w) would
+            # write THROUGH to a shared inode) — the endpoint promises to write only the local status file.
+            if os.path.islink(p):
+                raise ValueError("refusing to write through a symlinked status file: %s" % p)
+            if os.path.exists(p) and (not os.path.isfile(p) or os.stat(p).st_nlink > 1):
+                raise ValueError("refusing to write a hard-linked or non-regular status file: %s" % p)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, final)
     return record
 
 
