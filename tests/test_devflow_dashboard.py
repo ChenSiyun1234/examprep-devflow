@@ -880,6 +880,26 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("not localhost", err.getvalue().lower())
 
+    def test_writes_allowed_for_host_localhost_only(self):
+        # Codex R3 P2: the localhost-only write boundary is a pure predicate enforced in the factory
+        self.assertTrue(app._writes_allowed_for_host("127.0.0.1", True))
+        self.assertTrue(app._writes_allowed_for_host("localhost", True))
+        self.assertTrue(app._writes_allowed_for_host("::1", True))
+        self.assertTrue(app._writes_allowed_for_host(" LOCALHOST ", True))   # trimmed + case-insensitive
+        self.assertFalse(app._writes_allowed_for_host("0.0.0.0", True))      # non-loopback bind -> off
+        self.assertFalse(app._writes_allowed_for_host("10.0.0.5", True))
+        self.assertFalse(app._writes_allowed_for_host("127.0.0.1", False))   # opt-in off -> off
+
+    def test_run_server_factory_enforces_localhost_for_writes(self):
+        # run_server() used directly (embedding/test harness) must not enable writes off-loopback
+        httpd = app.run_server("127.0.0.1", 0, allow_writes=True)
+        try:
+            self.assertTrue(httpd.allow_writes)               # localhost bind keeps the opt-in
+        finally:
+            httpd.server_close()
+        # the non-loopback case is covered by the pure-predicate test above (no public bind in tests)
+        self.assertFalse(app._writes_allowed_for_host("0.0.0.0", True))
+
     def test_main_brackets_ipv6_url(self):
         fake = mock.Mock()
         fake.serve_forever.side_effect = KeyboardInterrupt
@@ -1836,6 +1856,8 @@ class CodexWriteHelperTests(unittest.TestCase):
         self.audit = os.path.join(self.tmp, "actions")
         self.state = os.path.join(self.tmp, "orch_state.json")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        dw._POSTED.clear()                                  # isolate the in-process dedup marker per test
+        self.addCleanup(dw._POSTED.clear)
 
     def _fakes(self, head="abc1234", state="OPEN", post_ok=True):
         ro = mock.Mock()
@@ -2002,28 +2024,48 @@ class CodexWriteHelperTests(unittest.TestCase):
         self.assertEqual(rh["5"], "abc1234")                     # new stamp present
         self.assertEqual(rh["7"], "oldhead7")                    # pre-existing stamp NOT clobbered
 
-    def test_duplicate_post_at_same_head_is_skipped(self):
-        # if review was already requested at THIS head (earlier post or the external watcher), don't
-        # post a second @codex review — idempotency that backs the concurrent-double-click guard
+    def test_planner_requested_head_does_not_block_first_post(self):
+        # Codex R3 P1: requested_head is ALSO written by build_plan to merely RECOMMEND a request
+        # (orchestrate-reviews without --dry). It must NOT make the first real dashboard post a silent
+        # no-op — idempotency keys off the dashboard's OWN _POSTED marker, not the shared requested_head.
         import devflow.tools.review_orchestrator as orch
         st0 = orch.load_state(self.state)
-        st0["requested_head"]["5"] = "abc1234"
+        st0["requested_head"]["5"] = "abc1234"                  # advisory marker, NOT a posted comment
         orch.save_state(st0, self.state)
         ro, writer, calls = self._fakes(head="abc1234")
         res = self._call(ro, writer)
         self.assertTrue(res["ok"])
-        self.assertTrue(res.get("duplicate"))
-        self.assertEqual(calls, [])                              # NO duplicate comment posted
-        self.assertEqual(self._audit_lines()[-1]["result"], "skipped_duplicate")
+        self.assertNotIn("duplicate", res)                      # NOT treated as already-posted
+        self.assertEqual(calls, [(5, "@codex review", True)])   # the real post DID happen
 
     def test_second_post_same_head_skips_after_first(self):
+        # this dashboard's OWN second submission for the same PR+head is the idempotent no-op (the
+        # concurrent-double-click guard) — exactly one real post across both calls
         ro, writer, calls = self._fakes(head="abc1234")
         r1 = self._call(ro, writer)
-        r2 = self._call(ro, writer)                              # same PR + head, immediately again
+        r2 = self._call(ro, writer)                             # same PR + head, immediately again
         self.assertTrue(r1["ok"])
         self.assertNotIn("duplicate", r1)
         self.assertTrue(r2.get("duplicate"))
-        self.assertEqual(calls, [(5, "@codex review", True)])    # exactly ONE real post across both calls
+        self.assertEqual(calls, [(5, "@codex review", True)])   # exactly ONE real post across both calls
+        self.assertEqual(self._audit_lines()[-1]["result"], "skipped_duplicate")
+
+    def test_new_head_is_not_a_duplicate(self):
+        # a post at head A then a later post at head B (the PR advanced) must both go through
+        ro1, writer1, calls1 = self._fakes(head="aaaaaaa")
+        self._call(ro1, writer1, expected_head_sha="aaaaaaa")
+        ro2, writer2, calls2 = self._fakes(head="bbbbbbb")
+        res = self._call(ro2, writer2, expected_head_sha="bbbbbbb")
+        self.assertTrue(res["ok"])
+        self.assertNotIn("duplicate", res)
+        self.assertEqual(calls2, [(5, "@codex review", True)])  # new head posted, not skipped
+
+    def test_confirmation_must_be_literal_no_trailing_space(self):
+        # Codex R3 P3: the phrase is whitespace-sensitive — a trailing space must NOT pass
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError):
+            self._call(ro, writer, confirmation="POST @codex review to #5 ")
+        self.assertEqual(calls, [])
 
 
 class CodexReviewServiceCandidatesTests(unittest.TestCase):
@@ -2116,6 +2158,18 @@ class WritesEnabledHttpTests(DashboardBase):
         self.assertIn("Post @codex review", body)
         self.assertNotIn("never mutates GitHub", body)            # no contradictory read-only claim
         self.assertNotIn("the dashboard never posts it", body)
+
+    def test_duplicate_post_shows_honest_not_posted_message(self):
+        # an idempotent no-op must NOT claim "Posted" (Codex R3 P1 honesty)
+        with mock.patch.object(service, "request_codex_review",
+                               return_value={"ok": True, "duplicate": True, "pr_number": 5,
+                                             "head_sha": "abc1234"}):
+            r = self._post({"repo": "owner/repo", "pr_number": "5", "expected_head_sha": "abc1234",
+                            "confirmation": "POST @codex review to #5"})
+            html = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Already requested", html)
+        self.assertNotIn("Posted @codex review to #5", html)     # honest: it did not re-post
 
 
 if __name__ == "__main__":

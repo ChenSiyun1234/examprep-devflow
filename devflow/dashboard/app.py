@@ -429,6 +429,13 @@ def _render_packet_detail(p: dict, notice: str = "") -> str:
             + card("Suggested Claude Code handoff", "<pre>%s</pre>" % e(p.get("handoff"))))
 
 
+def _writes_allowed_for_host(host, allow_writes) -> bool:
+    """The localhost-only write boundary, as a pure predicate so it can be enforced at the server factory
+    (not only in main()) and unit-tested without binding a socket. Writes are permitted ONLY when the
+    operator opted in AND the bind host is a loopback name."""
+    return bool(allow_writes) and (host or "").strip().lower() in _LOCALHOST_NAMES
+
+
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -439,9 +446,10 @@ class DashboardServer(ThreadingHTTPServer):
             self.address_family = socket.AF_INET6
         super().__init__(addr, handler)
         self.allowed_hosts = set(allowed_hosts)
-        # the ONE opt-in real-GitHub-write capability (post @codex review). Only ever True when the
-        # operator passed --allow-github-writes AND bound a localhost host (set in main()).
-        self.allow_writes = bool(allow_writes)
+        # the ONE opt-in real-GitHub-write capability (post @codex review). Enforce the localhost-only
+        # boundary HERE (not just in main()) so an embedding/test harness calling run_server() directly
+        # can't enable writes on a non-loopback bind: writes stay off unless the bind host is a loopback.
+        self.allow_writes = _writes_allowed_for_host(addr[0], allow_writes)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -833,7 +841,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._write_result_page(_alert("err", "Post refused: %s" % ex))
         except GhError as ex:
             return self._write_result_page(_alert("err", "gh error: %s" % ex))
-        if res.get("ok"):
+        if res.get("ok") and res.get("duplicate"):
+            # idempotent no-op: this dashboard already posted at this head — be honest (don't say "Posted")
+            notice = _alert("info", "Already requested @codex review for #%s at this head — not re-posted."
+                            % res.get("pr_number"))
+        elif res.get("ok"):
             notice = _alert("ok", "Posted @codex review to #%s (head %s)."
                             % (res.get("pr_number"), str(res.get("head_sha"))[:8]))
         else:

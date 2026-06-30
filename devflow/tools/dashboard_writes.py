@@ -33,10 +33,17 @@ CODEX_REVIEW_BODY = "@codex review"                    # the ONLY body this modu
 AUDIT_DIR = os.path.join(".devflow", "actions")        # local tool-state, gitignored
 AUDIT_FILE = "dashboard-writes.jsonl"
 
-# Serialize the whole post critical section (idempotency check -> comment_on_pr -> requested_head stamp)
-# across ThreadingHTTPServer worker threads, so two concurrent submissions for the same PR can't both
-# reach the GitHub write before either stamps requested_head (which would emit a DUPLICATE @codex review).
+# Serialize the whole post critical section (idempotency check -> comment_on_pr -> stamp) across
+# ThreadingHTTPServer worker threads, so two concurrent submissions for the same PR can't both reach the
+# GitHub write before the first records its post (which would emit a DUPLICATE @codex review).
 _POST_LOCK = threading.Lock()
+
+# What THIS dashboard process has actually posted: (repo, pr) -> head. Deliberately SEPARATE from the
+# orchestrator's shared ``requested_head`` (which build_plan also writes to merely RECOMMEND a request,
+# without posting) — keying idempotency off requested_head would make the first real post a silent no-op
+# for any PR/head already present in orchestrator state. In-process is sufficient: the concern is a
+# rapid double-submit within one session; a deliberate click in a fresh process is a real new request.
+_POSTED = {}
 
 
 def confirmation_text(pr_number) -> str:
@@ -108,7 +115,7 @@ def post_codex_review_request(repo: str, pr_number, expected_head_sha: str, conf
     expected = (expected_head_sha or "").strip()
     if not expected:
         _refuse(audit_dir, repo, n, "", "expected_head_sha is required")
-    if (confirmation or "").strip() != confirmation_text(n):
+    if (confirmation or "") != confirmation_text(n):       # LITERAL, whitespace-sensitive (no .strip())
         _refuse(audit_dir, repo, n, "",
                 "confirmation does not match — type exactly: %s" % confirmation_text(n))
 
@@ -135,19 +142,16 @@ def post_codex_review_request(repo: str, pr_number, expected_head_sha: str, conf
                 % (n, (head[:8] or "?"), expected[:8]))
 
     # Serialize the POST itself (not merely the bookkeeping) so two concurrent submissions for the same
-    # PR — e.g. a double-click on the threaded server — can't both reach comment_on_pr before
-    # requested_head is stamped (which would post a DUPLICATE @codex review and burn Codex review slots).
-    # Idempotent: if review was already requested at THIS exact head (by an earlier post or the external
-    # watcher), skip the write entirely. Everything after the post is best-effort and never raises.
-    path = state_file or orch.state_path_for_repo(repo)
+    # PR — e.g. a double-click on the threaded server — can't both reach comment_on_pr before the first
+    # records its post (which would emit a DUPLICATE @codex review). Idempotent ONLY against THIS
+    # dashboard's own prior post (the _POSTED marker), NOT against the orchestrator's shared
+    # requested_head — that one is also set by build_plan to merely RECOMMEND a request, so skipping on it
+    # would silently drop the first real post. Everything after the post is best-effort and never raises.
+    key = (repo, n)
     with _POST_LOCK:
-        try:
-            st = orch.load_state(path)
-        except Exception:
-            st = {"requested_head": {}}
-        if (st.get("requested_head") or {}).get(str(n)) == head:
+        if _POSTED.get(key) == head:
             _audit(audit_dir, _audit_record(repo, n, head, "skipped_duplicate",
-                                            "review already requested at this head"))
+                                            "this dashboard already posted at this head"))
             return {"ok": True, "pr_number": n, "head_sha": head, "body": CODEX_REVIEW_BODY,
                     "duplicate": True}
 
@@ -159,9 +163,12 @@ def post_codex_review_request(repo: str, pr_number, expected_head_sha: str, conf
             return {"ok": False, "error": res.get("error") or "post failed",
                     "pr_number": n, "head_sha": head}
 
-        # the Dashboard ACTUALLY requested review here — stamp requested_head ONLY on success, merging
-        # into existing state (never clobbering other PRs / converged / done).
+        # record OUR post (in-process idempotency marker), then ALSO stamp the orchestrator's shared
+        # requested_head so the read-only planner stops re-recommending it (now TRUE — we really posted).
+        _POSTED[key] = head
         try:
+            path = state_file or orch.state_path_for_repo(repo)
+            st = orch.load_state(path)
             st.setdefault("requested_head", {})[str(n)] = head
             orch.save_state(st, path)
         except Exception:
