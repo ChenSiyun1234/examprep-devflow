@@ -1,0 +1,32 @@
+<h1>New dry-run run</h1>
+<p class="muted">Creates a devflow run on the pure-stdlib fallback backend. Everything is
+<strong>dry-run</strong>: no GitHub writes ever. Pick a gate to pause at so you can approve/reject
+and export an Implementation Packet.</p>
+$notice
+<form method="post" action="/new" class="card">
+  <label for="thread_id">thread_id <span class="muted">(required, unique)</span></label>
+  <input type="text" id="thread_id" name="thread_id" placeholder="e.g. demo-1" required>
+
+  <label for="task_type">task_type</label>
+  <input type="text" id="task_type" name="task_type" value="docs-advisory">
+
+  <label for="repo">repo</label>
+  <input type="text" id="repo" name="repo" placeholder="owner/name (dry-run — never written to)">
+
+  <label for="pause_at">pause at gate</label>
+  <select id="pause_at" name="pause_at">
+    <option value="">(run to completion — do not pause)</option>
+    <option value="advisory" selected>advisory — approve implementing the advisory</option>
+    <option value="fix">fix — approve fixing blocking comments</option>
+    <option value="merge">merge — approve the final merge</option>
+  </select>
+
+  <label for="backend">backend</label>
+  <select id="backend" name="backend" disabled>
+    <option selected>stdlib fallback (dry-run)</option>
+  </select>
+  <p class="note">Backend is the stdlib fallback for this MVP. LangGraph stays an optional dev
+  dependency and is not wired into the dashboard yet.</p>
+
+  <p><button type="submit">Create run</button></p>
+</form>

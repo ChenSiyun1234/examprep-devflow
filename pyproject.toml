@@ -18,4 +18,9 @@ langgraph = ["langgraph>=0.2,<0.4", "langgraph-checkpoint-sqlite>=2.0"]
 studio = ["langgraph>=0.2,<0.4", "langgraph-checkpoint-sqlite>=2.0", "langgraph-cli[inmem]>=0.1.55"]
 
 [tool.setuptools]
-packages = ["devflow", "devflow.nodes", "devflow.tools"]
+packages = ["devflow", "devflow.nodes", "devflow.tools", "devflow.dashboard"]
+
+[tool.setuptools.package-data]
+# the dashboard's HTML templates are opened at runtime (app.py) — ship them in the wheel/sdist so
+# `python -m devflow.dashboard.app` works on an installed package, not only from the checkout.
+"devflow.dashboard" = ["templates/*.html"]
