@@ -267,7 +267,10 @@ guarded `GitHubWriter` (write-shape allow-list + secret scan); the narrow helper
    you type the exact phrase `MARK #<PR> READY`, the PR is still a member of the current `ready_then_merge`
    set, its head still matches the page, and it is still OPEN **and still a draft**. It does **not** merge,
    request reviewers, retarget, close, push, or delete branches, and it touches no orchestrator state.
-   Helper: `devflow/tools/dashboard_writes.mark_pr_ready_for_review` → the narrow `GitHubWriter.mark_pr_ready`.
+   (Honest caveat: like readying *any* PR, this can trigger the **target repo's own**
+   `pull_request: ready_for_review` workflows if defined — inherent to un-drafting; the dashboard itself
+   never invokes Actions.) Helper: `devflow/tools/dashboard_writes.mark_pr_ready_for_review` → the narrow
+   `GitHubWriter.mark_pr_ready`.
 
 **GPT fallback prompt builder (`/gpt-review`) — read-only text builder.** Creates a copyable
 GPT/ChatGPT code-review prompt for a PR from read-only GitHub data (PR metadata, changed files, a capped

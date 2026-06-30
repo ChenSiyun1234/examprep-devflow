@@ -1852,6 +1852,13 @@ class OrchestratorWriteRenderTests(unittest.TestCase):
         self.assertNotIn("/mark-ready", html)              # nothing in ready_then_merge -> no mark-ready
         self.assertIn("/codex-review-request", html)       # but the codex form still renders
 
+    def test_mark_ready_form_warns_about_ready_for_review_actions(self):
+        # Codex PR#16 R1: readying a draft can trigger the target repo's pull_request:ready_for_review
+        # workflows — the button copy must carry that honest caveat (like the @codex review caveat)
+        html = app._render_orchestration(self._with_ready_then_merge(), True, 50)
+        self.assertIn("ready_for_review", html)
+        self.assertIn("never invokes", html)               # "...the dashboard itself never invokes Actions"
+
 
 class CodexWriteFlagTests(unittest.TestCase):
     """`--allow-github-writes` enables the write path ONLY on a localhost bind."""
@@ -2289,6 +2296,37 @@ class CodexReviewServiceCandidatesTests(unittest.TestCase):
         ro.assert_called_once_with("o/r", limit="80")
         self.assertEqual(list(mk.call_args[1]["candidates"]), [9, 12])
         self.assertTrue(mk.call_args[1]["live"])
+
+    def _audit_lines(self, audit_dir):
+        p = os.path.join(audit_dir, dw.AUDIT_FILE)
+        with open(p, encoding="utf-8") as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def test_gh_error_during_mark_ready_recompute_is_audited_as_failure(self):
+        # Codex PR#16 R1: a gh read failure (candidate recompute / metadata) must be audited, then re-raised
+        from devflow.tools.github_cli import GhError
+        tmp = tempfile.mkdtemp(prefix="svc_aud_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        audit = os.path.join(tmp, "actions")
+        with mock.patch.object(service, "run_orchestrator", side_effect=GhError("gh down")):
+            with self.assertRaises(GhError):
+                service.mark_ready_for_review("o/r", "9", "abc", "MARK #9 READY", audit_dir=audit)
+        rec = self._audit_lines(audit)[-1]
+        self.assertEqual(rec["action"], "mark_ready_for_review")
+        self.assertEqual(rec["result"], "failure")
+        self.assertIn("gh error", rec["reason"])
+
+    def test_gh_error_during_codex_review_recompute_is_audited_as_failure(self):
+        from devflow.tools.github_cli import GhError
+        tmp = tempfile.mkdtemp(prefix="svc_aud2_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        audit = os.path.join(tmp, "actions")
+        with mock.patch.object(service, "run_orchestrator", side_effect=GhError("gh down")):
+            with self.assertRaises(GhError):
+                service.request_codex_review("o/r", "5", "abc", "POST @codex review to #5", audit_dir=audit)
+        rec = self._audit_lines(audit)[-1]
+        self.assertEqual(rec["action"], "post_codex_review")
+        self.assertEqual(rec["result"], "failure")
 
 
 class WritesEnabledHttpTests(DashboardBase):

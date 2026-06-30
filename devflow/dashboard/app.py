@@ -143,9 +143,12 @@ def _mark_ready_forms(repo, nums, prs_by_num, limit=50) -> str:
             "placeholder='%s' required> <button type='submit'>Mark ready for review</button></form>"
             % (e(repo), e(n), e(head), e(limit), e(n), e((head or "")[:8]), e(conf), e(conf)))
     return ("<p class='note'>Each button performs a <strong>real</strong> GitHub write — it marks the "
-            "DRAFT PR <strong>ready for review</strong> and nothing else. It does <strong>not</strong> "
-            "merge, request reviewers, retarget, push, or delete branches. It is refused unless the PR is "
-            "still a draft, still OPEN, its head still matches, and the confirmation is exact.</p>"
+            "DRAFT PR <strong>ready for review</strong> (runs <code>gh pr ready</code>) and nothing else. "
+            "It does <strong>not</strong> merge, request reviewers, retarget, push, or delete branches. It "
+            "is refused unless the PR is still a draft, still OPEN, its head still matches, and the "
+            "confirmation is exact. (Honest caveat: like readying <em>any</em> PR, this can trigger the "
+            "<strong>target repo's own</strong> <code>pull_request: ready_for_review</code> workflows if "
+            "defined — inherent to un-drafting; the dashboard itself never invokes GitHub Actions.)</p>"
             + "".join(rows))
 
 

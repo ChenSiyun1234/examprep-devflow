@@ -36,6 +36,7 @@ from devflow.tools.packet_writer import (
     render_manual_markdown, write_packet, PacketError,  # noqa: F401 (re-exported for the app layer)
 )
 from devflow.tools.review_orchestrator_runner import build_orchestration_result
+from devflow.tools.github_cli import GhError
 from devflow.tools.fallback_review_prompt import (
     build_fallback_review_prompt, FOCUS_MODES, DIFF_BUDGETS,
 )
@@ -398,10 +399,17 @@ def request_codex_review(repo, pr_number, expected_head_sha, confirmation, *,
     SAME ``limit`` the page was rendered with, so a stale/tampered form can only target a PR still
     recommended for review) and delegates the confirmation / head / OPEN / fixed-body gating to the
     guarded writer. Returns the helper result; raises ValueError on a gate failure, GhError on gh."""
-    candidates = _current_request_review_candidates(repo, limit=limit)
-    return dashboard_writes.post_codex_review_request(
-        repo, pr_number, expected_head_sha, confirmation,
-        live=True, candidates=candidates, audit_dir=audit_dir)
+    try:
+        candidates = _current_request_review_candidates(repo, limit=limit)
+        return dashboard_writes.post_codex_review_request(
+            repo, pr_number, expected_head_sha, confirmation,
+            live=True, candidates=candidates, audit_dir=audit_dir)
+    except GhError as ex:
+        # a gh read failure (candidate recompute / PR-metadata read) is a FAILED attempt — audit it too,
+        # then propagate so the handler renders the error (the local trail must cover gh failures).
+        dashboard_writes.audit_failure(dashboard_writes.POST_ACTION, repo, pr_number,
+                                       "gh error: %s" % ex, audit_dir=audit_dir)
+        raise
 
 
 def _current_ready_then_merge_candidates(repo, limit=None) -> list:
@@ -420,7 +428,14 @@ def mark_ready_for_review(repo, pr_number, expected_head_sha, confirmation, *,
     ready-then-merge) and delegates the confirmation / head / OPEN / DRAFT / fixed-shape gating to the
     guarded writer. This does NOT merge. Returns the helper result; raises ValueError on a gate failure,
     GhError on gh."""
-    candidates = _current_ready_then_merge_candidates(repo, limit=limit)
-    return dashboard_writes.mark_pr_ready_for_review(
-        repo, pr_number, expected_head_sha, confirmation,
-        live=True, candidates=candidates, audit_dir=audit_dir)
+    try:
+        candidates = _current_ready_then_merge_candidates(repo, limit=limit)
+        return dashboard_writes.mark_pr_ready_for_review(
+            repo, pr_number, expected_head_sha, confirmation,
+            live=True, candidates=candidates, audit_dir=audit_dir)
+    except GhError as ex:
+        # a gh read failure (candidate recompute / PR-metadata read) is a FAILED attempt — audit it too,
+        # then propagate so the handler renders the error (the local trail must cover gh failures).
+        dashboard_writes.audit_failure(dashboard_writes.MARK_READY_ACTION, repo, pr_number,
+                                       "gh error: %s" % ex, audit_dir=audit_dir)
+        raise

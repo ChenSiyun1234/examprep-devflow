@@ -686,12 +686,21 @@ _SECRET_RE = re.compile(
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
 
 
+def _norm_token(a: str) -> str:
+    """Normalize an arg for the forbidden-token check: a long flag may be passed as ``--flag=value``
+    (gh/pflag accepts that), so strip ``=value`` from FLAG-like args (those starting with ``-``) so
+    ``--undo=true`` / ``--force=1`` still match. Non-flag args are left intact, so a comment body that
+    merely contains ``=`` (e.g. ``merge=now``) is NOT mistaken for the bare token ``merge``."""
+    a = a.lower()
+    return a.split("=", 1)[0] if a.startswith("-") else a
+
+
 def _assert_write_allowed(args: list[str]) -> None:
-    """Refuse any write that is not an allow-listed create/comment, or that smells like
-    merge/delete/force-push. The single write-safety chokepoint."""
+    """Refuse any write that is not an allow-listed create/comment/ready, or that smells like
+    merge/delete/force-push/undo. The single write-safety chokepoint."""
     if tuple(args[:2]) not in _ALLOWED_WRITE_PREFIXES:
         raise GhError(f"refused: write op not in allow-list: {' '.join(args[:2]) or '(empty)'}")
-    low = {a.lower() for a in args}
+    low = {_norm_token(a) for a in args}
     bad = low & _FORBIDDEN_WRITE_TOKENS
     if bad:
         raise GhError(f"refused: forbidden token(s) in write op: {sorted(bad)}")

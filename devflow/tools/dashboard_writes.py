@@ -100,6 +100,14 @@ def _refuse(action, audit_dir, repo, pr_number, head, reason) -> None:
     raise ValueError(reason)
 
 
+def audit_failure(action, repo, pr_number, reason, audit_dir=None) -> None:
+    """Record a FAILED write ATTEMPT that didn't reach (or complete) the GitHub write — e.g. a gh read
+    error during the candidate recompute or PR-metadata read, BEFORE the write helper's own gates. The
+    service layer calls this so the local trail covers gh-error failures too, not only refusals/executed
+    writes. Best-effort (never raises); the caller still propagates the original error."""
+    _audit(audit_dir, _audit_record(action, repo, pr_number, "", "failure", reason))
+
+
 def post_codex_review_request(repo: str, pr_number, expected_head_sha: str, confirmation: str, *,
                               live: bool = True, candidates: Optional[Iterable] = None,
                               audit_dir: Optional[str] = None,
