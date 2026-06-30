@@ -14,7 +14,6 @@ from __future__ import annotations
 import datetime
 import json
 import os
-import re
 
 from devflow.tools.packet_writer import PACKET_JSON_NAME, PACKET_MD_NAME, MANUAL_SOURCE
 
@@ -23,16 +22,19 @@ STATUS_FILE = "handoff-status.json"
 STATUSES = ("created", "handed_to_claude", "in_progress", "implemented", "blocked", "abandoned")
 DEFAULT_STATUS = "created"
 
-# a slug is a single path component as produced by packet_writer.safe_thread_slug: [A-Za-z0-9._-] + a hash.
-_SAFE_SLUG_RE = re.compile(r"[A-Za-z0-9._-]+")
-
-
 def safe_slug(slug: str) -> str:
     """Return ``slug`` if it is a safe single path component; else raise ValueError. Rejects empty,
-    ``.``/``..``, any separator, and anything outside ``[A-Za-z0-9._-]`` — so no path traversal."""
+    ``.``/``..``, any path separator, and any control char — but ACCEPTS the full charset
+    ``packet_writer.safe_thread_slug`` emits (unicode-alnum plus ``-_.``), so a localized thread id like
+    ``生命周期-00920077`` is not falsely rejected. (The realpath containment check in ``_packet_dir`` is
+    the second line of defense against traversal.)"""
     s = (slug or "").strip()
-    if not s or s in (".", "..") or ".." in s or not _SAFE_SLUG_RE.fullmatch(s):
+    if not s or s in (".", "..") or ".." in s or "\x00" in s:
         raise ValueError("invalid packet slug")
+    if "/" in s or "\\" in s or os.sep in s or (os.altsep and os.altsep in s):
+        raise ValueError("invalid packet slug")       # must be a single path component
+    if any(not (c.isalnum() or c in "-_.") for c in s):
+        raise ValueError("invalid packet slug")        # same allow-set as safe_thread_slug (unicode-aware)
     return s
 
 
@@ -113,10 +115,16 @@ def write_status(base_dir: str, slug: str, status: str) -> dict:
     if not os.path.isdir(pkt_dir):
         raise ValueError("no such packet %r" % (slug,))
     record = {"status": status, "updated_at": _now_iso()}
-    tmp = os.path.join(pkt_dir, STATUS_FILE + ".tmp")
+    final = os.path.join(pkt_dir, STATUS_FILE)
+    tmp = final + ".tmp"
+    for p in (tmp, final):
+        # never follow a planted symlink and write THROUGH to its target (open(w) would do so) — the
+        # endpoint promises to write only the local status file.
+        if os.path.islink(p):
+            raise ValueError("refusing to write through a symlinked status file: %s" % p)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, os.path.join(pkt_dir, STATUS_FILE))
+    os.replace(tmp, final)
     return record
 
 
@@ -154,19 +162,23 @@ def list_packets(base_dir: str) -> list:
     if not os.path.isdir(base_dir):
         return out
     for name in os.listdir(base_dir):
+        pkt_dir = os.path.join(base_dir, name)
         try:
             safe_slug(name)                              # skip dirs whose name isn't a safe slug
-        except ValueError:
+            # do NOT follow a symlinked entry (its target may be a valid packet OUTSIDE the root); skip
+            # non-dirs. A single bad/unsafe entry must never break the whole index.
+            if os.path.islink(pkt_dir) or not os.path.isdir(pkt_dir):
+                continue
+            packet = _read_packet_json(pkt_dir)
+            if packet is None:                           # not a packet dir (no/garbled json) -> ignore
+                continue
+            info = _normalize(packet)
+            info["slug"] = name
+            info["status"] = read_status(base_dir, name)
+        except (ValueError, OSError):                    # one entry's failure shouldn't break /packets
             continue
-        pkt_dir = os.path.join(base_dir, name)
-        if not os.path.isdir(pkt_dir):
-            continue
-        packet = _read_packet_json(pkt_dir)
-        if packet is None:                               # not a packet dir (no/garbled json) -> ignore
-            continue
-        info = _normalize(packet)
-        info["slug"] = name
-        info["status"] = read_status(base_dir, name)
         out.append(info)
-    out.sort(key=lambda p: p.get("generated_at") or "", reverse=True)
+    # str() the sort key: generated_at is user-editable on-disk state — a non-string value (e.g. 123)
+    # must not raise TypeError comparing against string timestamps.
+    out.sort(key=lambda p: str(p.get("generated_at") or ""), reverse=True)
     return out

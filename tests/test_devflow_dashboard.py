@@ -1439,6 +1439,52 @@ class PacketStoreTests(unittest.TestCase):
                 packet_store.get_packet(self.base, bad)
         self.assertEqual(packet_store.safe_slug("demo-1-abcd1234"), "demo-1-abcd1234")
 
+    def test_non_ascii_slug_accepted_and_listed(self):
+        slug = _make_packet(self.base, "生命周期")          # CJK thread id -> unicode-alnum slug
+        self.assertTrue(slug.startswith("生命周期"))
+        self.assertEqual([p["slug"] for p in packet_store.list_packets(self.base)], [slug])
+        self.assertIsNotNone(packet_store.get_packet(self.base, slug))
+        self.assertEqual(packet_store.safe_slug(slug), slug)          # does not raise
+
+    def test_non_string_generated_at_does_not_break_index(self):
+        d = os.path.join(self.base, "weird-0000abcd")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "implementation-packet.json"), "w", encoding="utf-8") as f:
+            json.dump({"metadata": {"thread_id": "w", "generated_at": 123}, "approval": {}}, f)
+        good = _make_packet(self.base, "good1")
+        slugs = [p["slug"] for p in packet_store.list_packets(self.base)]   # must NOT raise TypeError
+        self.assertIn("weird-0000abcd", slugs)
+        self.assertIn(good, slugs)
+
+    def _symlink_or_skip(self, src, dst):
+        try:
+            os.symlink(src, dst, target_is_directory=os.path.isdir(src))
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("symlinks not supported in this environment")
+
+    def test_symlinked_packet_dir_skipped_not_crash(self):
+        outside = tempfile.mkdtemp(prefix="pkt_outside_")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        _make_packet(outside, "ext")                      # a valid packet OUTSIDE the base
+        ext_slug = os.listdir(outside)[0]
+        good = _make_packet(self.base, "inside1")
+        self._symlink_or_skip(os.path.join(outside, ext_slug), os.path.join(self.base, "linky-0000abcd"))
+        slugs = [p["slug"] for p in packet_store.list_packets(self.base)]   # must not raise
+        self.assertIn(good, slugs)
+        self.assertNotIn("linky-0000abcd", slugs)          # symlinked entry skipped, index still works
+
+    def test_symlinked_status_tmp_refused(self):
+        slug = _make_packet(self.base, "sl1")
+        target = os.path.join(self.base, "evil-target.txt")
+        with open(target, "w") as f:
+            f.write("important")
+        link = os.path.join(self.base, slug, packet_store.STATUS_FILE + ".tmp")
+        self._symlink_or_skip(target, link)
+        with self.assertRaises(ValueError):
+            packet_store.write_status(self.base, slug, "implemented")
+        with open(target) as f:
+            self.assertEqual(f.read(), "important")        # target NOT written through the symlink
+
     def test_detail_render_escapes_untrusted_fields(self):
         slug = _make_packet(self.base, "t6", task="<script>alert(1)</script>")
         p = packet_store.get_packet(self.base, slug)
