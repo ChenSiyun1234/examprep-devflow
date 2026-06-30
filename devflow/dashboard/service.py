@@ -40,6 +40,7 @@ from devflow.tools.fallback_review_prompt import (
     build_fallback_review_prompt, FOCUS_MODES, DIFF_BUDGETS,
 )
 from devflow.tools.codex_review_prompt import build_codex_review_prompt
+from devflow.tools import packet_store
 
 # First-line markers cmd_watch_codex_reviews can emit (read-only watcher).
 WATCH_MARKERS = ("ACTIONABLE_CODEX_REVIEWS", "CODEX_WATCH_INCOMPLETE",
@@ -348,3 +349,26 @@ def build_codex_prompt(repo: str, pr_number, diff_budget: str = "compact") -> di
         raise ValueError("PR number must be a positive integer")
     diff_budget = diff_budget if diff_budget in DIFF_BUDGETS else "compact"
     return build_codex_review_prompt(repo=repo, pr_number=n, diff_budget=diff_budget)
+
+
+# ----------------------------------------------------------------------------------------
+# Implementation Packet lifecycle (read packets + LOCAL handoff status only — no GitHub, no shell, no LLM)
+# ----------------------------------------------------------------------------------------
+PACKET_STATUSES = packet_store.STATUSES
+
+
+def list_packets(base_dir=None) -> list:
+    """List Implementation Packets under the packets dir (read-only)."""
+    return packet_store.list_packets(base_dir or _cli.PACKETS_DIR)
+
+
+def get_packet(slug, base_dir=None):
+    """Full normalized packet view for the detail page, or None if missing. Raises ValueError on an
+    unsafe slug (path-traversal guard lives in packet_store)."""
+    return packet_store.get_packet(base_dir or _cli.PACKETS_DIR, slug)
+
+
+def set_packet_status(slug, status, base_dir=None) -> dict:
+    """Update ONLY the local handoff-status.json for a packet. Raises ValueError on bad slug/status or a
+    non-existent packet. No GitHub write."""
+    return packet_store.write_status(base_dir or _cli.PACKETS_DIR, slug, status)

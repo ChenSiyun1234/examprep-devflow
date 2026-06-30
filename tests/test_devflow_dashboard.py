@@ -22,7 +22,18 @@ from unittest import mock
 from devflow import cli as _cli
 from devflow.tools.packet_writer import PacketError
 from devflow.tools.github_cli import GhError
+from devflow.tools import packet_store
+from devflow.tools import packet_writer as _pw
 import devflow.tools.review_orchestrator_runner as orch_runner
+
+
+def _make_packet(base, thread_id, task="Add feature", scope_task="implement x"):
+    """Write a real manual-scope Implementation Packet under `base/<slug>/` and return its slug."""
+    pkt = _pw.build_manual_packet(thread_id, task, "owner/x", "2026-06-30T00:00:00Z",
+                                  {"approved_scope": ["scope a"], "tasks": [scope_task],
+                                   "files": ["a.py"], "out_of_scope": [], "checks": [], "safety": []})
+    paths = _pw.write_packet(base, thread_id, pkt, markdown=_pw.render_manual_markdown(pkt))
+    return paths["slug"]
 import devflow.tools.fallback_review_prompt as fbprompt
 import devflow.tools.codex_review_prompt as codexprompt
 import devflow.tools.review_prompt_policy as policy
@@ -1228,6 +1239,60 @@ class HttpIntegrationTests(DashboardBase):
         self.assertEqual(resp.status, 200)
         self.assertIn("Build GPT fallback prompt", body)
         self.assertIn("href='/gpt-review?repo=o%2Fr&amp;pr=5'", body)     # GET navigation, repo url-encoded
+        self.assertIn("href='/codex-review-prompt?repo=o%2Fr&amp;pr=5'", body)   # guided Codex link too
+
+    def test_packets_page_loads(self):
+        _make_packet(self.packets, "http-pk1")
+        c = self._conn()
+        c.request("GET", "/packets")
+        r = c.getresponse()
+        b = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Implementation Packets", b)
+        self.assertIn("http-pk1", b)
+
+    def test_packet_detail_loads_with_status_buttons(self):
+        slug = _make_packet(self.packets, "http-pk2")
+        c = self._conn()
+        c.request("GET", "/packet/" + slug)
+        r = c.getresponse()
+        b = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Handoff status", b)
+        for s in ("created", "handed_to_claude", "implemented", "abandoned"):
+            self.assertIn(s, b)
+
+    def test_packet_detail_only_local_status_form_no_write_buttons(self):
+        slug = _make_packet(self.packets, "http-pk3")
+        c = self._conn()
+        c.request("GET", "/packet/" + slug)
+        r = c.getresponse()
+        b = r.read().decode("utf-8")
+        self.assertEqual(b.count("<form"), 1)                 # only the local status form
+        self.assertIn("action='/packet-status'", b)
+        for bad in ("action='/decide'", "action='/export'", "Post comment", ">Merge<", "Request review"):
+            self.assertNotIn(bad, b)
+
+    def test_packet_status_post_updates_local_only(self):
+        slug = _make_packet(self.packets, "http-pk4")
+        resp = self._post("/packet-status", {"slug": slug, "status": "in_progress"})
+        resp.read()
+        self.assertEqual(resp.status, 303)
+        self.assertEqual(packet_store.read_status(self.packets, slug), "in_progress")
+
+    def test_packet_status_post_invalid_status_leaves_unchanged(self):
+        slug = _make_packet(self.packets, "http-pk5")
+        resp = self._post("/packet-status", {"slug": slug, "status": "bogus"})
+        resp.read()
+        self.assertEqual(resp.status, 303)                    # PRG back, no crash
+        self.assertEqual(packet_store.read_status(self.packets, slug), "created")  # unchanged
+
+    def test_packet_detail_path_traversal_is_404(self):
+        c = self._conn()
+        c.request("GET", "/packet/..%2f..%2fsecret")
+        r = c.getresponse()
+        r.read()
+        self.assertEqual(r.status, 404)
 
     def test_orchestrator_renders_retarget_targets(self):
         canned = {
@@ -1320,6 +1385,74 @@ class HttpIntegrationTests(DashboardBase):
         self.assertIn("bare", body.lower())
         self.assertIn("optional", body.lower())
         self.assertIn("Build guided Codex prompt", body)        # still offered, just not preferred
+
+
+class PacketStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="pktstore_")
+        self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+
+    def test_list_packets_and_ignore_malformed_dirs(self):
+        slug = _make_packet(self.base, "t1")
+        os.makedirs(os.path.join(self.base, "junk"), exist_ok=True)   # non-packet dir
+        with open(os.path.join(self.base, "junk", "x.txt"), "w") as f:
+            f.write("hi")
+        with open(os.path.join(self.base, "junk", "implementation-packet.json"), "w") as f:
+            f.write("{ not valid json")                                # malformed json -> ignored
+        self.assertEqual([p["slug"] for p in packet_store.list_packets(self.base)], [slug])
+
+    def test_read_metadata(self):
+        slug = _make_packet(self.base, "t2", task="My Task")
+        p = packet_store.get_packet(self.base, slug)
+        self.assertEqual(p["task"], "My Task")
+        self.assertEqual(p["repo"], "owner/x")
+        self.assertEqual(p["thread_id"], "t2")
+        self.assertIn("scope a", p["approved_scope"])
+        self.assertTrue(p["handoff"])                                  # suggested handoff present
+
+    def test_status_defaults_to_created(self):
+        slug = _make_packet(self.base, "t3")
+        self.assertEqual(packet_store.read_status(self.base, slug), "created")
+        self.assertEqual(packet_store.get_packet(self.base, slug)["status"], "created")
+
+    def test_status_update_writes_only_local_status_file(self):
+        slug = _make_packet(self.base, "t4")
+        d = os.path.join(self.base, slug)
+        before = set(os.listdir(d))
+        packet_store.write_status(self.base, slug, "implemented")
+        added = set(os.listdir(d)) - before
+        self.assertEqual(added, {"handoff-status.json"})              # ONLY the local status file
+        self.assertEqual(packet_store.read_status(self.base, slug), "implemented")
+
+    def test_invalid_status_rejected(self):
+        slug = _make_packet(self.base, "t5")
+        with self.assertRaises(ValueError):
+            packet_store.write_status(self.base, slug, "bogus")
+
+    def test_status_for_missing_packet_rejected(self):
+        with self.assertRaises(ValueError):
+            packet_store.write_status(self.base, "nope-00000000", "created")
+
+    def test_unsafe_slug_and_traversal_rejected(self):
+        for bad in ("..", "../x", "a/b", "x/../y", "/etc", "", "."):
+            with self.assertRaises(ValueError):
+                packet_store.get_packet(self.base, bad)
+        self.assertEqual(packet_store.safe_slug("demo-1-abcd1234"), "demo-1-abcd1234")
+
+    def test_detail_render_escapes_untrusted_fields(self):
+        slug = _make_packet(self.base, "t6", task="<script>alert(1)</script>")
+        p = packet_store.get_packet(self.base, slug)
+        html = app._render_packet_detail(p)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("<script>alert(1)</script>", html)
+
+    def test_packet_store_has_no_shell_sdk_or_gh_write(self):
+        import inspect
+        src = inspect.getsource(packet_store)
+        for forbidden in ("os.system(", "subprocess", "import openai", "from openai", "import anthropic",
+                          "from anthropic", "os.getenv", "os.environ", "ReadOnlyGitHub", "import requests",
+                          "urllib.request", "gh pr merge"):
+            self.assertNotIn(forbidden, src)
 
 
 if __name__ == "__main__":
