@@ -122,6 +122,13 @@ def _render_orchestration(result: dict) -> str:
     def card(title, body):
         return "<div class='card'><h3>%s</h3>%s</div>" % (e(title), body)
 
+    # prefill link to the read-only GPT fallback-prompt builder (navigation only — no GitHub write).
+    repo_q = urllib.parse.quote(result.get("repo") or "", safe="")
+
+    def gpt_link(n):
+        return ("<a href='/gpt-review?repo=%s&amp;pr=%s'>Build GPT fallback prompt</a>"
+                % (repo_q, urllib.parse.quote(str(n), safe="")))
+
     summary = (
         "<table class='kv'>"
         "<tr><th>marker</th><td><span class='marker'>%s</span></td></tr>"
@@ -154,9 +161,9 @@ def _render_orchestration(result: dict) -> str:
         ranking_html = "<p class='muted'>(no open PRs)</p>"
 
     rr = plan.get("request_review") or []
-    rr_html = (chips(rr) + "<p class='muted'>Recommended — copy this onto each PR yourself; the "
-               "dashboard does <strong>not</strong> post it:</p><pre>@codex review</pre>") if rr \
-        else "<p class='muted'>(none)</p>"
+    rr_html = (chips(rr, extra=gpt_link) + "<p class='muted'>Recommended — copy this onto each PR "
+               "yourself; the dashboard does <strong>not</strong> post it:</p><pre>@codex review</pre>") \
+        if rr else "<p class='muted'>(none)</p>"
 
     rt_to = plan.get("retarget_to") or {}
     rt_html = chips(plan.get("needs_retarget"),
@@ -183,7 +190,7 @@ def _render_orchestration(result: dict) -> str:
         + (card("Errors", errors_html) if errs else "")
         + card("Ranking", ranking_html)
         + card("Request review (priority-ordered, ≤3 in-flight)", rr_html)
-        + card("Findings to fix (P1/P2 or early P3)", chips(plan.get("findings_to_fix")))
+        + card("Findings to fix (P1/P2 or early P3)", chips(plan.get("findings_to_fix"), extra=gpt_link))
         + card("Mergeable now (clean / converged)", mn_html)
         + card("Force-mergeable (≥3 rounds, only-minor P3)", chips(plan.get("force_mergeable")))
         + card("Ready then merge (un-draft first)", chips(plan.get("ready_then_merge")))
@@ -192,6 +199,40 @@ def _render_orchestration(result: dict) -> str:
         + card("Mergeability pending (GitHub still computing; re-run)", chips(plan.get("mergeable_unknown")))
         + card("Awaiting Codex (already requested, not by this view)", awaiting_html)
         + card("Raw plan (debug)", "<pre>%s</pre>" % e(json.dumps(result, ensure_ascii=False, indent=2))))
+
+
+def _render_gpt_result(res: dict) -> str:
+    """Render the fallback-review result: no-send warning, private-repo warning, a copyable textarea with
+    the prompt, and a PR metadata card. All dynamic content escaped (the textarea too — the browser
+    decodes the entities so the COPIED text is the original prompt, and `</textarea>` can't break out)."""
+    warn = _alert("info", "This page does NOT call GPT or send your data anywhere — copy the prompt below "
+                          "and paste it into GPT/ChatGPT yourself.")
+    if res.get("private_repo_warning"):
+        warn += _alert("err", "Private / proprietary repository: this prompt may include your code. Do NOT "
+                              "paste it into external tools unless you are permitted to.")
+    url = res.get("pr_url") or ""
+    url_html = ("<a href='%s'>%s</a>" % (e(url), e(url))) if str(url).startswith("http") else e(url) or "—"
+    meta = ("<div class='card'><h3>PR</h3><table class='kv'>"
+            "<tr><th>repo</th><td>%s</td></tr>"
+            "<tr><th>PR</th><td>#%s</td></tr>"
+            "<tr><th>url</th><td>%s</td></tr>"
+            "<tr><th>title</th><td>%s</td></tr>"
+            "<tr><th>base &larr; head</th><td>%s &larr; %s</td></tr>"
+            "<tr><th>head SHA</th><td><code>%s</code></td></tr>"
+            "<tr><th>changed files</th><td>%s</td></tr>"
+            "<tr><th>diff chars</th><td>%s</td></tr>"
+            "<tr><th>diff truncated</th><td>%s</td></tr>"
+            "<tr><th>focus / budget</th><td>%s / %s</td></tr>"
+            "</table></div>"
+            % (e(res.get("repo")), e(res.get("pr_number")), url_html, e(res.get("title")),
+               e(res.get("base")), e(res.get("head")), e(res.get("head_sha")),
+               e(len(res.get("changed_files") or [])), e(res.get("diff_chars")),
+               ("yes" if res.get("diff_truncated") else "no"),
+               e(res.get("focus")), e(res.get("diff_budget"))))
+    textarea = ("<div class='card'><h3>Prompt — copy &amp; paste into GPT/ChatGPT</h3>"
+                "<textarea readonly rows='24' onclick='this.select()'>%s</textarea></div>"
+                % e(res.get("prompt")))
+    return warn + meta + textarea
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -305,6 +346,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._page_watcher()
         if path == "/orchestrator":
             return self._page_orchestrator()
+        if path == "/gpt-review":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            return self._page_gpt_review(repo=qs.get("repo", [""])[0], pr=qs.get("pr", [""])[0])
         if path.startswith("/run/"):
             return self._page_run_detail(urllib.parse.unquote(path[len("/run/"):]))
         return self._not_found()
@@ -326,6 +370,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_watcher(form)
         if path == "/orchestrator":
             return self._post_orchestrator(form)
+        if path == "/gpt-review":
+            return self._post_gpt_review(form)
         if path == "/decide":
             return self._post_decide(form)
         if path == "/export":
@@ -523,6 +569,25 @@ class Handler(BaseHTTPRequestHandler):
         marker = res.get("marker")
         notice = _alert("ok" if marker == "ORCHESTRATION_PLAN" else "info", "marker: %s" % marker)
         self._page_orchestrator(notice=notice, result=_render_orchestration(res))
+
+    def _page_gpt_review(self, notice: str = "", result: str = "", repo: str = "", pr: str = ""):
+        self._send_html(_render("gpt_review.html", title="GPT Review Prompt", notice=notice,
+                                result=result, repo=e(repo), pr=e(pr)))
+
+    def _post_gpt_review(self, form):
+        repo = form.get("repo", "")
+        pr = form.get("pr_number", "")
+        try:
+            res = service.build_gpt_review_prompt(
+                repo, pr, focus=form.get("focus", "general"),
+                diff_budget=form.get("diff_budget", "compact"),
+                include_existing_feedback=bool(form.get("include_feedback")))
+        except ValueError as ex:
+            return self._page_gpt_review(notice=_alert("err", str(ex)), repo=repo, pr=pr)
+        except GhError as ex:
+            return self._page_gpt_review(notice=_alert("err", "gh error: %s" % ex), repo=repo, pr=pr)
+        self._page_gpt_review(result=_render_gpt_result(res),
+                              repo=res.get("repo") or repo, pr=str(res.get("pr_number")))
 
 
 def _allowed_hosts(host: str) -> set:

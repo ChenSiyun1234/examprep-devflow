@@ -628,12 +628,36 @@ class ReadOnlyGitHub:
             "author": (c.get("user") or {}).get("login"), "body": c.get("body") or "",
             "created_at": c.get("created_at"), "commit_id": c.get("commit_id"),
             "review_id": c.get("pull_request_review_id"), "id": c.get("id"), "url": c.get("html_url"),
+            "path": c.get("path"),
         } for c in (_gh_json_paginated(f"repos/{repo}/pulls/{n}/comments") or [])]
         comments = [{
             "author": (c.get("user") or {}).get("login"), "body": c.get("body") or "",
             "created_at": c.get("created_at"), "id": c.get("id"), "url": c.get("html_url"),
         } for c in (_gh_json_paginated(f"repos/{repo}/issues/{n}/comments") or [])]
         return {"reviews": reviews, "inline": inline, "comments": comments}
+
+    def get_pr_overview(self, pr_number: int) -> dict:
+        """Read-only PR overview for the fallback-review prompt builder: title/body/base/head/SHA/url +
+        diffstat. Uses ``gh pr view --json`` (passes ``_assert_read_only``). Distinct from get_pr_meta
+        so the orchestrator's lean per-PR sweep doesn't pay to fetch the (possibly large) body."""
+        repo = self.resolve_repo()
+        data = _gh_json(["pr", "view", str(int(pr_number)), "-R", repo, "--json",
+                         "number,title,body,state,baseRefName,headRefName,headRefOid,url,"
+                         "additions,deletions,changedFiles"]) or {}
+        return {
+            "number": data.get("number"), "title": data.get("title"), "body": data.get("body") or "",
+            "state": data.get("state"), "base_ref": data.get("baseRefName"),
+            "head_ref": data.get("headRefName"), "head_oid": data.get("headRefOid"),
+            "url": data.get("url"), "additions": int(data.get("additions") or 0),
+            "deletions": int(data.get("deletions") or 0),
+            "changed_files": int(data.get("changedFiles") or 0),
+        }
+
+    def get_pr_diff(self, pr_number: int) -> str:
+        """Read-only unified diff for a PR (``gh pr diff`` — an allow-listed read; NO mutation). Returns
+        the raw diff text (caller caps it). Raises GhError if the diff can't be fetched."""
+        repo = self.resolve_repo()
+        return _run_gh(["pr", "diff", str(int(pr_number)), "-R", repo])
 
 
 # ======================================================================================

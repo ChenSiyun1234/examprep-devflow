@@ -1,0 +1,40 @@
+<h1>GPT fallback review prompt <span class="muted">(read-only)</span></h1>
+<p class="muted">Builds a copyable prompt for a <strong>manual</strong> GPT/ChatGPT code review of a PR,
+from read-only GitHub data — useful when Codex is quota-limited or you want a second opinion.
+<strong>This page does not call GPT and sends your code nowhere</strong>; you copy the prompt and paste
+it yourself. For private/proprietary repos, use your own judgment before pasting into external tools.</p>
+$notice
+$result
+<form method="post" action="/gpt-review" class="card">
+  <label for="repo">repo <span class="muted">(required, owner/name)</span></label>
+  <input type="text" id="repo" name="repo" value="$repo" placeholder="e.g. ChenSiyun1234/examprep-devflow" required>
+
+  <label for="pr_number">PR number <span class="muted">(required)</span></label>
+  <input type="text" id="pr_number" name="pr_number" value="$pr" placeholder="e.g. 11" required>
+
+  <label for="focus">review focus</label>
+  <select id="focus" name="focus">
+    <option value="general">general — correctness, regression risk, edge cases, tests</option>
+    <option value="safety">safety — security, CSRF/XSS, localhost-only, write boundaries</option>
+    <option value="tests">tests — missing/flaky tests, fixtures, CI assumptions</option>
+    <option value="docs">docs — accuracy vs actual behavior</option>
+    <option value="verify-fix">verify-fix — were the listed review comments addressed?</option>
+  </select>
+
+  <label for="diff_budget">diff budget</label>
+  <select id="diff_budget" name="diff_budget">
+    <option value="compact">compact (~8k chars)</option>
+    <option value="medium">medium (~20k chars)</option>
+    <option value="large">large (~50k chars)</option>
+  </select>
+
+  <div class="checkbox">
+    <input type="checkbox" id="include_feedback" name="include_feedback" value="1" checked>
+    <label for="include_feedback" style="margin:0;font-weight:400;">include existing Codex feedback (capped)</label>
+  </div>
+  <p class="note">Read-only; requires <code>gh</code> authenticated. The generated prompt instructs GPT to
+  use a strict P1/P2/P3 findings format and to never suggest merge / push / branch-delete / GitHub
+  Actions / secrets. Truncated diffs and feedback are flagged in the prompt.</p>
+
+  <p><button type="submit">Build prompt</button></p>
+</form>

@@ -23,8 +23,42 @@ from devflow import cli as _cli
 from devflow.tools.packet_writer import PacketError
 from devflow.tools.github_cli import GhError
 import devflow.tools.review_orchestrator_runner as orch_runner
+import devflow.tools.fallback_review_prompt as fbprompt
 import devflow.dashboard.app as app
 import devflow.dashboard.service as service
+
+_CODEX = "chatgpt-codex-connector[bot]"
+
+
+def _gpt_gh(private=False, diff="diff --git a/foo.py b/foo.py\n+x\n", body="b", codex_inline=None,
+            signals=None):
+    """Factory for a read-only GitHub stand-in used by the fallback-review prompt helper."""
+    sig = signals if signals is not None else {"reviews": [], "inline": (codex_inline or []),
+                                               "comments": []}
+
+    class _GH:
+        def __init__(self, repo):
+            self.repo = repo
+
+        def resolve_repo(self):
+            return "o/r"
+
+        def get_repo_info(self):
+            return {"private": private}
+
+        def get_pr_overview(self, n):
+            return {"number": n, "title": "feat: x", "body": body, "base_ref": "main",
+                    "head_ref": "feat/x", "head_oid": "abc1234",
+                    "url": "https://github.com/o/r/pull/%d" % n, "additions": 1, "deletions": 0,
+                    "changed_files": 1}
+
+        def get_pr_diff(self, n):
+            return diff
+
+        def get_pr_codex_signals(self, n):
+            return sig
+
+    return _GH
 
 
 @contextlib.contextmanager
@@ -412,23 +446,89 @@ class OrchestratorRenderTests(unittest.TestCase):
         self.assertIn("#6", card)
 
 
+class GptPromptHelperTests(unittest.TestCase):
+    def _build(self, gh_factory, **kw):
+        pr = kw.pop("pr", 11)
+        with mock.patch.object(fbprompt, "ReadOnlyGitHub", side_effect=gh_factory):
+            return fbprompt.build_fallback_review_prompt("o/r", pr, **kw)
+
+    def test_builds_prompt_with_metadata_files_and_diff(self):
+        res = self._build(_gpt_gh(diff="diff --git a/foo.py b/foo.py\n+print(1)\n"))
+        self.assertEqual(res["repo"], "o/r")
+        self.assertEqual(res["pr_number"], 11)
+        self.assertEqual(res["head_sha"], "abc1234")
+        self.assertEqual(res["changed_files"], ["foo.py"])
+        self.assertIn("+print(1)", res["prompt"])
+        self.assertIn("P1 / P2 / P3", res["prompt"])         # strict findings format
+        self.assertIn("Do not suggest merging", res["prompt"])
+        self.assertFalse(res["diff_truncated"])
+
+    def test_truncates_diff_and_marks_truncated(self):
+        big = "diff --git a/foo.py b/foo.py\n" + ("+x\n" * 5000)   # > compact budget (8000)
+        res = self._build(_gpt_gh(diff=big), diff_budget="compact")
+        self.assertTrue(res["diff_truncated"])
+        self.assertEqual(res["diff_chars"], fbprompt.DIFF_BUDGETS["compact"])
+        self.assertIn("Diff was truncated", res["prompt"])
+
+    def test_private_repo_warning(self):
+        res = self._build(_gpt_gh(private=True))
+        self.assertTrue(res["private_repo_warning"])
+        self.assertIn("PRIVATE", res["prompt"])
+
+    def test_includes_existing_feedback_when_requested(self):
+        inline = [{"author": _CODEX, "body": "![P2 Badge] fix the thing", "path": "foo.py",
+                   "created_at": "2026-01-01T00:00:00Z"}]
+        res = self._build(_gpt_gh(codex_inline=inline), include_existing_feedback=True)
+        self.assertIn("Existing Codex feedback", res["prompt"])
+        self.assertIn("fix the thing", res["prompt"])
+
+    def test_omits_existing_feedback_when_false(self):
+        inline = [{"author": _CODEX, "body": "secret finding text", "path": "foo.py",
+                   "created_at": "2026-01-01T00:00:00Z"}]
+        res = self._build(_gpt_gh(codex_inline=inline), include_existing_feedback=False)
+        self.assertNotIn("secret finding text", res["prompt"])
+
+    def test_focus_modes_change_instructions(self):
+        g = self._build(_gpt_gh(), focus="general")
+        s = self._build(_gpt_gh(), focus="safety")
+        v = self._build(_gpt_gh(), focus="verify-fix")
+        self.assertIn("regression risk", g["prompt"])
+        self.assertIn("CSRF", s["prompt"])
+        self.assertIn("addressed", v["prompt"])
+        self.assertNotEqual(g["prompt"], s["prompt"])
+
+
 class NoShellExecutionTests(unittest.TestCase):
-    def test_dashboard_layer_has_no_shell_execution(self):
-        here = os.path.dirname(os.path.abspath(app.__file__))
-        for fname in ("app.py", "service.py"):
-            with open(os.path.join(here, fname), encoding="utf-8") as f:
+    # the dashboard layer + the new read-only prompt helper
+    _FILES = (app.__file__, service.__file__, fbprompt.__file__)
+
+    def test_no_shell_execution(self):
+        for path in self._FILES:
+            with open(path, encoding="utf-8") as f:
                 src = f.read()
             # precise dangerous patterns (avoid false matches like 'empty.' for a broad 'pty.')
             for forbidden in ("os.system(", "os.popen(", "subprocess.run(", "subprocess.Popen(",
                               "subprocess.call(", "import pty", "pty.spawn", "eval(", "exec("):
                 self.assertNotIn(forbidden, src,
-                                 "%s must not contain %r" % (fname, forbidden))
+                                 "%s must not contain %r" % (os.path.basename(path), forbidden))
+
+    def test_no_llm_sdk_or_api_key_usage(self):
+        # the GPT fallback page must NEVER call an LLM or read API keys — it only builds text
+        for path in self._FILES:
+            with open(path, encoding="utf-8") as f:
+                src = f.read().lower()
+            for forbidden in ("import openai", "from openai", "import anthropic", "from anthropic",
+                              "openai_api_key", "anthropic_api_key", "os.environ", "os.getenv",
+                              "api.openai.com", "api.anthropic.com"):
+                self.assertNotIn(forbidden, src,
+                                 "%s must not contain %r" % (os.path.basename(path), forbidden))
 
     def test_post_routes_are_a_fixed_safe_set(self):
         # the only state-changing endpoints; nothing accepts an arbitrary command
         import inspect
         src = inspect.getsource(app.Handler.do_POST)
-        for route in ('"/new"', '"/manual"', '"/watcher"', '"/decide"', '"/export"'):
+        for route in ('"/new"', '"/manual"', '"/watcher"', '"/orchestrator"', '"/gpt-review"',
+                      '"/decide"', '"/export"'):
             self.assertIn(route, src)
 
 
@@ -793,6 +893,81 @@ class HttpIntegrationTests(DashboardBase):
         self.assertIn("&lt;script&gt;", body)
         self.assertNotIn("<b>brnch</b>", body)                # branch escaped
         self.assertNotIn("<i>boom</i>", body)                 # error escaped
+
+    def test_gpt_review_page_loads(self):
+        c = self._conn()
+        c.request("GET", "/gpt-review")
+        resp = c.getresponse()
+        body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("GPT fallback review prompt", body)
+        self.assertIn("does not call GPT", body)
+
+    def test_gpt_review_prefill_from_query(self):
+        c = self._conn()
+        c.request("GET", "/gpt-review?repo=o/r&pr=11")
+        resp = c.getresponse()
+        body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn('value="o/r"', body)
+        self.assertIn('value="11"', body)
+
+    def test_gpt_review_missing_repo_validation(self):
+        resp = self._post("/gpt-review", {"repo": "", "pr_number": "11"})
+        body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("repo is required", body)
+
+    def test_gpt_review_invalid_pr_validation(self):
+        for bad in ("0", "-3", "abc", ""):
+            resp = self._post("/gpt-review", {"repo": "o/r", "pr_number": bad})
+            body = resp.read().decode("utf-8")
+            self.assertEqual(resp.status, 200)
+            self.assertIn("PR number must be a positive integer", body)
+
+    def test_gpt_review_renders_escaped_prompt_and_warnings(self):
+        canned = {"repo": "o/r", "pr_number": 11, "pr_url": "https://github.com/o/r/pull/11",
+                  "title": "feat: x", "base": "main", "head": "feat/x", "head_sha": "abc1234",
+                  "changed_files": ["foo.py"], "diff_chars": 50, "diff_truncated": True,
+                  "feedback_truncated": False, "private_repo_warning": True, "focus": "general",
+                  "diff_budget": "compact", "prompt": "REVIEW <script>alert(1)</script> END"}
+        with mock.patch.object(service, "build_gpt_review_prompt", return_value=canned):
+            resp = self._post("/gpt-review", {"repo": "o/r", "pr_number": "11"})
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("<textarea", body)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body)      # prompt escaped in textarea
+        self.assertNotIn("<script>alert(1)</script>", body)
+        self.assertIn("does NOT call GPT", body)                          # no-send banner
+        self.assertIn("Private / proprietary", body)                     # private warning
+
+    def test_gpt_review_has_no_send_or_write_buttons(self):
+        canned = {"repo": "o/r", "pr_number": 11, "pr_url": "", "title": "t", "base": "main",
+                  "head": "h", "head_sha": "s", "changed_files": [], "diff_chars": 0,
+                  "diff_truncated": False, "feedback_truncated": False, "private_repo_warning": False,
+                  "focus": "general", "diff_budget": "compact", "prompt": "hello"}
+        with mock.patch.object(service, "build_gpt_review_prompt", return_value=canned):
+            resp = self._post("/gpt-review", {"repo": "o/r", "pr_number": "11"})
+            body = resp.read().decode("utf-8")
+        for forbidden in ("Send to GPT", "Call OpenAI", "Post comment", "Request review", ">Merge<"):
+            self.assertNotIn(forbidden, body)
+        self.assertEqual(body.count("<form"), 1)              # only the build-prompt form
+        self.assertNotIn("action='/decide'", body)
+
+    def test_review_queue_links_to_gpt_review_readonly(self):
+        canned = {"marker": "ORCHESTRATION_PLAN", "repo": "o/r", "default_branch": "main",
+                  "state_path": "s", "rate_limited": False, "errors": [],
+                  "open_prs": [{"number": 5, "title": "feat: x", "branch": "feat/x", "base_ref": "main"}],
+                  "plan": {"ranking": [], "request_review": [5], "findings_to_fix": [], "mergeable_now": [],
+                           "force_mergeable": [], "ready_then_merge": [], "needs_conflict": [],
+                           "needs_retarget": [], "retarget_to": {}, "mergeable_unknown": [],
+                           "in_flight": [], "rate_limited": False}}
+        with mock.patch.object(service, "run_orchestrator", return_value=canned):
+            resp = self._post("/orchestrator", {"repo": "o/r"})
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("Build GPT fallback prompt", body)
+        self.assertIn("href='/gpt-review?repo=o%2Fr&amp;pr=5'", body)     # GET navigation, repo url-encoded
 
     def test_orchestrator_renders_retarget_targets(self):
         canned = {

@@ -36,6 +36,9 @@ from devflow.tools.packet_writer import (
     render_manual_markdown, write_packet, PacketError,  # noqa: F401 (re-exported for the app layer)
 )
 from devflow.tools.review_orchestrator_runner import build_orchestration_result
+from devflow.tools.fallback_review_prompt import (
+    build_fallback_review_prompt, FOCUS_MODES, DIFF_BUDGETS,
+)
 
 # First-line markers cmd_watch_codex_reviews can emit (read-only watcher).
 WATCH_MARKERS = ("ACTIONABLE_CODEX_REVIEWS", "CODEX_WATCH_INCOMPLETE",
@@ -302,3 +305,27 @@ def run_orchestrator(repo: str, limit: int = ORCH_LIMIT_DEFAULT) -> dict:
     # reviews, so it must NEVER persist the planner's in-flight tracking — that would suppress a later
     # real request. No caller can make the dashboard persist.
     return build_orchestration_result(repo=repo, limit=lim, persist_state=False)
+
+
+# ----------------------------------------------------------------------------------------
+# GPT / ChatGPT FALLBACK review prompt builder (READ-ONLY text builder — never calls an LLM)
+# ----------------------------------------------------------------------------------------
+def build_gpt_review_prompt(repo: str, pr_number, focus: str = "general",
+                            diff_budget: str = "compact",
+                            include_existing_feedback: bool = True) -> dict:
+    """Validate input and delegate to the read-only fallback-review prompt builder. Builds copyable TEXT
+    only: NO LLM/API call, NO GitHub write, NO shell beyond the existing read-only gh layer. Raises
+    ValueError on bad input (empty repo / non-positive PR number); GhError propagates for a gh failure."""
+    repo = (repo or "").strip()
+    if not repo:
+        raise ValueError("repo is required")
+    try:
+        n = int(str(pr_number).strip())
+    except (TypeError, ValueError):
+        raise ValueError("PR number must be a positive integer")
+    if n <= 0:
+        raise ValueError("PR number must be a positive integer")
+    focus = focus if focus in FOCUS_MODES else "general"          # clamp to a known focus mode
+    diff_budget = diff_budget if diff_budget in DIFF_BUDGETS else "compact"   # clamp to a known budget
+    return build_fallback_review_prompt(repo=repo, pr_number=n, focus=focus, diff_budget=diff_budget,
+                                        include_existing_feedback=bool(include_existing_feedback))

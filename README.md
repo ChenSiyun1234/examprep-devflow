@@ -206,7 +206,8 @@ Implementation Packet** buttons) · **New run** (create a dry-run run, optionall
 **Manual packet** (build an Implementation Packet from a Markdown scope form — same as
 `create-implementation-packet` — and see the paths + suggested Claude Code handoff) · **Codex
 watcher** (run the read-only `watch-codex-reviews` sweep and show its marker) · **Review Queue** (the
-read-only `orchestrate-reviews` cross-PR plan).
+read-only `orchestrate-reviews` cross-PR plan) · **GPT Review Prompt** (build a copyable manual-review
+prompt — see below).
 
 **Review Queue (orchestrator) — read-only & advisory.** Surfaces the same cross-PR plan as
 `orchestrate-reviews`: a priority ranking plus who to request review from, findings to fix, mergeable /
@@ -220,6 +221,17 @@ local tracking state (the dashboard never actually requests reviews, so it must 
 state). Both the CLI and the page call one structured helper
 (`devflow/tools/review_orchestrator_runner.build_orchestration_result`), so there is no stdout scraping
 and no behavioural drift.
+
+**GPT fallback prompt builder (`/gpt-review`) — read-only text builder.** Creates a copyable
+GPT/ChatGPT code-review prompt for a PR from read-only GitHub data (PR metadata, changed files, a capped
+diff excerpt, and — optionally — recent Codex feedback), with a focus mode (general / safety / tests /
+docs / verify-fix) and a diff budget (compact / medium / large). Useful when Codex is quota-limited or
+you want a manual second opinion. It **does not call GPT/OpenAI/Anthropic/Codex or any LLM** (no SDK, no
+API key, no network beyond read-only `gh`) and **sends your code nowhere** — it only builds text you copy
+and paste yourself. The prompt instructs the model to use a strict P1/P2/P3 findings format and to never
+suggest merge / push / branch-delete / GitHub Actions / secrets; truncated diffs and feedback are flagged.
+**Private repos require human judgment before pasting into external tools** (the page warns prominently).
+Backed by `devflow/tools/fallback_review_prompt.build_fallback_review_prompt` (read-only).
 
 **Safe by default — what it does / does not do.**
 
