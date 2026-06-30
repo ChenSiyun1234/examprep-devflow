@@ -207,7 +207,16 @@ Implementation Packet** buttons) · **New run** (create a dry-run run, optionall
 `create-implementation-packet` — and see the paths + suggested Claude Code handoff) · **Codex
 watcher** (run the read-only `watch-codex-reviews` sweep and show its marker) · **Review Queue** (the
 read-only `orchestrate-reviews` cross-PR plan) · **GPT Review Prompt** (build a copyable manual-review
-prompt — see below).
+prompt — see below) · **Packets** (Implementation Packet lifecycle — see below).
+
+**Packets (`/packets`, `/packet/<slug>`) — packet lifecycle, local-only.** A packet-centric view of every
+Implementation Packet already generated under `.devflow/packets`: the index lists slug / thread / task /
+repo / gate / decision / source issue·PR / handoff status; the detail page shows the full packet
+(metadata, approved scope, tasks, files likely touched, out-of-scope, tests, safety boundaries, suggested
+Claude Code handoff, and the md/json paths). It also tracks a **local-only** handoff lifecycle —
+`created → handed_to_claude → in_progress → implemented → blocked → abandoned` — whose buttons write **only**
+`.devflow/packets/<slug>/handoff-status.json`. **No GitHub reads or writes**, no LLM, no shell; slugs are
+validated against path traversal and all packet fields are HTML-escaped.
 
 **Review Queue (orchestrator) — read-only & advisory.** Surfaces the same cross-PR plan as
 `orchestrate-reviews`: a priority ranking plus who to request review from, findings to fix, mergeable /

@@ -306,6 +306,81 @@ def _render_codex_result(res: dict) -> str:
     return warn + meta + textarea
 
 
+def _packet_source_text(p: dict) -> str:
+    bits = []
+    if p.get("issue_number"):
+        bits.append("issue #%s" % e(p.get("issue_number")))
+    if p.get("pr_number"):
+        bits.append("PR #%s" % e(p.get("pr_number")))
+    return " / ".join(bits) or "—"
+
+
+def _packet_index(packets: list) -> str:
+    if not packets:
+        return ("<p class='muted'>No packets yet. Export one from a paused run's detail page, or build a "
+                "<a href='/manual'>Manual packet</a>.</p>")
+    rows = []
+    for p in packets:
+        slug = p.get("slug") or ""
+        rows.append(
+            "<tr><td><a href='/packet/%s'>%s</a></td><td>%s</td><td>%s</td><td>%s</td>"
+            "<td>%s / %s</td><td>%s</td><td><span class='marker'>%s</span></td><td class='muted'>%s</td></tr>"
+            % (urllib.parse.quote(slug, safe=""), e(slug), e(p.get("thread_id")), e(p.get("task")),
+               e(p.get("repo")), e(p.get("gate")), e(p.get("decision")), _packet_source_text(p),
+               e(p.get("status")), e(p.get("generated_at"))))
+    return ("<table><thead><tr><th>slug</th><th>thread</th><th>task</th><th>repo</th>"
+            "<th>gate / decision</th><th>source</th><th>status</th><th>generated</th></tr></thead><tbody>"
+            + "".join(rows) + "</tbody></table>")
+
+
+def _status_buttons(slug: str, current: str) -> str:
+    btns = []
+    for s in service.PACKET_STATUSES:
+        cls = " class='ok'" if s == current else ""
+        btns.append("<button name='status' value='%s'%s>%s</button>" % (e(s), cls, e(s)))
+    return ("<form method='post' action='/packet-status' class='inline'>"
+            "<input type='hidden' name='slug' value='%s'>%s</form>" % (e(slug), "".join(btns)))
+
+
+def _render_packet_detail(p: dict, notice: str = "") -> str:
+    """Render a packet's full detail (escaped) + local-only handoff-status buttons. No GitHub anything."""
+    def card(title, body):
+        return "<div class='card'><h3>%s</h3>%s</div>" % (e(title), body)
+
+    meta = ("<table class='kv'>"
+            "<tr><th>slug</th><td><code>%s</code></td></tr>"
+            "<tr><th>thread_id</th><td>%s</td></tr>"
+            "<tr><th>task</th><td>%s</td></tr>"
+            "<tr><th>repo</th><td>%s</td></tr>"
+            "<tr><th>source</th><td>%s</td></tr>"
+            "<tr><th>generated_at</th><td>%s</td></tr>"
+            "<tr><th>gate</th><td>%s</td></tr>"
+            "<tr><th>decision</th><td>%s</td></tr>"
+            "<tr><th>source issue / PR</th><td>%s</td></tr>"
+            "<tr><th>markdown</th><td><code>%s</code></td></tr>"
+            "<tr><th>json</th><td><code>%s</code></td></tr></table>"
+            % (e(p.get("slug")), e(p.get("thread_id")), e(p.get("task")), e(p.get("repo")),
+               e(p.get("source")), e(p.get("generated_at")), e(p.get("gate")), e(p.get("decision")),
+               _packet_source_text(p), e(p.get("md_path")), e(p.get("json_path"))))
+
+    status_card = (card("Handoff status",
+                        "<p>current: <span class='marker'>%s</span></p>" % e(p.get("status"))
+                        + _status_buttons(p.get("slug") or "", p.get("status") or "")
+                        + "<p class='note'>Local only — writes "
+                          "<code>.devflow/packets/&lt;slug&gt;/handoff-status.json</code>. "
+                          "No GitHub write.</p>"))
+    return (notice
+            + status_card
+            + card("Metadata", meta)
+            + card("Approved scope", _li(p.get("approved_scope")))
+            + card("Implementation tasks", _li(p.get("tasks")))
+            + card("Files likely touched", _li(p.get("files_likely_touched")))
+            + card("Out of scope", _li(p.get("out_of_scope")))
+            + card("Tests / checks to run", _li(p.get("tests_to_run")))
+            + card("Safety boundaries", _li(p.get("safety_boundaries")))
+            + card("Suggested Claude Code handoff", "<pre>%s</pre>" % e(p.get("handoff"))))
+
+
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -423,6 +498,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/codex-review-prompt":
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             return self._page_codex_review(repo=qs.get("repo", [""])[0], pr=qs.get("pr", [""])[0])
+        if path == "/packets":
+            return self._page_packets()
+        if path.startswith("/packet/"):
+            return self._page_packet_detail(urllib.parse.unquote(path[len("/packet/"):]))
         if path.startswith("/run/"):
             return self._page_run_detail(urllib.parse.unquote(path[len("/run/"):]))
         return self._not_found()
@@ -448,6 +527,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_gpt_review(form)
         if path == "/codex-review-prompt":
             return self._post_codex_review(form)
+        if path == "/packet-status":
+            return self._post_packet_status(form)
         if path == "/decide":
             return self._post_decide(form)
         if path == "/export":
@@ -686,6 +767,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._page_codex_review(notice=_alert("err", msg), repo=repo, pr=pr, diff_budget=budget)
         self._page_codex_review(result=_render_codex_result(res), repo=res.get("repo") or repo,
                                 pr=str(res.get("pr_number")), diff_budget=res.get("diff_budget") or budget)
+
+    def _page_packets(self, notice: str = ""):
+        self._send_html(_render("packets.html", title="Packets", notice=notice,
+                                rows=_packet_index(service.list_packets())))
+
+    def _page_packet_detail(self, slug: str, notice: str = ""):
+        try:
+            p = service.get_packet(slug)
+        except ValueError:
+            return self._not_found()                       # unsafe slug / path traversal
+        if p is None:
+            return self._not_found()
+        self._send_html(_render("packet_detail.html", title="Packet %s" % slug,
+                                slug=e(p.get("slug")), body=_render_packet_detail(p, notice)))
+
+    def _post_packet_status(self, form):
+        slug = form.get("slug", "")
+        try:
+            service.set_packet_status(slug, form.get("status", ""))
+        except ValueError:
+            pass                                           # bad slug/status/packet -> re-render detail
+        # PRG back to the detail page (only the local status file was touched)
+        self._redirect("/packet/" + urllib.parse.quote(slug, safe=""))
 
 
 def _allowed_hosts(host: str) -> set:
