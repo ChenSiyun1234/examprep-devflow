@@ -43,8 +43,16 @@ def _packet_dir(base_dir: str, slug: str) -> str:
     """Resolve ``base_dir/slug`` AND verify it stays inside ``base_dir`` (defense-in-depth vs traversal)."""
     s = safe_slug(slug)
     raw = os.path.join(base_dir, s)
-    if os.path.islink(raw):                            # a symlinked slug entry must NOT be followed even
-        raise ValueError("refusing a symlinked packet slug")   # if its target stays under the root
+    # refuse a symlink at the slug entry OR any ancestor (e.g. .devflow / .devflow/packets): otherwise
+    # realpath would resolve a symlinked root and a read/write could land outside the packets tree.
+    anc = raw
+    while anc:
+        if os.path.islink(anc):
+            raise ValueError("refusing a symlinked path component: %s" % anc)
+        parent = os.path.dirname(anc)
+        if parent == anc:                              # reached the filesystem anchor / top of a rel path
+            break
+        anc = parent
     base = os.path.realpath(base_dir)
     path = os.path.realpath(raw)
     if path != base and not path.startswith(base + os.sep):
@@ -106,8 +114,11 @@ def _normalize(packet: dict) -> dict:
 def read_status(base_dir: str, slug: str) -> str:
     """Current handoff status (default ``created``). Read-only; tolerant of a missing/garbled file."""
     pkt_dir = _packet_dir(base_dir, slug)
+    sp = os.path.join(pkt_dir, STATUS_FILE)
+    if os.path.islink(sp) or not os.path.isfile(sp):   # missing / symlink / FIFO -> default, don't open
+        return DEFAULT_STATUS
     try:
-        with open(os.path.join(pkt_dir, STATUS_FILE), encoding="utf-8") as f:
+        with open(sp, encoding="utf-8") as f:
             data = json.load(f)
         status = (data or {}).get("status") if isinstance(data, dict) else None
     except (OSError, ValueError):
@@ -121,8 +132,9 @@ def write_status(base_dir: str, slug: str, status: str) -> dict:
     pkt_dir = _packet_dir(base_dir, slug)
     if status not in STATUSES:
         raise ValueError("invalid status %r (allowed: %s)" % (status, ", ".join(STATUSES)))
-    if not os.path.isdir(pkt_dir):
-        raise ValueError("no such packet %r" % (slug,))
+    if not os.path.isdir(pkt_dir) or _read_packet_json(pkt_dir) is None:
+        # a safe-named but non-packet sibling dir must NOT receive a stray handoff-status.json
+        raise ValueError("not a packet directory %r (no valid implementation-packet.json)" % (slug,))
     record = {"status": status, "updated_at": _now_iso()}
     final = os.path.join(pkt_dir, STATUS_FILE)
     tmp = final + ".tmp"

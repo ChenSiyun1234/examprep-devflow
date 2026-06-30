@@ -1528,6 +1528,33 @@ class PacketStoreTests(unittest.TestCase):
                          [p["slug"] for p in packet_store.list_packets(self.base)])
         self.assertIsNone(packet_store.get_packet(self.base, "fakepkt-0000abcd"))
 
+    def test_status_write_rejected_for_non_packet_dir(self):
+        d = os.path.join(self.base, "notpkt-0000abcd")
+        os.makedirs(d, exist_ok=True)                  # safe-named dir but NO implementation-packet.json
+        with self.assertRaises(ValueError):
+            packet_store.write_status(self.base, "notpkt-0000abcd", "implemented")
+        self.assertFalse(os.path.exists(os.path.join(d, packet_store.STATUS_FILE)))
+
+    def test_symlinked_status_file_read_as_default(self):
+        slug = _make_packet(self.base, "rs1")
+        target = os.path.join(self.base, "real-status.json")
+        with open(target, "w") as f:
+            json.dump({"status": "implemented"}, f)
+        sp = os.path.join(self.base, slug, packet_store.STATUS_FILE)
+        self._symlink_or_skip(target, sp)
+        self.assertEqual(packet_store.read_status(self.base, slug), "created")   # symlink not followed
+
+    def test_symlinked_packets_base_refused(self):
+        real = tempfile.mkdtemp(prefix="pkt_realbase_")
+        self.addCleanup(shutil.rmtree, real, ignore_errors=True)
+        slug = _make_packet(real, "b1")
+        holder = tempfile.mkdtemp(prefix="pkt_linkholder_")
+        self.addCleanup(shutil.rmtree, holder, ignore_errors=True)
+        linkbase = os.path.join(holder, "packets")
+        self._symlink_or_skip(real, linkbase)          # the packets BASE is a symlink
+        with self.assertRaises(ValueError):
+            packet_store.write_status(linkbase, slug, "implemented")
+
     def test_status_card_marker_not_double_escaped(self):
         slug = _make_packet(self.base, "card1")
         html = app._render_packet_detail(packet_store.get_packet(self.base, slug))
