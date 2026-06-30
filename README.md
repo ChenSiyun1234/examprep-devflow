@@ -197,8 +197,13 @@ A tiny **local** dashboard to drive the common safe workflow from buttons/forms 
 
 ```bash
 python -m devflow.dashboard.app        # then open http://127.0.0.1:8765
+python -m devflow.dashboard.app --open # start + open the URL in your browser (localhost binds only)
+devflow-dashboard --open               # same, via the console script once the package is installed
 # options: --host 127.0.0.1 (default; localhost-only) --port 8765
 ```
+
+`--open` is a convenience (stdlib `webbrowser`, no shell); it is **skipped for a non-localhost `--host`**
+(the warning still prints) and changes nothing about the read-only / dry-run safety posture.
 
 Pages: **Runs** (list local checkpoints — thread id, status, paused gate) · **Run detail** (state
 fields, event log, errors, and — when paused — the gate payload with **Approve / Reject / Export
@@ -206,8 +211,9 @@ Implementation Packet** buttons) · **New run** (create a dry-run run, optionall
 **Manual packet** (build an Implementation Packet from a Markdown scope form — same as
 `create-implementation-packet` — and see the paths + suggested Claude Code handoff) · **Codex
 watcher** (run the read-only `watch-codex-reviews` sweep and show its marker) · **Review Queue** (the
-read-only `orchestrate-reviews` cross-PR plan) · **GPT Review Prompt** (build a copyable manual-review
-prompt — see below) · **Packets** (Implementation Packet lifecycle — see below).
+read-only `orchestrate-reviews` cross-PR plan) · **Codex Prompt** (build a copyable guided `@codex review`
+comment — not posted) · **GPT Review Prompt** (build a copyable manual-review prompt — see below) ·
+**Packets** (Implementation Packet lifecycle — see below).
 
 **Packets (`/packets`, `/packet/<slug>`) — packet lifecycle, local-only.** A packet-centric view of every
 Implementation Packet already generated under `.devflow/packets`: the index lists slug / thread / task /

@@ -795,6 +795,13 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("devflow.dashboard", toml)          # package shipped
         self.assertIn("templates/*.html", toml)           # templates shipped as package data
 
+    def test_pyproject_declares_console_script(self):
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(repo, "pyproject.toml"), encoding="utf-8") as f:
+            toml = f.read()
+        self.assertIn("[project.scripts]", toml)
+        self.assertIn('devflow-dashboard = "devflow.dashboard.app:main"', toml)
+
 
 class ServerTests(unittest.TestCase):
     def test_server_defaults_to_localhost(self):
@@ -845,6 +852,40 @@ class ServerTests(unittest.TestCase):
         with mock.patch.object(app, "run_server", return_value=fake), mock.patch("sys.stdout", out):
             app.main(["--host", "::1", "--port", "0"])
         self.assertIn("[::1]", out.getvalue())               # IPv6 literal bracketed in the printed URI
+
+    def _run_main(self, argv):
+        """Run main() without binding/serving: mock run_server + serve_forever, capture stdout/stderr,
+        and mock webbrowser.open. Returns (rc, stdout, stderr, webbrowser_mock)."""
+        fake = mock.Mock()
+        fake.serve_forever.side_effect = KeyboardInterrupt
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(app, "run_server", return_value=fake), \
+             mock.patch.object(app.webbrowser, "open") as wb, \
+             mock.patch("sys.stderr", err), contextlib.redirect_stdout(out):
+            rc = app.main(argv)
+        return rc, out.getvalue(), err.getvalue(), wb
+
+    def test_open_flag_localhost_opens_browser_with_url(self):
+        rc, out, _, wb = self._run_main(["--host", "127.0.0.1", "--port", "8765", "--open"])
+        self.assertEqual(rc, 0)                              # parser accepts --open
+        wb.assert_called_once_with("http://127.0.0.1:8765")
+
+    def test_open_flag_non_localhost_skips_browser(self):
+        rc, out, err, wb = self._run_main(["--host", "0.0.0.0", "--port", "8765", "--open"])
+        self.assertEqual(rc, 0)
+        wb.assert_not_called()                              # never auto-open a non-localhost bind
+        self.assertIn("--open skipped", out)
+        self.assertIn("not localhost", err.lower())         # existing warning still prints
+
+    def test_no_open_flag_does_not_open_browser(self):
+        rc, out, _, wb = self._run_main(["--host", "127.0.0.1", "--port", "8765"])
+        self.assertEqual(rc, 0)
+        wb.assert_not_called()                              # default behavior unchanged
+
+    def test_open_ipv6_localhost_opens_bracketed_url(self):
+        rc, out, _, wb = self._run_main(["--host", "::1", "--port", "8765", "--open"])
+        self.assertEqual(rc, 0)
+        wb.assert_called_once_with("http://[::1]:8765")     # IPv6 URL stays bracketed when opened
 
 
 class HttpIntegrationTests(DashboardBase):

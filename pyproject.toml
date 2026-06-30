@@ -11,6 +11,10 @@ requires-python = ">=3.8"
 # No runtime third-party deps: the default path is pure stdlib (the fallback runner).
 dependencies = []
 
+[project.scripts]
+# convenience launcher for the local dashboard: `devflow-dashboard --open` (no new deps; stdlib only)
+devflow-dashboard = "devflow.dashboard.app:main"
+
 [project.optional-dependencies]
 # the real LangGraph backend (+ durable sqlite checkpointer for cross-process pause/resume)
 langgraph = ["langgraph>=0.2,<0.4", "langgraph-checkpoint-sqlite>=2.0"]

@@ -25,6 +25,7 @@ import socket
 import string
 import sys
 import urllib.parse
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from devflow.dashboard import service
@@ -808,8 +809,11 @@ def main(argv=None) -> int:
     p.add_argument("--host", default=DEFAULT_HOST,
                    help="bind host (default 127.0.0.1 — localhost only; do NOT expose publicly)")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="bind port (default 8765)")
+    p.add_argument("--open", action="store_true",
+                   help="after starting, open the dashboard URL in your browser (localhost binds only)")
     args = p.parse_args(argv)
-    if args.host.strip().lower() not in _LOCALHOST_NAMES:
+    is_local = args.host.strip().lower() in _LOCALHOST_NAMES
+    if not is_local:
         sys.stderr.write(
             "[dashboard] WARNING: binding %s is NOT localhost. This dashboard is a local dev tool "
             "with no authentication — do not expose it on an untrusted network.\n" % args.host)
@@ -817,6 +821,14 @@ def main(argv=None) -> int:
     host_disp = "[%s]" % args.host if ":" in args.host else args.host    # bracket an IPv6 literal for the URI
     url = "http://%s:%d" % (host_disp, args.port)
     print("[dashboard] serving on %s  (Ctrl-C to stop; localhost-only, dry-run/read-only)" % url)
+    if args.open:
+        # convenience only, stdlib webbrowser (no shell). NEVER auto-open a non-localhost bind.
+        if is_local:
+            webbrowser.open(url)
+            print("[dashboard] opened %s in your browser." % url)
+        else:
+            print("[dashboard] --open skipped: %s is not a localhost bind; not auto-opening a browser."
+                  % args.host)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
