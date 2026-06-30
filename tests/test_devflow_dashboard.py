@@ -1485,6 +1485,55 @@ class PacketStoreTests(unittest.TestCase):
         with open(target) as f:
             self.assertEqual(f.read(), "important")        # target NOT written through the symlink
 
+    def test_slug_with_dots_but_no_separator_accepted(self):
+        # safe_thread_slug can emit consecutive dots (e.g. thread id 'release..1'); must NOT be rejected
+        self.assertEqual(packet_store.safe_slug("release..1-abcd1234"), "release..1-abcd1234")
+        slug = _make_packet(self.base, "release..1")
+        self.assertIn(slug, [p["slug"] for p in packet_store.list_packets(self.base)])
+        self.assertIsNotNone(packet_store.get_packet(self.base, slug))
+
+    def test_hardlinked_status_tmp_refused(self):
+        slug = _make_packet(self.base, "hl1")
+        target = os.path.join(self.base, "hl-target.txt")
+        with open(target, "w") as f:
+            f.write("important")
+        link = os.path.join(self.base, slug, packet_store.STATUS_FILE + ".tmp")
+        try:
+            os.link(target, link)
+        except (OSError, NotImplementedError, AttributeError):
+            self.skipTest("hardlinks not supported in this environment")
+        with self.assertRaises(ValueError):
+            packet_store.write_status(self.base, slug, "implemented")
+        with open(target) as f:
+            self.assertEqual(f.read(), "important")        # shared inode NOT truncated
+
+    def test_symlinked_slug_entry_rejected(self):
+        outside = tempfile.mkdtemp(prefix="pkt_out2_")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        _make_packet(outside, "tgt")
+        tgt = os.path.join(outside, os.listdir(outside)[0])
+        self._symlink_or_skip(tgt, os.path.join(self.base, "alias-0000abcd"))
+        with self.assertRaises(ValueError):                # direct /packet/<symlink> path is refused
+            packet_store.get_packet(self.base, "alias-0000abcd")
+        with self.assertRaises(ValueError):                # ...and so is a status write to it
+            packet_store.write_status(self.base, "alias-0000abcd", "implemented")
+
+    def test_symlinked_packet_json_not_read(self):
+        slug = _make_packet(self.base, "sj1")
+        fake = os.path.join(self.base, "fakepkt-0000abcd")
+        os.makedirs(fake, exist_ok=True)
+        real_json = os.path.join(self.base, slug, "implementation-packet.json")
+        self._symlink_or_skip(real_json, os.path.join(fake, "implementation-packet.json"))
+        self.assertNotIn("fakepkt-0000abcd",
+                         [p["slug"] for p in packet_store.list_packets(self.base)])
+        self.assertIsNone(packet_store.get_packet(self.base, "fakepkt-0000abcd"))
+
+    def test_status_card_marker_not_double_escaped(self):
+        slug = _make_packet(self.base, "card1")
+        html = app._render_packet_detail(packet_store.get_packet(self.base, slug))
+        self.assertIn("<span class='marker'>created</span>", html)   # marker renders
+        self.assertNotIn("&lt;span class='marker'&gt;", html)        # not shown as literal markup
+
     def test_detail_render_escapes_untrusted_fields(self):
         slug = _make_packet(self.base, "t6", task="<script>alert(1)</script>")
         p = packet_store.get_packet(self.base, slug)

@@ -29,10 +29,11 @@ def safe_slug(slug: str) -> str:
     ``生命周期-00920077`` is not falsely rejected. (The realpath containment check in ``_packet_dir`` is
     the second line of defense against traversal.)"""
     s = (slug or "").strip()
-    if not s or s in (".", "..") or ".." in s or "\x00" in s:
+    if not s or s in (".", "..") or "\x00" in s:
         raise ValueError("invalid packet slug")
     if "/" in s or "\\" in s or os.sep in s or (os.altsep and os.altsep in s):
-        raise ValueError("invalid packet slug")       # must be a single path component
+        raise ValueError("invalid packet slug")       # must be a single path component (so '..' inside a
+                                                       # single component like 'release..1-<hash>' is fine)
     if any(not (c.isalnum() or c in "-_.") for c in s):
         raise ValueError("invalid packet slug")        # same allow-set as safe_thread_slug (unicode-aware)
     return s
@@ -41,8 +42,11 @@ def safe_slug(slug: str) -> str:
 def _packet_dir(base_dir: str, slug: str) -> str:
     """Resolve ``base_dir/slug`` AND verify it stays inside ``base_dir`` (defense-in-depth vs traversal)."""
     s = safe_slug(slug)
+    raw = os.path.join(base_dir, s)
+    if os.path.islink(raw):                            # a symlinked slug entry must NOT be followed even
+        raise ValueError("refusing a symlinked packet slug")   # if its target stays under the root
     base = os.path.realpath(base_dir)
-    path = os.path.realpath(os.path.join(base, s))
+    path = os.path.realpath(raw)
     if path != base and not path.startswith(base + os.sep):
         raise ValueError("packet path escapes the packets directory")
     return path
@@ -53,8 +57,13 @@ def _now_iso() -> str:
 
 
 def _read_packet_json(pkt_dir: str):
+    jp = os.path.join(pkt_dir, PACKET_JSON_NAME)
+    if os.path.islink(jp):                             # don't follow a packet json symlinked outside the root
+        return None
     try:
-        with open(os.path.join(pkt_dir, PACKET_JSON_NAME), encoding="utf-8") as f:
+        if not os.path.isfile(jp):
+            return None
+        with open(jp, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return None
@@ -118,10 +127,12 @@ def write_status(base_dir: str, slug: str, status: str) -> dict:
     final = os.path.join(pkt_dir, STATUS_FILE)
     tmp = final + ".tmp"
     for p in (tmp, final):
-        # never follow a planted symlink and write THROUGH to its target (open(w) would do so) — the
-        # endpoint promises to write only the local status file.
+        # never follow a planted symlink, or truncate a hard-linked / non-regular target (open(w) would
+        # write THROUGH to a shared inode) — the endpoint promises to write only the local status file.
         if os.path.islink(p):
             raise ValueError("refusing to write through a symlinked status file: %s" % p)
+        if os.path.exists(p) and (not os.path.isfile(p) or os.stat(p).st_nlink > 1):
+            raise ValueError("refusing to write a hard-linked or non-regular status file: %s" % p)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
     os.replace(tmp, final)

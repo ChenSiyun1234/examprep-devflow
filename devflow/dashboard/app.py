@@ -363,8 +363,9 @@ def _render_packet_detail(p: dict, notice: str = "") -> str:
                e(p.get("source")), e(p.get("generated_at")), e(p.get("gate")), e(p.get("decision")),
                _packet_source_text(p), e(p.get("md_path")), e(p.get("json_path"))))
 
-    status_card = (card("Handoff status: <span class='marker'>%s</span>" % e(p.get("status")),
-                        _status_buttons(p.get("slug") or "", p.get("status") or "")
+    status_card = (card("Handoff status",
+                        "<p>current: <span class='marker'>%s</span></p>" % e(p.get("status"))
+                        + _status_buttons(p.get("slug") or "", p.get("status") or "")
                         + "<p class='note'>Local only — writes "
                           "<code>.devflow/packets/&lt;slug&gt;/handoff-status.json</code>. "
                           "No GitHub write.</p>"))
