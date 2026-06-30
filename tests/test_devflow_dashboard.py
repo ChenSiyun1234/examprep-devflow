@@ -21,6 +21,7 @@ from unittest import mock
 
 from devflow import cli as _cli
 from devflow.tools.packet_writer import PacketError
+from devflow.tools.github_cli import GhError
 import devflow.tools.review_orchestrator_runner as orch_runner
 import devflow.dashboard.app as app
 import devflow.dashboard.service as service
@@ -764,6 +765,33 @@ class HttpIntegrationTests(DashboardBase):
         self.assertIn("&lt;script&gt;", body)
         self.assertNotIn("<b>brnch</b>", body)                # branch escaped
         self.assertNotIn("<i>boom</i>", body)                 # error escaped
+
+    def test_orchestrator_renders_retarget_targets(self):
+        canned = {
+            "marker": "ORCHESTRATION_PLAN", "repo": "o/r", "default_branch": "main",
+            "state_path": "/tmp/s.json", "rate_limited": False, "errors": [],
+            "open_prs": [{"number": 6, "title": "child a", "branch": "feat/a", "base_ref": "feat/parent"},
+                         {"number": 7, "title": "child b", "branch": "feat/b", "base_ref": "feat/gone"}],
+            "plan": {"ranking": [], "request_review": [], "findings_to_fix": [], "mergeable_now": [],
+                     "force_mergeable": [], "ready_then_merge": [], "needs_conflict": [],
+                     "needs_retarget": [6, 7], "retarget_to": {"6": "feat/parent"},  # 7 -> default fallback
+                     "mergeable_unknown": [], "in_flight": [], "rate_limited": False}}
+        with mock.patch.object(service, "run_orchestrator", return_value=canned):
+            resp = self._post("/orchestrator", {"repo": "o/r"})
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("retarget base", body)
+        self.assertIn("feat/parent", body)                    # explicit retarget_to target
+        self.assertIn("<code>main</code>", body)              # #7 falls back to default_branch
+
+    def test_orchestrator_gh_error_is_surfaced(self):
+        with mock.patch.object(service, "run_orchestrator",
+                               side_effect=GhError("gh not authenticated")):
+            resp = self._post("/orchestrator", {"repo": "o/r", "limit": "50"})
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("gh error", body)
+        self.assertIn("gh not authenticated", body)
 
 
 if __name__ == "__main__":

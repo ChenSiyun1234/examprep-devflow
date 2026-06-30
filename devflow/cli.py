@@ -37,7 +37,6 @@ from devflow.tools.packet_writer import (
     parse_scope_markdown, build_manual_packet, render_manual_markdown,
 )
 from devflow.tools.review_priority import score as score_review_priority
-from devflow.tools import review_orchestrator as orch
 from devflow.tools.review_orchestrator_runner import build_orchestration_result
 from devflow._compat import HAS_LANGGRAPH
 
