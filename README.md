@@ -252,11 +252,14 @@ so there is no arbitrary-comment box. To guard against fat-finger and stale-plan
 refused unless **(a)** you type the exact PR-specific phrase `POST @codex review to #<PR>`, **(b)** the
 PR's current head SHA still matches the one the page rendered (otherwise: refresh and retry), and **(c)**
 the PR is OPEN. It still **cannot** merge / mark ready / retarget / request reviewers / close / delete
-branches / push / force-push / trigger GitHub Actions / post the guided prompt or any other text. Each
-attempt (success or failure) appends one line to a **local** audit log,
+branches / push / force-push / invoke GitHub Actions itself / post the guided prompt or any other text.
+(One honest caveat: like *any* PR comment, posting `@codex review` can trigger the **target repo's own**
+`on: issue_comment` workflows if it defines them — that is inherent to commenting, not something the
+dashboard does or can prevent; the dashboard itself never calls `gh workflow` / `workflow_dispatch`.)
+Each attempt (success, failure, or refused) appends one line to a **local** audit log,
 `.devflow/actions/dashboard-writes.jsonl` (timestamp, action, repo, PR, head SHA, the fixed body, result —
-no secrets, no GitHub content), and a successful post stamps the local orchestrator's `requested_head` so
-the read-only planner stops re-recommending it. The mutation goes through the existing guarded
+no secrets, no GitHub content), and a successful post stamps the local orchestrator's `requested_head`
+(serialized so concurrent posts don't double-request) so the read-only planner stops re-recommending it. The mutation goes through the existing guarded
 `GitHubWriter` (write-shape allow-list + secret scan); the narrow helper is
 `devflow/tools/dashboard_writes.post_codex_review_request`.
 

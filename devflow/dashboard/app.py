@@ -99,9 +99,11 @@ def _payload_html(payload: dict) -> str:
     return "".join(out)
 
 
-def _codex_write_forms(repo, nums, prs_by_num) -> str:
+def _codex_write_forms(repo, nums, prs_by_num, limit=50) -> str:
     """Strongly-confirmed 'post @codex review' forms (one per request_review PR). Each posts the FIXED
-    body @codex review only; the head SHA is pinned and a PR-specific confirmation phrase is required."""
+    body @codex review only; the head SHA is pinned and a PR-specific confirmation phrase is required.
+    ``limit`` (the window the plan was computed with) is carried through so the server-side candidate
+    recompute on POST recognizes a PR shown only because the operator widened the limit past the default."""
     rows = []
     for n in nums:
         head = (prs_by_num.get(n) or {}).get("head") or ""
@@ -111,17 +113,18 @@ def _codex_write_forms(repo, nums, prs_by_num) -> str:
             "<input type='hidden' name='repo' value='%s'>"
             "<input type='hidden' name='pr_number' value='%s'>"
             "<input type='hidden' name='expected_head_sha' value='%s'>"
+            "<input type='hidden' name='limit' value='%s'>"
             "<strong>#%s</strong> <span class='muted'>head <code>%s</code></span> — type "
             "<code>%s</code>: <input type='text' name='confirmation' autocomplete='off' size='30' "
             "placeholder='%s' required> <button type='submit'>Post @codex review to #%s</button></form>"
-            % (e(repo), e(n), e(head), e(n), e((head or "")[:8]), e(conf), e(conf), e(n)))
+            % (e(repo), e(n), e(head), e(limit), e(n), e((head or "")[:8]), e(conf), e(conf), e(n)))
     return ("<p class='note'>Each button posts a <strong>real</strong> GitHub PR comment whose body is "
             "EXACTLY <code>@codex review</code>. It does <strong>not</strong> merge, mark ready, retarget, "
             "request reviewers, close, push, or post the guided prompt. The post is refused unless the PR "
             "head still matches and the confirmation is exact.</p>" + "".join(rows))
 
 
-def _render_orchestration(result: dict, allow_writes: bool = False) -> str:
+def _render_orchestration(result: dict, allow_writes: bool = False, limit: int = 50) -> str:
     """Render the read-only orchestration plan as escaped cards + a ranking table + a raw debug blob.
     Recommends actions only; emits NO merge/comment/retarget buttons."""
     plan = result.get("plan") or {}
@@ -192,13 +195,23 @@ def _render_orchestration(result: dict, allow_writes: bool = False) -> str:
         ranking_html = "<p class='muted'>(no open PRs)</p>"
 
     rr = plan.get("request_review") or []
-    rr_html = (chips(rr, extra=prompt_links)
-               + "<p class='muted'>Preferred review request — paste the <strong>bare</strong> trigger "
-               "below (reliable: on Codex Cloud a guided brief can switch Codex into code-change mode "
-               "instead of review). The guided Codex prompt is <strong>optional</strong>, for when you "
-               "want the shared policy applied. The dashboard posts <strong>nothing</strong>:</p>"
-               "<pre>@codex review</pre>") \
-        if rr else "<p class='muted'>(none)</p>"
+    if not rr:
+        rr_html = "<p class='muted'>(none)</p>"
+    elif allow_writes:
+        # writes are live: don't claim "the dashboard posts nothing" next to a real post button below
+        rr_html = (chips(rr, extra=prompt_links)
+                   + "<p class='muted'>Preferred review request — the <strong>bare</strong> trigger "
+                   "<code>@codex review</code> (reliable: on Codex Cloud a guided brief can switch Codex "
+                   "into code-change mode instead of review). Use the <strong>Post @codex review</strong> "
+                   "form below to post it for real, or copy it. The guided Codex prompt is "
+                   "<strong>optional</strong>.</p><pre>@codex review</pre>")
+    else:
+        rr_html = (chips(rr, extra=prompt_links)
+                   + "<p class='muted'>Preferred review request — paste the <strong>bare</strong> trigger "
+                   "below (reliable: on Codex Cloud a guided brief can switch Codex into code-change mode "
+                   "instead of review). The guided Codex prompt is <strong>optional</strong>, for when you "
+                   "want the shared policy applied. The dashboard posts <strong>nothing</strong>:</p>"
+                   "<pre>@codex review</pre>")
 
     rt_to = plan.get("retarget_to") or {}
     rt_html = chips(plan.get("needs_retarget"),
@@ -222,7 +235,7 @@ def _render_orchestration(result: dict, allow_writes: bool = False) -> str:
 
     write_card = ""
     if allow_writes:
-        body = (_codex_write_forms(result.get("repo"), rr, prs_by_num) if rr
+        body = (_codex_write_forms(result.get("repo"), rr, prs_by_num, limit) if rr
                 else "<p class='muted'>(no request_review PRs to post to)</p>")
         write_card = card("Post @codex review — REAL GitHub write (opt-in)", body)
     banner = (_alert("info", "GitHub writes ENABLED (localhost, opt-in): you can post @codex review to "
@@ -785,16 +798,18 @@ class Handler(BaseHTTPRequestHandler):
         self._send_html(_render("watcher.html", title="Codex watcher", notice=notice, result=result))
 
     def _post_orchestrator(self, form):
+        limit = form.get("limit") or 50
         try:
-            res = service.run_orchestrator(form.get("repo", ""), limit=(form.get("limit") or 50))
+            res = service.run_orchestrator(form.get("repo", ""), limit=limit)
         except ValueError as ex:
             return self._page_orchestrator(notice=_alert("err", str(ex)))
         except GhError as ex:
             return self._page_orchestrator(notice=_alert("err", "gh error: %s" % ex))
         marker = res.get("marker")
         notice = _alert("ok" if marker == "ORCHESTRATION_PLAN" else "info", "marker: %s" % marker)
+        # carry the SAME limit into the write forms so the POST-time candidate recompute matches this plan
         self._page_orchestrator(notice=notice,
-                                result=_render_orchestration(res, self.server.allow_writes))
+                                result=_render_orchestration(res, self.server.allow_writes, limit))
 
     def _forbidden_writes(self) -> None:
         self._send_html(_render("message.html", title="Forbidden",
@@ -812,7 +827,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             res = service.request_codex_review(repo, form.get("pr_number", ""),
                                                form.get("expected_head_sha", ""),
-                                               form.get("confirmation", ""))
+                                               form.get("confirmation", ""),
+                                               limit=form.get("limit"))
         except ValueError as ex:
             return self._write_result_page(_alert("err", "Post refused: %s" % ex))
         except GhError as ex:

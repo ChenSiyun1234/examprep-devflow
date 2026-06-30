@@ -1777,6 +1777,18 @@ class OrchestratorWriteRenderTests(unittest.TestCase):
         self.assertNotIn("action='/codex-review-request'", html)
         self.assertIn("no request_review PRs", html)
 
+    def test_request_review_card_copy_is_conditional_on_write_mode(self):
+        # the "Request review" card must not claim the dashboard posts nothing when a post button is live
+        off = app._render_orchestration(_CannedOrchestration.make(), False)
+        on = app._render_orchestration(_CannedOrchestration.make(), True)
+        self.assertIn("posts <strong>nothing</strong>", off)     # read-only: the disclaimer stays
+        self.assertNotIn("posts <strong>nothing</strong>", on)   # write mode: contradictory claim dropped
+
+    def test_write_form_carries_the_plan_limit(self):
+        # the limit the plan was computed with is threaded into the form so the POST-time recompute matches
+        html = app._render_orchestration(_CannedOrchestration.make(), True, limit=120)
+        self.assertIn("name='limit' value='120'", html)
+
 
 class CodexWriteFlagTests(unittest.TestCase):
     """`--allow-github-writes` enables the write path ONLY on a localhost bind."""
@@ -1990,6 +2002,29 @@ class CodexWriteHelperTests(unittest.TestCase):
         self.assertEqual(rh["5"], "abc1234")                     # new stamp present
         self.assertEqual(rh["7"], "oldhead7")                    # pre-existing stamp NOT clobbered
 
+    def test_duplicate_post_at_same_head_is_skipped(self):
+        # if review was already requested at THIS head (earlier post or the external watcher), don't
+        # post a second @codex review — idempotency that backs the concurrent-double-click guard
+        import devflow.tools.review_orchestrator as orch
+        st0 = orch.load_state(self.state)
+        st0["requested_head"]["5"] = "abc1234"
+        orch.save_state(st0, self.state)
+        ro, writer, calls = self._fakes(head="abc1234")
+        res = self._call(ro, writer)
+        self.assertTrue(res["ok"])
+        self.assertTrue(res.get("duplicate"))
+        self.assertEqual(calls, [])                              # NO duplicate comment posted
+        self.assertEqual(self._audit_lines()[-1]["result"], "skipped_duplicate")
+
+    def test_second_post_same_head_skips_after_first(self):
+        ro, writer, calls = self._fakes(head="abc1234")
+        r1 = self._call(ro, writer)
+        r2 = self._call(ro, writer)                              # same PR + head, immediately again
+        self.assertTrue(r1["ok"])
+        self.assertNotIn("duplicate", r1)
+        self.assertTrue(r2.get("duplicate"))
+        self.assertEqual(calls, [(5, "@codex review", True)])    # exactly ONE real post across both calls
+
 
 class CodexReviewServiceCandidatesTests(unittest.TestCase):
     """`service.request_codex_review` recomputes the CURRENT request_review candidates and passes them
@@ -2001,10 +2036,19 @@ class CodexReviewServiceCandidatesTests(unittest.TestCase):
              mock.patch.object(service.dashboard_writes, "post_codex_review_request",
                                return_value={"ok": True, "pr_number": 5, "head_sha": "abc"}) as post:
             service.request_codex_review("o/r", "5", "abc", "POST @codex review to #5")
-        ro.assert_called_once_with("o/r")                         # recomputed read-only, server-side
+        ro.assert_called_once_with("o/r", limit=service.ORCH_LIMIT_DEFAULT)   # read-only, default window
         _, kwargs = post.call_args
         self.assertEqual(list(kwargs["candidates"]), [5, 9])      # current candidate set threaded through
         self.assertTrue(kwargs["live"])
+
+    def test_threads_displayed_limit_into_recompute(self):
+        # a PR shown only because the operator widened the limit must still be recognized server-side
+        with mock.patch.object(service, "run_orchestrator",
+                               return_value={"plan": {"request_review": [5]}}) as ro, \
+             mock.patch.object(service.dashboard_writes, "post_codex_review_request",
+                               return_value={"ok": True}):
+            service.request_codex_review("o/r", "5", "abc", "POST @codex review to #5", limit="120")
+        ro.assert_called_once_with("o/r", limit="120")            # page's limit honored, not the default 50
 
     def test_empty_request_review_plan_yields_empty_candidates(self):
         # rate-limited / nothing-to-request -> candidates [] -> the helper will refuse any PR (fail-closed)

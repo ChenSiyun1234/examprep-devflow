@@ -33,9 +33,10 @@ CODEX_REVIEW_BODY = "@codex review"                    # the ONLY body this modu
 AUDIT_DIR = os.path.join(".devflow", "actions")        # local tool-state, gitignored
 AUDIT_FILE = "dashboard-writes.jsonl"
 
-# Serialize the requested_head read-modify-write across ThreadingHTTPServer worker threads so two
-# concurrent successful posts can't both load the same state and clobber each other's stamp.
-_STATE_LOCK = threading.Lock()
+# Serialize the whole post critical section (idempotency check -> comment_on_pr -> requested_head stamp)
+# across ThreadingHTTPServer worker threads, so two concurrent submissions for the same PR can't both
+# reach the GitHub write before either stamps requested_head (which would emit a DUPLICATE @codex review).
+_POST_LOCK = threading.Lock()
 
 
 def confirmation_text(pr_number) -> str:
@@ -133,25 +134,36 @@ def post_codex_review_request(repo: str, pr_number, expected_head_sha: str, conf
                 "PR #%s head changed (now %s, expected %s) — refresh Review Queue and retry"
                 % (n, (head[:8] or "?"), expected[:8]))
 
-    # post the FIXED body through the guarded writer (real write only when live=True)
-    res = GitHubWriter(repo, live=bool(live)).comment_on_pr(n, CODEX_REVIEW_BODY)
-    ok = bool(res.get("executed")) and not res.get("error")
-
-    # AFTER the post, everything is best-effort and must NOT raise: the comment may already be live, so a
-    # local audit/state failure cannot be allowed to surface as an error (it would trigger a duplicate).
-    _audit(audit_dir, _audit_record(repo, n, head, "success" if ok else "failure"))
-    if not ok:
-        return {"ok": False, "error": res.get("error") or "post failed", "pr_number": n, "head_sha": head}
-
-    # the Dashboard ACTUALLY requested review here (unlike the read-only Review Queue), so stamp the
-    # local orchestrator requested_head — ONLY on success, serialized so concurrent posts don't clobber,
-    # and never touching converged/done or other PRs' state.
-    try:
-        with _STATE_LOCK:
-            path = state_file or orch.state_path_for_repo(repo)
+    # Serialize the POST itself (not merely the bookkeeping) so two concurrent submissions for the same
+    # PR — e.g. a double-click on the threaded server — can't both reach comment_on_pr before
+    # requested_head is stamped (which would post a DUPLICATE @codex review and burn Codex review slots).
+    # Idempotent: if review was already requested at THIS exact head (by an earlier post or the external
+    # watcher), skip the write entirely. Everything after the post is best-effort and never raises.
+    path = state_file or orch.state_path_for_repo(repo)
+    with _POST_LOCK:
+        try:
             st = orch.load_state(path)
-            st["requested_head"][str(n)] = head
+        except Exception:
+            st = {"requested_head": {}}
+        if (st.get("requested_head") or {}).get(str(n)) == head:
+            _audit(audit_dir, _audit_record(repo, n, head, "skipped_duplicate",
+                                            "review already requested at this head"))
+            return {"ok": True, "pr_number": n, "head_sha": head, "body": CODEX_REVIEW_BODY,
+                    "duplicate": True}
+
+        # post the FIXED body through the guarded writer (real write only when live=True)
+        res = GitHubWriter(repo, live=bool(live)).comment_on_pr(n, CODEX_REVIEW_BODY)
+        ok = bool(res.get("executed")) and not res.get("error")
+        _audit(audit_dir, _audit_record(repo, n, head, "success" if ok else "failure"))
+        if not ok:
+            return {"ok": False, "error": res.get("error") or "post failed",
+                    "pr_number": n, "head_sha": head}
+
+        # the Dashboard ACTUALLY requested review here — stamp requested_head ONLY on success, merging
+        # into existing state (never clobbering other PRs / converged / done).
+        try:
+            st.setdefault("requested_head", {})[str(n)] = head
             orch.save_state(st, path)
-    except Exception:
-        pass                                           # best-effort bookkeeping; the post already succeeded
+        except Exception:
+            pass                                       # best-effort bookkeeping; the post already succeeded
     return {"ok": True, "pr_number": n, "head_sha": head, "body": CODEX_REVIEW_BODY}
