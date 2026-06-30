@@ -169,9 +169,11 @@ def _render_orchestration(result: dict) -> str:
 
     rr = plan.get("request_review") or []
     rr_html = (chips(rr, extra=prompt_links)
-               + "<p class='muted'>Preferred: <strong>build a guided Codex prompt</strong> (carries the "
-               "shared review policy) and paste it yourself. Minimal fallback — the bare trigger (the "
-               "dashboard does <strong>not</strong> post anything):</p><pre>@codex review</pre>") \
+               + "<p class='muted'>Preferred review request — paste the <strong>bare</strong> trigger "
+               "below (reliable: on Codex Cloud a guided brief can switch Codex into code-change mode "
+               "instead of review). The guided Codex prompt is <strong>optional</strong>, for when you "
+               "want the shared policy applied. The dashboard posts <strong>nothing</strong>:</p>"
+               "<pre>@codex review</pre>") \
         if rr else "<p class='muted'>(none)</p>"
 
     rt_to = plan.get("retarget_to") or {}

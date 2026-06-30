@@ -9,10 +9,11 @@ $notice
 $result
 <form method="post" action="/codex-review-prompt" class="card">
   <label for="repo">repo <span class="muted">(required, owner/name)</span></label>
-  <input type="text" id="repo" name="repo" placeholder="e.g. ChenSiyun1234/examprep-devflow" required>
+  <input type="text" id="repo" name="repo" value="$repo"
+         placeholder="e.g. ChenSiyun1234/examprep-devflow" required>
 
   <label for="pr_number">PR number <span class="muted">(required)</span></label>
-  <input type="text" id="pr_number" name="pr_number" placeholder="e.g. 12" required>
+  <input type="text" id="pr_number" name="pr_number" value="$pr" placeholder="e.g. 12" required>
 
   <label for="diff_budget">diff budget</label>
   <select id="diff_budget" name="diff_budget">$budget_options</select>
