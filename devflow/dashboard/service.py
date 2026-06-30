@@ -35,6 +35,7 @@ from devflow.tools.packet_writer import (
     build_packet, build_manual_packet, parse_scope_markdown,
     render_manual_markdown, write_packet, PacketError,  # noqa: F401 (re-exported for the app layer)
 )
+from devflow.tools.review_orchestrator_runner import build_orchestration_result
 
 # First-line markers cmd_watch_codex_reviews can emit (read-only watcher).
 WATCH_MARKERS = ("ACTIONABLE_CODEX_REVIEWS", "CODEX_WATCH_INCOMPLETE",
@@ -273,3 +274,31 @@ def run_watcher(repo: str, init: bool = False, limit: int = 50) -> dict:
     marker = next((m for line in output.splitlines()
                    for m in WATCH_MARKERS if line.strip() == m), None)
     return {"marker": marker, "rc": rc, "output": output}
+
+
+# ----------------------------------------------------------------------------------------
+# Review Queue / Orchestrator (READ-ONLY planner) — recommends actions, never mutates GitHub
+# ----------------------------------------------------------------------------------------
+ORCH_LIMIT_DEFAULT = 50
+ORCH_LIMIT_MAX = 200
+
+
+def run_orchestrator(repo: str, limit: int = ORCH_LIMIT_DEFAULT) -> dict:
+    """Compute the READ-ONLY cross-PR orchestration plan for the dashboard.
+
+    Validates input, clamps ``limit``, and delegates to the structured runner which uses ONLY
+    ReadOnlyGitHub + the pure planner — no GitHub writes, no shell, no merge/comment/review-request.
+    Returns the structured result (``{marker, repo, default_branch, open_prs, plan, errors, state_path,
+    rate_limited}``). Raises ValueError on bad input; GhError propagates for a gh failure."""
+    repo = (repo or "").strip()
+    if not repo:
+        raise ValueError("repo is required")
+    try:
+        lim = int(limit)
+    except (TypeError, ValueError):
+        lim = ORCH_LIMIT_DEFAULT
+    lim = max(1, min(lim, ORCH_LIMIT_MAX))            # clamp to a sane window
+    # HARD-FORCE persist_state=False (not merely a default): the dashboard never actually requests
+    # reviews, so it must NEVER persist the planner's in-flight tracking — that would suppress a later
+    # real request. No caller can make the dashboard persist.
+    return build_orchestration_result(repo=repo, limit=lim, persist_state=False)
