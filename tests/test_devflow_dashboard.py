@@ -838,6 +838,7 @@ class ServerTests(unittest.TestCase):
         # mock run_server so no public bind happens; serve_forever returns immediately
         fake = mock.Mock()
         fake.serve_forever.side_effect = KeyboardInterrupt
+        fake.server_address = ("0.0.0.0", 8765)
         err = io.StringIO()
         with mock.patch.object(app, "run_server", return_value=fake), \
              mock.patch("sys.stderr", err), contextlib.redirect_stdout(io.StringIO()):
@@ -848,19 +849,22 @@ class ServerTests(unittest.TestCase):
     def test_main_brackets_ipv6_url(self):
         fake = mock.Mock()
         fake.serve_forever.side_effect = KeyboardInterrupt
+        fake.server_address = ("::1", 8765)
         out = io.StringIO()
         with mock.patch.object(app, "run_server", return_value=fake), mock.patch("sys.stdout", out):
             app.main(["--host", "::1", "--port", "0"])
         self.assertIn("[::1]", out.getvalue())               # IPv6 literal bracketed in the printed URI
 
-    def _run_main(self, argv):
-        """Run main() without binding/serving: mock run_server + serve_forever, capture stdout/stderr,
-        and mock webbrowser.open. Returns (rc, stdout, stderr, webbrowser_mock)."""
+    def _run_main(self, argv, bound_port=8765):
+        """Run main() without binding/serving: mock run_server (with a fake BOUND port) + serve_forever,
+        run the browser-open synchronously, capture I/O, mock webbrowser.open. Returns (rc, out, err, wb)."""
         fake = mock.Mock()
         fake.serve_forever.side_effect = KeyboardInterrupt
+        fake.server_address = ("127.0.0.1", bound_port)     # the ACTUAL port run_server bound
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(app, "run_server", return_value=fake), \
-             mock.patch.object(app.webbrowser, "open") as wb, \
+             mock.patch.object(app, "_spawn_browser_open", side_effect=app._open_browser), \
+             mock.patch.object(app.webbrowser, "open", return_value=True) as wb, \
              mock.patch("sys.stderr", err), contextlib.redirect_stdout(out):
             rc = app.main(argv)
         return rc, out.getvalue(), err.getvalue(), wb
@@ -886,6 +890,31 @@ class ServerTests(unittest.TestCase):
         rc, out, _, wb = self._run_main(["--host", "::1", "--port", "8765", "--open"])
         self.assertEqual(rc, 0)
         wb.assert_called_once_with("http://[::1]:8765")     # IPv6 URL stays bracketed when opened
+
+    def test_open_uses_actual_bound_port_for_ephemeral(self):
+        # --port 0 binds an ephemeral port; the opened URL must use the REAL bound port, not :0
+        rc, out, _, wb = self._run_main(["--host", "127.0.0.1", "--port", "0", "--open"], bound_port=54321)
+        wb.assert_called_once_with("http://127.0.0.1:54321")
+        self.assertNotIn(":0", wb.call_args[0][0])
+
+    def test_open_browser_failure_is_reported(self):
+        out = io.StringIO()
+        with mock.patch.object(app.webbrowser, "open", return_value=False), \
+             contextlib.redirect_stdout(out):
+            app._open_browser("http://127.0.0.1:8765")       # no usable browser -> honest message
+        self.assertIn("could not open", out.getvalue())
+        self.assertNotIn("opened http", out.getvalue())
+
+    def test_spawn_browser_open_uses_daemon_thread(self):
+        captured = {}
+
+        def fake_thread(*a, **kw):
+            captured["daemon"] = kw.get("daemon")
+            return mock.Mock()                               # .start() is a no-op; don't open a real browser
+
+        with mock.patch.object(app.threading, "Thread", side_effect=fake_thread):
+            app._spawn_browser_open("http://127.0.0.1:8765")
+        self.assertTrue(captured["daemon"])                  # daemon -> never blocks startup / process exit
 
 
 class HttpIntegrationTests(DashboardBase):
