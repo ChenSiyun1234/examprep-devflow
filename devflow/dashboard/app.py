@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from devflow.dashboard import service
 from devflow.tools.packet_writer import PacketError
+from devflow.tools.github_cli import GhError
 
 TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 DEFAULT_HOST = "127.0.0.1"
@@ -94,6 +95,93 @@ def _payload_html(payload: dict) -> str:
             body = "<div>%s</div>" % e(v)
         out.append("<div class='payload'><div class='muted'>%s:</div>%s</div>" % (e(label), body))
     return "".join(out)
+
+
+def _render_orchestration(result: dict) -> str:
+    """Render the read-only orchestration plan as escaped cards + a ranking table + a raw debug blob.
+    Recommends actions only; emits NO merge/comment/retarget buttons."""
+    plan = result.get("plan") or {}
+    prs_by_num = {p.get("number"): p for p in (result.get("open_prs") or [])}
+
+    def chips(nums, extra=None):
+        if not nums:
+            return "<p class='muted'>(none)</p>"
+        out = []
+        for n in nums:
+            p = prs_by_num.get(n) or {}
+            bits = ["<strong>#%s</strong>" % e(n)]
+            if p.get("title"):
+                bits.append(e(p.get("title")))
+            branch = p.get("branch") or p.get("head_ref")
+            if branch:
+                bits.append("<code>%s</code>" % e(branch))
+            suffix = (" — " + extra(n)) if extra else ""
+            out.append("<li>%s%s</li>" % (" · ".join(bits), suffix))
+        return "<ul>" + "".join(out) + "</ul>"
+
+    def card(title, body):
+        return "<div class='card'><h3>%s</h3>%s</div>" % (e(title), body)
+
+    summary = (
+        "<table class='kv'>"
+        "<tr><th>marker</th><td><span class='marker'>%s</span></td></tr>"
+        "<tr><th>repo</th><td>%s</td></tr>"
+        "<tr><th>default branch</th><td>%s</td></tr>"
+        "<tr><th>open PRs inspected</th><td>%s</td></tr>"
+        "<tr><th>Codex rate-limited</th><td>%s</td></tr>"
+        "<tr><th>state file</th><td><code>%s</code></td></tr></table>"
+        % (e(result.get("marker")), e(result.get("repo")), e(result.get("default_branch")),
+           e(len(result.get("open_prs") or [])),
+           ("yes — back off" if result.get("rate_limited") else "no"), e(result.get("state_path"))))
+
+    errs = result.get("errors") or []
+    errors_html = ""
+    if errs:
+        errors_html = (_alert("err", "PR read errors: %d (sweep continued)" % len(errs))
+                       + "<ul>" + "".join("<li><strong>#%s</strong>: %s</li>"
+                                          % (e(x.get("pr")), e(x.get("error"))) for x in errs) + "</ul>")
+
+    ranking = plan.get("ranking") or []
+    if ranking:
+        rows = "".join(
+            "<tr><td>#%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+            % (e(r.get("pr")), e((prs_by_num.get(r.get("pr")) or {}).get("title")), e(r.get("priority")),
+               e(r.get("rounds")), ("clean" if r.get("clean") else ""), e(r.get("state")))
+            for r in ranking)
+        ranking_html = ("<table><thead><tr><th>PR</th><th>title</th><th>priority</th><th>rounds</th>"
+                        "<th>clean</th><th>state</th></tr></thead><tbody>" + rows + "</tbody></table>")
+    else:
+        ranking_html = "<p class='muted'>(no open PRs)</p>"
+
+    rr = plan.get("request_review") or []
+    rr_html = (chips(rr) + "<p class='muted'>Recommended — copy this onto each PR yourself; the "
+               "dashboard does <strong>not</strong> post it:</p><pre>@codex review</pre>") if rr \
+        else "<p class='muted'>(none)</p>"
+
+    rt_to = plan.get("retarget_to") or {}
+    rt_html = chips(plan.get("needs_retarget"),
+                    extra=lambda n: "retarget base &rarr; <code>%s</code>"
+                    % e(rt_to.get(str(n)) or result.get("default_branch")))
+
+    mn_html = chips(plan.get("mergeable_now"))
+    if plan.get("mergeable_now"):
+        mn_html += ("<p class='note'>Human merge preflight required — verify locally and merge via the "
+                    "CLI/GitHub. The dashboard provides <strong>no</strong> merge button.</p>")
+
+    return (
+        card("Summary", summary)
+        + (card("Errors", errors_html) if errs else "")
+        + card("Ranking", ranking_html)
+        + card("Request review (priority-ordered, ≤3 in-flight)", rr_html)
+        + card("Findings to fix (P1/P2 or early P3)", chips(plan.get("findings_to_fix")))
+        + card("Mergeable now (clean / converged)", mn_html)
+        + card("Force-mergeable (≥3 rounds, only-minor P3)", chips(plan.get("force_mergeable")))
+        + card("Ready then merge (un-draft first)", chips(plan.get("ready_then_merge")))
+        + card("Resolve conflict (merge base in; never force-push)", chips(plan.get("needs_conflict")))
+        + card("Needs retarget (parent PR merged)", rt_html)
+        + card("Mergeability pending (GitHub still computing; re-run)", chips(plan.get("mergeable_unknown")))
+        + card("In-flight (awaiting Codex)", chips(plan.get("in_flight")))
+        + card("Raw plan (debug)", "<pre>%s</pre>" % e(json.dumps(result, ensure_ascii=False, indent=2))))
 
 
 class DashboardServer(ThreadingHTTPServer):
@@ -205,6 +293,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._page_manual()
         if path == "/watcher":
             return self._page_watcher()
+        if path == "/orchestrator":
+            return self._page_orchestrator()
         if path.startswith("/run/"):
             return self._page_run_detail(urllib.parse.unquote(path[len("/run/"):]))
         return self._not_found()
@@ -224,6 +314,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_manual(form)
         if path == "/watcher":
             return self._post_watcher(form)
+        if path == "/orchestrator":
+            return self._post_orchestrator(form)
         if path == "/decide":
             return self._post_decide(form)
         if path == "/export":
@@ -321,6 +413,9 @@ class Handler(BaseHTTPRequestHandler):
     def _page_watcher(self, notice: str = "", result: str = ""):
         self._send_html(_render("watcher.html", title="Codex watcher", notice=notice, result=result))
 
+    def _page_orchestrator(self, notice: str = "", result: str = ""):
+        self._send_html(_render("orchestrator.html", title="Review Queue", notice=notice, result=result))
+
     # -- POST handlers ---------------------------------------------------------
     def _post_new_run(self, form):
         try:
@@ -407,6 +502,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _page_watcher_render(self, notice, result):
         self._send_html(_render("watcher.html", title="Codex watcher", notice=notice, result=result))
+
+    def _post_orchestrator(self, form):
+        try:
+            res = service.run_orchestrator(form.get("repo", ""), limit=(form.get("limit") or 50))
+        except ValueError as ex:
+            return self._page_orchestrator(notice=_alert("err", str(ex)))
+        except GhError as ex:
+            return self._page_orchestrator(notice=_alert("err", "gh error: %s" % ex))
+        marker = res.get("marker")
+        notice = _alert("ok" if marker == "ORCHESTRATION_PLAN" else "info", "marker: %s" % marker)
+        self._page_orchestrator(notice=notice, result=_render_orchestration(res))
 
 
 def _allowed_hosts(host: str) -> set:

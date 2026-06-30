@@ -21,6 +21,7 @@ from unittest import mock
 
 from devflow import cli as _cli
 from devflow.tools.packet_writer import PacketError
+import devflow.tools.review_orchestrator_runner as orch_runner
 import devflow.dashboard.app as app
 import devflow.dashboard.service as service
 
@@ -303,6 +304,83 @@ class WatcherTests(DashboardBase):
             service.create_run("lock-1", "docs-advisory", "owner/x", pause_at="advisory")
             service.run_watcher("owner/repo")
         self.assertGreaterEqual(len(entered), 2)   # both create_run AND run_watcher took the shared lock
+
+
+class _FakeOrchGH:
+    """Read-only stand-in for ReadOnlyGitHub used by the orchestration runner — only read methods."""
+    def __init__(self, repo):
+        self.repo = repo
+        self.calls = []
+
+    def resolve_repo(self):
+        self.calls.append("resolve_repo")
+        return "o/r"
+
+    def get_repo_info(self):
+        self.calls.append("get_repo_info")
+        return {"default_branch": "main"}
+
+    def list_prs(self, state="open", limit=50):
+        self.calls.append(("list_prs", state, limit))
+        return [{"number": 5, "title": "feat: x", "state": "OPEN", "head_ref": "feat/x",
+                 "base_ref": "main", "branch": "feat/x", "head": "aaaaaaa"}]
+
+    def get_pr_meta(self, num):
+        self.calls.append(("get_pr_meta", num))
+        return {"number": num, "state": "OPEN", "mergeable": "MERGEABLE", "base_ref": "main",
+                "head_ref": "feat/x", "head_oid": "aaaaaaa", "is_draft": True, "additions": 10,
+                "deletions": 0, "changed_files": 2, "title": "feat: x"}
+
+    def get_pr_codex_signals(self, num):
+        self.calls.append(("get_pr_codex_signals", num))
+        return {"reviews": [], "inline": [], "comments": []}
+
+    def merged_heads(self, branches):
+        self.calls.append(("merged_heads", tuple(sorted(branches or []))))
+        return {}
+
+
+class BuildOrchestrationResultTests(unittest.TestCase):
+    def test_structured_result_is_read_only_and_does_not_persist_by_default(self):
+        holder = {}
+
+        def mk(repo):
+            holder["gh"] = _FakeOrchGH(repo)
+            return holder["gh"]
+
+        with mock.patch.object(orch_runner, "ReadOnlyGitHub", side_effect=mk), \
+             mock.patch.object(orch_runner.orch, "save_state") as save:
+            res = orch_runner.build_orchestration_result("o/r", limit=50)   # persist_state default False
+        self.assertEqual(res["marker"], "ORCHESTRATION_PLAN")
+        self.assertEqual(res["repo"], "o/r")
+        self.assertEqual(res["default_branch"], "main")
+        self.assertEqual([p["number"] for p in res["open_prs"]], [5])
+        self.assertIn(5, res["plan"]["request_review"])          # unreviewed PR -> request review
+        save.assert_not_called()                                  # default: never persists tracking state
+        self.assertIn("resolve_repo", holder["gh"].calls)        # only the fake's read methods exist
+
+    def test_persist_state_true_saves_tracking(self):
+        with mock.patch.object(orch_runner, "ReadOnlyGitHub", side_effect=lambda r: _FakeOrchGH(r)), \
+             mock.patch.object(orch_runner.orch, "save_state") as save:
+            orch_runner.build_orchestration_result("o/r", persist_state=True)
+        save.assert_called_once()
+
+
+class OrchestratorServiceTests(unittest.TestCase):
+    def test_run_orchestrator_requires_repo(self):
+        with self.assertRaises(ValueError):
+            service.run_orchestrator("")
+
+    def test_run_orchestrator_clamps_limit_and_never_persists(self):
+        with mock.patch.object(service, "build_orchestration_result",
+                               return_value={"marker": "NO_ACTION_NEEDED"}) as m:
+            service.run_orchestrator("o/r", limit=99999)
+            service.run_orchestrator("o/r", limit="not-a-number")
+        big = m.call_args_list[0].kwargs
+        self.assertLessEqual(big["limit"], service.ORCH_LIMIT_MAX)   # clamped
+        self.assertFalse(big["persist_state"])                       # dashboard never persists
+        bad = m.call_args_list[1].kwargs
+        self.assertEqual(bad["limit"], service.ORCH_LIMIT_DEFAULT)   # invalid -> default
 
 
 class NoShellExecutionTests(unittest.TestCase):
@@ -622,6 +700,70 @@ class HttpIntegrationTests(DashboardBase):
         self.assertEqual(resp.status, 303)
         self.assertTrue(resp.getheader("Location").startswith("/?done="))
         self.assertIsNone(service.get_run("f2-done"))        # completed -> checkpoint cleared
+
+    def test_orchestrator_page_loads(self):
+        c = self._conn()
+        c.request("GET", "/orchestrator")
+        resp = c.getresponse()
+        body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("Review Queue", body)
+        self.assertIn("read-only", body.lower())
+
+    def test_orchestrator_missing_repo_shows_validation(self):
+        resp = self._post("/orchestrator", {"repo": "", "limit": "50"})
+        body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("repo is required", body)
+
+    def test_orchestrator_renders_plan_sections(self):
+        canned = {
+            "marker": "ORCHESTRATION_PLAN", "repo": "o/r", "default_branch": "main",
+            "state_path": "/tmp/s.json", "rate_limited": True,
+            "errors": [{"pr": 9, "error": "boom"}],
+            "open_prs": [{"number": 5, "title": "feat: x", "branch": "feat/x", "base_ref": "main"},
+                         {"number": 6, "title": "fix: y", "branch": "fix/y", "base_ref": "main"}],
+            "plan": {"ranking": [{"pr": 5, "priority": 10, "rounds": 0, "clean": False, "state": "OPEN"}],
+                     "request_review": [5], "findings_to_fix": [6], "mergeable_now": [5],
+                     "force_mergeable": [], "ready_then_merge": [], "needs_conflict": [],
+                     "needs_retarget": [], "retarget_to": {}, "mergeable_unknown": [],
+                     "in_flight": [5], "rate_limited": True}}
+        with mock.patch.object(service, "run_orchestrator", return_value=canned):
+            resp = self._post("/orchestrator", {"repo": "o/r", "limit": "50"})
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        for section in ("Request review", "Findings to fix", "Mergeable now"):
+            self.assertIn(section, body)
+        self.assertIn("@codex review", body)                  # copyable request text
+        self.assertIn("back off", body)                       # rate_limited surfaced
+        self.assertIn("read errors", body.lower())            # errors surfaced
+        self.assertIn("merge preflight", body.lower())        # no merge button, preflight note instead
+        # read-only: the result section has NO write forms; only the compute-plan form exists on the page
+        self.assertEqual(body.count("<form"), 1)
+        self.assertNotIn("action='/decide'", body)
+        self.assertNotIn("Merge</button>", body)
+        self.assertNotIn("Approve</button>", body)
+
+    def test_orchestrator_escapes_html(self):
+        canned = {
+            "marker": "ORCHESTRATION_PLAN", "repo": "o/r", "default_branch": "main",
+            "state_path": "/tmp/s.json", "rate_limited": False,
+            "errors": [{"pr": 9, "error": "<i>boom</i>"}],
+            "open_prs": [{"number": 5, "title": "<script>pwn</script>", "branch": "<b>brnch</b>",
+                          "base_ref": "main"}],
+            "plan": {"ranking": [{"pr": 5, "priority": 1, "rounds": 0, "clean": False, "state": "OPEN"}],
+                     "request_review": [5], "findings_to_fix": [], "mergeable_now": [],
+                     "force_mergeable": [], "ready_then_merge": [], "needs_conflict": [],
+                     "needs_retarget": [], "retarget_to": {}, "mergeable_unknown": [],
+                     "in_flight": [], "rate_limited": False}}
+        with mock.patch.object(service, "run_orchestrator", return_value=canned):
+            resp = self._post("/orchestrator", {"repo": "o/r"})
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertNotIn("<script>pwn</script>", body)        # PR title escaped
+        self.assertIn("&lt;script&gt;", body)
+        self.assertNotIn("<b>brnch</b>", body)                # branch escaped
+        self.assertNotIn("<i>boom</i>", body)                 # error escaped
 
 
 if __name__ == "__main__":

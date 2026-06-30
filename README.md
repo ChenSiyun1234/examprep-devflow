@@ -205,7 +205,21 @@ fields, event log, errors, and — when paused — the gate payload with **Appro
 Implementation Packet** buttons) · **New run** (create a dry-run run, optionally paused at a gate) ·
 **Manual packet** (build an Implementation Packet from a Markdown scope form — same as
 `create-implementation-packet` — and see the paths + suggested Claude Code handoff) · **Codex
-watcher** (run the read-only `watch-codex-reviews` sweep and show its marker).
+watcher** (run the read-only `watch-codex-reviews` sweep and show its marker) · **Review Queue** (the
+read-only `orchestrate-reviews` cross-PR plan).
+
+**Review Queue (orchestrator) — read-only & advisory.** Surfaces the same cross-PR plan as
+`orchestrate-reviews`: a priority ranking plus who to request review from, findings to fix, mergeable /
+force-mergeable / ready-then-merge PRs, conflicts / retargets, mergeability-pending, in-flight, and the
+global Codex rate-limit state. It **recommends** actions and **executes none**: for *request review* it
+shows copyable `@codex review` text (it does not post it); for *mergeable* PRs it shows a
+"human merge preflight required" note (there is **no** merge button). It does **not** comment, request
+reviewers, merge, mark ready, retarget, push, force-push, delete branches, or call any GitHub write
+API — and it does **not** replace human approval. By default it does **not** persist the orchestrator's
+local tracking state (the dashboard never actually requests reviews, so it must not record in-flight
+state). Both the CLI and the page call one structured helper
+(`devflow/tools/review_orchestrator_runner.build_orchestration_result`), so there is no stdout scraping
+and no behavioural drift.
 
 **Safe by default — what it does / does not do.**
 
@@ -217,9 +231,10 @@ watcher** (run the read-only `watch-codex-reviews` sweep and show its marker).
 - Every action is **read-only or dry-run**: runs use the pure-stdlib fallback backend with
   `real_github` forced off, so it performs **no** real GitHub writes; packets are the same local
   files the CLI writes; the watcher is the CLI's read-only sweep.
-- It **cannot** merge, delete branches, force-push, add GitHub Actions, run arbitrary shell commands
-  (there is no such endpoint), or edit code. The CLI remains fully supported and is the source of
-  truth; the dashboard only calls the same functions (see `devflow/dashboard/service.py`).
+- It **cannot** merge, mark ready, retarget, post comments, request reviewers, delete branches,
+  force-push, add GitHub Actions, run arbitrary shell commands (there is no such endpoint), or edit
+  code. The CLI remains fully supported and is the source of truth; the dashboard only calls the same
+  functions (see `devflow/dashboard/service.py`).
 
 **Not yet (out of scope for this MVP):** the real LangGraph backend (the dashboard always uses the
 stdlib fallback), authentication, public deployment, and any real GitHub write buttons.
