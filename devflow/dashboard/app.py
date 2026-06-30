@@ -99,7 +99,29 @@ def _payload_html(payload: dict) -> str:
     return "".join(out)
 
 
-def _render_orchestration(result: dict) -> str:
+def _codex_write_forms(repo, nums, prs_by_num) -> str:
+    """Strongly-confirmed 'post @codex review' forms (one per request_review PR). Each posts the FIXED
+    body @codex review only; the head SHA is pinned and a PR-specific confirmation phrase is required."""
+    rows = []
+    for n in nums:
+        head = (prs_by_num.get(n) or {}).get("head") or ""
+        conf = "POST @codex review to #%s" % n
+        rows.append(
+            "<form method='post' action='/codex-review-request' style='margin:8px 0'>"
+            "<input type='hidden' name='repo' value='%s'>"
+            "<input type='hidden' name='pr_number' value='%s'>"
+            "<input type='hidden' name='expected_head_sha' value='%s'>"
+            "<strong>#%s</strong> <span class='muted'>head <code>%s</code></span> — type "
+            "<code>%s</code>: <input type='text' name='confirmation' autocomplete='off' size='30' "
+            "placeholder='%s' required> <button type='submit'>Post @codex review to #%s</button></form>"
+            % (e(repo), e(n), e(head), e(n), e((head or "")[:8]), e(conf), e(conf), e(n)))
+    return ("<p class='note'>Each button posts a <strong>real</strong> GitHub PR comment whose body is "
+            "EXACTLY <code>@codex review</code>. It does <strong>not</strong> merge, mark ready, retarget, "
+            "request reviewers, close, push, or post the guided prompt. The post is refused unless the PR "
+            "head still matches and the confirmation is exact.</p>" + "".join(rows))
+
+
+def _render_orchestration(result: dict, allow_writes: bool = False) -> str:
     """Render the read-only orchestration plan as escaped cards + a ranking table + a raw debug blob.
     Recommends actions only; emits NO merge/comment/retarget buttons."""
     plan = result.get("plan") or {}
@@ -198,11 +220,22 @@ def _render_orchestration(result: dict) -> str:
         awaiting_html += ("<p class='muted'>Freshly recommended PRs are under <em>Request review</em>, "
                           "not here — the dashboard has not posted those requests.</p>")
 
+    write_card = ""
+    if allow_writes:
+        body = (_codex_write_forms(result.get("repo"), rr, prs_by_num) if rr
+                else "<p class='muted'>(no request_review PRs to post to)</p>")
+        write_card = card("Post @codex review — REAL GitHub write (opt-in)", body)
+    banner = (_alert("info", "GitHub writes ENABLED (localhost, opt-in): you can post @codex review to "
+                             "request_review PRs below. This is the ONLY write — no merge/mark-ready/"
+                             "retarget/reviewer/close/push.") if allow_writes else "")
+
     return (
-        card("Summary", summary)
+        banner
+        + card("Summary", summary)
         + (card("Errors", errors_html) if errs else "")
         + card("Ranking", ranking_html)
         + card("Request review (priority-ordered, ≤3 in-flight)", rr_html)
+        + write_card
         + card("Findings to fix (P1/P2 or early P3)", chips(plan.get("findings_to_fix"), extra=prompt_links))
         + card("Mergeable now (clean / converged)", mn_html)
         + card("Force-mergeable (≥3 rounds, only-minor P3)", chips(plan.get("force_mergeable")))
@@ -386,13 +419,16 @@ def _render_packet_detail(p: dict, notice: str = "") -> str:
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, addr, handler, allowed_hosts):
+    def __init__(self, addr, handler, allowed_hosts, allow_writes=False):
         # bind an IPv6 socket for an IPv6 host literal (e.g. ::1) — the default family is IPv4, so
         # without this `--host ::1` (advertised as a localhost name) would fail with an address error.
         if ":" in (addr[0] or ""):
             self.address_family = socket.AF_INET6
         super().__init__(addr, handler)
         self.allowed_hosts = set(allowed_hosts)
+        # the ONE opt-in real-GitHub-write capability (post @codex review). Only ever True when the
+        # operator passed --allow-github-writes AND bound a localhost host (set in main()).
+        self.allow_writes = bool(allow_writes)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -531,6 +567,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_codex_review(form)
         if path == "/packet-status":
             return self._post_packet_status(form)
+        if path == "/codex-review-request":
+            return self._post_codex_review_request(form)
         if path == "/decide":
             return self._post_decide(form)
         if path == "/export":
@@ -727,7 +765,40 @@ class Handler(BaseHTTPRequestHandler):
             return self._page_orchestrator(notice=_alert("err", "gh error: %s" % ex))
         marker = res.get("marker")
         notice = _alert("ok" if marker == "ORCHESTRATION_PLAN" else "info", "marker: %s" % marker)
-        self._page_orchestrator(notice=notice, result=_render_orchestration(res))
+        self._page_orchestrator(notice=notice,
+                                result=_render_orchestration(res, self.server.allow_writes))
+
+    def _forbidden_writes(self) -> None:
+        self._send_html(_render("message.html", title="Forbidden",
+                                heading="403 — GitHub writes disabled",
+                                body="<p>GitHub-write controls are off. Restart the dashboard with "
+                                     "<code>--allow-github-writes</code> on a localhost bind to enable the "
+                                     "single <code>@codex review</code> post.</p>"), code=403)
+
+    def _post_codex_review_request(self, form):
+        # GATE: writes must be enabled at startup (--allow-github-writes + localhost bind). The Host check
+        # and same-origin CSRF check already ran for this POST. Nothing posts unless allow_writes is True.
+        if not getattr(self.server, "allow_writes", False):
+            return self._forbidden_writes()
+        repo = form.get("repo", "")
+        try:
+            res = service.request_codex_review(repo, form.get("pr_number", ""),
+                                               form.get("expected_head_sha", ""),
+                                               form.get("confirmation", ""))
+        except ValueError as ex:
+            return self._write_result_page(_alert("err", "Post refused: %s" % ex))
+        except GhError as ex:
+            return self._write_result_page(_alert("err", "gh error: %s" % ex))
+        if res.get("ok"):
+            notice = _alert("ok", "Posted @codex review to #%s (head %s)."
+                            % (res.get("pr_number"), str(res.get("head_sha"))[:8]))
+        else:
+            notice = _alert("err", "Post failed: %s" % res.get("error"))
+        self._write_result_page(notice)
+
+    def _write_result_page(self, notice):
+        self._send_html(_render("message.html", title="Codex review request", heading="GitHub write",
+                                body=notice + "<p><a href='/orchestrator'>&larr; back to Review Queue</a></p>"))
 
     def _page_gpt_review(self, notice: str = "", result: str = "", repo: str = "", pr: str = "",
                          focus: str = "general", diff_budget: str = "compact",
@@ -799,9 +870,12 @@ def _allowed_hosts(host: str) -> set:
     return set(_LOCALHOST_NAMES) | {host.strip().lower()}
 
 
-def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> DashboardServer:
-    """Build (but do not serve) the dashboard server bound to ``host:port``. Caller serves it."""
-    httpd = DashboardServer((host, port), Handler, _allowed_hosts(host))
+def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
+               allow_writes: bool = False) -> DashboardServer:
+    """Build (but do not serve) the dashboard server bound to ``host:port``. Caller serves it.
+    ``allow_writes`` enables the single opt-in GitHub-write control (post @codex review) — callers must
+    pass it True ONLY for a localhost bind (main() enforces this)."""
+    httpd = DashboardServer((host, port), Handler, _allowed_hosts(host), allow_writes=allow_writes)
     return httpd
 
 
@@ -832,16 +906,27 @@ def main(argv=None) -> int:
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="bind port (default 8765)")
     p.add_argument("--open", action="store_true",
                    help="after starting, open the dashboard URL in your browser (localhost binds only)")
+    p.add_argument("--allow-github-writes", action="store_true",
+                   help="opt-in: enable the ONE real GitHub-write control (post '@codex review' from the "
+                        "Review Queue, with typed confirmation). Localhost binds ONLY; off by default")
     args = p.parse_args(argv)
     is_local = args.host.strip().lower() in _LOCALHOST_NAMES
     if not is_local:
         sys.stderr.write(
             "[dashboard] WARNING: binding %s is NOT localhost. This dashboard is a local dev tool "
             "with no authentication — do not expose it on an untrusted network.\n" % args.host)
-    httpd = run_server(args.host, args.port)
+    # the ONE opt-in write capability is enabled ONLY with the flag AND a localhost bind.
+    allow_writes = bool(args.allow_github_writes) and is_local
+    if args.allow_github_writes and not is_local:
+        sys.stderr.write(
+            "[dashboard] REFUSED: --allow-github-writes requires a localhost bind; GitHub-write controls "
+            "are DISABLED for %s.\n" % args.host)
+    httpd = run_server(args.host, args.port, allow_writes=allow_writes)
     host_disp = "[%s]" % args.host if ":" in args.host else args.host    # bracket an IPv6 literal for the URI
     url = "http://%s:%d" % (host_disp, httpd.server_address[1])          # ACTUAL bound port (handles --port 0)
-    print("[dashboard] serving on %s  (Ctrl-C to stop; localhost-only, dry-run/read-only)" % url)
+    print("[dashboard] serving on %s  (Ctrl-C to stop; localhost-only; %s)"
+          % (url, "GitHub writes ENABLED (post @codex review only)" if allow_writes
+             else "read-only / dry-run"))
     if args.open:
         # convenience only, stdlib webbrowser (no shell). NEVER auto-open a non-localhost bind.
         if is_local:

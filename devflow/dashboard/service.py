@@ -41,6 +41,8 @@ from devflow.tools.fallback_review_prompt import (
 )
 from devflow.tools.codex_review_prompt import build_codex_review_prompt
 from devflow.tools import packet_store
+from devflow.tools import dashboard_writes
+from devflow.tools.dashboard_writes import confirmation_text  # noqa: F401 (re-exported for the app layer)
 
 # First-line markers cmd_watch_codex_reviews can emit (read-only watcher).
 WATCH_MARKERS = ("ACTIONABLE_CODEX_REVIEWS", "CODEX_WATCH_INCOMPLETE",
@@ -372,3 +374,15 @@ def set_packet_status(slug, status, base_dir=None) -> dict:
     """Update ONLY the local handoff-status.json for a packet. Raises ValueError on bad slug/status or a
     non-existent packet. No GitHub write."""
     return packet_store.write_status(base_dir or _cli.PACKETS_DIR, slug, status)
+
+
+# ----------------------------------------------------------------------------------------
+# The ONE real GitHub write the dashboard can do: post the fixed "@codex review" (gated by the app on
+# --allow-github-writes + localhost). Delegates to the narrow guarded helper; no generic comment API.
+# ----------------------------------------------------------------------------------------
+def request_codex_review(repo, pr_number, expected_head_sha, confirmation, *, audit_dir=None) -> dict:
+    """Post EXACTLY '@codex review' to a PR. The APP gates this on --allow-github-writes + localhost
+    BEFORE calling here; this only validates the confirmation/head and delegates to the guarded writer.
+    Returns the helper result; raises ValueError on a gate failure, GhError on a gh failure."""
+    return dashboard_writes.post_codex_review_request(
+        repo, pr_number, expected_head_sha, confirmation, live=True, audit_dir=audit_dir)

@@ -39,6 +39,7 @@ import devflow.tools.codex_review_prompt as codexprompt
 import devflow.tools.review_prompt_policy as policy
 import devflow.dashboard.app as app
 import devflow.dashboard.service as service
+import devflow.tools.dashboard_writes as dw
 
 _CODEX = "chatgpt-codex-connector[bot]"
 
@@ -737,8 +738,9 @@ class CodexPromptHelperTests(unittest.TestCase):
 
 
 class NoShellExecutionTests(unittest.TestCase):
-    # the dashboard layer + the read-only prompt helpers + the shared policy
-    _FILES = (app.__file__, service.__file__, fbprompt.__file__, codexprompt.__file__, policy.__file__)
+    # the dashboard layer + the read-only prompt helpers + the shared policy + the one write helper
+    _FILES = (app.__file__, service.__file__, fbprompt.__file__, codexprompt.__file__, policy.__file__,
+              dw.__file__)
 
     def test_no_shell_execution(self):
         for path in self._FILES:
@@ -766,8 +768,40 @@ class NoShellExecutionTests(unittest.TestCase):
         import inspect
         src = inspect.getsource(app.Handler.do_POST)
         for route in ('"/new"', '"/manual"', '"/watcher"', '"/orchestrator"', '"/gpt-review"',
-                      '"/codex-review-prompt"', '"/decide"', '"/export"'):
+                      '"/codex-review-prompt"', '"/decide"', '"/export"', '"/codex-review-request"'):
             self.assertIn(route, src)
+
+    def test_no_destructive_github_write_routes_or_buttons(self):
+        # the ONLY real GitHub write is the fixed '@codex review' post. The dashboard layer must not
+        # contain any other gh write-verb shape or GitHub Actions trigger. (Tokens are chosen to match
+        # real invocations, not the safety-disclaimer PROSE that legitimately mentions these words.)
+        src = ""
+        for path in (app.__file__, service.__file__, dw.__file__):
+            with open(path, encoding="utf-8") as f:
+                src += f.read().lower()
+        for forbidden in ("gh pr merge", "gh pr ready", "gh pr edit", "gh pr close", "delete-branch",
+                          "--force", "force-with-lease", "gh workflow", "actions/workflows",
+                          ".github/workflows"):
+            self.assertNotIn(forbidden, src,
+                             "dashboard layer must not contain destructive write %r" % forbidden)
+
+    def test_post_handler_has_no_destructive_route_literals(self):
+        # the do_POST dispatcher must not route any destructive endpoint
+        import inspect
+        src = inspect.getsource(app.Handler.do_POST)
+        for route in ('"/merge"', '"/mark-ready"', '"/retarget"', '"/request-review"', '"/close"',
+                      '"/delete-branch"', '"/push"'):
+            self.assertNotIn(route, src,
+                             "do_POST must not route destructive endpoint %s" % route)
+
+    def test_codex_body_is_a_constant_not_a_parameter(self):
+        # no generic comment API: the body is a module constant, never a function argument
+        import inspect
+        self.assertEqual(dw.CODEX_REVIEW_BODY, "@codex review")
+        params = inspect.signature(dw.post_codex_review_request).parameters
+        self.assertNotIn("body", params)
+        self.assertNotIn("message", params)
+        self.assertNotIn("comment", params)
 
 
 class PayloadRenderTests(unittest.TestCase):
@@ -952,6 +986,14 @@ class HttpIntegrationTests(DashboardBase):
         body = resp.read().decode("utf-8")
         self.assertEqual(resp.status, 200)
         self.assertIn("DevFlow Dashboard", body)
+
+    def test_codex_review_post_forbidden_when_writes_disabled(self):
+        # this server was started read-only (default) — the write route must 403 even with valid fields
+        resp = self._post("/codex-review-request",
+                          {"repo": "owner/repo", "pr_number": "5", "expected_head_sha": "abc1234",
+                           "confirmation": "POST @codex review to #5"})
+        resp.read()
+        self.assertEqual(resp.status, 403)
 
     def test_bad_host_header_rejected(self):
         c = self._conn()
@@ -1677,6 +1719,255 @@ class PacketStoreTests(unittest.TestCase):
                           "from anthropic", "os.getenv", "os.environ", "ReadOnlyGitHub", "import requests",
                           "urllib.request", "gh pr merge"):
             self.assertNotIn(forbidden, src)
+
+
+class _CannedOrchestration:
+    """A minimal valid orchestration result with one request_review PR (#5) at a known head."""
+    @staticmethod
+    def make():
+        return {
+            "marker": "ORCHESTRATION_PLAN", "repo": "owner/repo", "default_branch": "main",
+            "state_path": "/tmp/state.json", "rate_limited": False, "errors": [],
+            "open_prs": [{"number": 5, "title": "feat: thing", "branch": "feat/x",
+                          "head": "abc1234def5678", "base_ref": "main"}],
+            "plan": {"ranking": [], "request_review": [5], "findings_to_fix": [], "mergeable_now": [],
+                     "force_mergeable": [], "ready_then_merge": [], "needs_conflict": [],
+                     "needs_retarget": [], "retarget_to": {}, "mergeable_unknown": [], "in_flight": [],
+                     "rate_limited": False},
+        }
+
+
+class OrchestratorWriteRenderTests(unittest.TestCase):
+    def test_no_write_form_when_writes_disabled(self):
+        html = app._render_orchestration(_CannedOrchestration.make(), False)
+        self.assertNotIn("codex-review-request", html)        # no write form/route
+        self.assertNotIn("POST @codex review to #5", html)    # no confirmation phrase
+        self.assertNotIn("<form", html)                       # the read-only plan has no forms at all
+
+    def test_write_form_when_enabled_pins_head_and_requires_typed_confirmation(self):
+        html = app._render_orchestration(_CannedOrchestration.make(), True)
+        self.assertIn("action='/codex-review-request'", html)
+        self.assertIn("name='pr_number' value='5'", html)
+        self.assertIn("abc1234def5678", html)                 # head SHA pinned in a hidden field
+        self.assertIn("name='expected_head_sha'", html)
+        self.assertIn("POST @codex review to #5", html)       # exact confirmation phrase shown
+        self.assertIn("name='confirmation'", html)
+        # the form advertises the EXACT fixed body and disclaims all other actions
+        self.assertIn("@codex review", html)
+        self.assertIn("does <strong>not</strong> merge", html)
+
+    def test_enabled_banner_only_when_writes_on(self):
+        self.assertIn("GitHub writes ENABLED", app._render_orchestration(_CannedOrchestration.make(), True))
+        self.assertNotIn("GitHub writes ENABLED", app._render_orchestration(_CannedOrchestration.make(), False))
+
+    def test_no_request_review_prs_renders_no_form_even_when_enabled(self):
+        res = _CannedOrchestration.make()
+        res["plan"]["request_review"] = []
+        html = app._render_orchestration(res, True)
+        self.assertNotIn("action='/codex-review-request'", html)
+        self.assertIn("no request_review PRs", html)
+
+
+class CodexWriteFlagTests(unittest.TestCase):
+    """`--allow-github-writes` enables the write path ONLY on a localhost bind."""
+
+    def _main(self, argv, bound_host="127.0.0.1"):
+        fake = mock.Mock()
+        fake.serve_forever.side_effect = KeyboardInterrupt
+        fake.server_address = (bound_host, 8765)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(app, "run_server", return_value=fake) as rs, \
+             mock.patch("sys.stderr", err), contextlib.redirect_stdout(out):
+            rc = app.main(argv)
+        return rc, rs, out.getvalue(), err.getvalue()
+
+    def test_default_is_read_only_no_writes(self):
+        rc, rs, out, _ = self._main(["--host", "127.0.0.1", "--port", "8765"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(rs.call_args.kwargs.get("allow_writes"))
+        self.assertNotIn("writes ENABLED", out)
+
+    def test_flag_on_localhost_enables_writes(self):
+        rc, rs, out, _ = self._main(["--host", "127.0.0.1", "--port", "8765", "--allow-github-writes"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(rs.call_args.kwargs.get("allow_writes"))
+        self.assertIn("writes ENABLED", out)
+
+    def test_flag_on_localhost_name_enables_writes(self):
+        rc, rs, _, _ = self._main(["--host", "localhost", "--port", "8765", "--allow-github-writes"],
+                                  bound_host="localhost")
+        self.assertTrue(rs.call_args.kwargs.get("allow_writes"))
+
+    def test_flag_on_non_localhost_refuses_writes(self):
+        rc, rs, out, err = self._main(["--host", "0.0.0.0", "--port", "8765", "--allow-github-writes"],
+                                      bound_host="0.0.0.0")
+        self.assertEqual(rc, 0)
+        self.assertFalse(rs.call_args.kwargs.get("allow_writes"))   # writes NOT enabled off-loopback
+        self.assertIn("REFUSED", err)
+
+
+class CodexWriteHelperTests(unittest.TestCase):
+    """The narrow `post_codex_review_request` helper: gating, the fixed body, audit + state effects."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="dw_")
+        self.audit = os.path.join(self.tmp, "actions")
+        self.state = os.path.join(self.tmp, "orch_state.json")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _fakes(self, head="abc1234", state="OPEN", post_ok=True):
+        ro = mock.Mock()
+        ro_inst = mock.Mock()
+        ro_inst.get_pr_meta.return_value = {"number": 5, "head_oid": head, "state": state}
+        ro.return_value = ro_inst
+        calls = []
+
+        class _Writer:
+            def __init__(self, repo, live=False, logger=None):
+                self.repo, self.live = repo, live
+
+            def comment_on_pr(self, n, body):
+                calls.append((n, body, self.live))
+                return {"executed": True} if post_ok else {"executed": False, "error": "boom"}
+
+        return ro, _Writer, calls
+
+    def _call(self, ro, writer, **over):
+        kw = dict(repo="owner/repo", pr_number=5, expected_head_sha="abc1234",
+                  confirmation="POST @codex review to #5", live=True,
+                  audit_dir=self.audit, state_file=self.state)
+        kw.update(over)
+        with mock.patch.object(dw, "ReadOnlyGitHub", ro), mock.patch.object(dw, "GitHubWriter", writer):
+            return dw.post_codex_review_request(**kw)
+
+    def _audit_lines(self):
+        p = os.path.join(self.audit, dw.AUDIT_FILE)
+        if not os.path.exists(p):
+            return []
+        with open(p, encoding="utf-8") as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def test_posts_exactly_codex_review_on_success(self):
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer)
+        self.assertTrue(res["ok"])
+        self.assertEqual(calls, [(5, "@codex review", True)])     # exact fixed body, real (live) write
+
+    def test_success_writes_one_audit_line_and_stamps_requested_head(self):
+        ro, writer, _ = self._fakes(head="abc1234")
+        self._call(ro, writer)
+        lines = self._audit_lines()
+        self.assertEqual(len(lines), 1)
+        rec = lines[0]
+        self.assertEqual(rec["action"], "post_codex_review")
+        self.assertEqual(rec["body"], "@codex review")
+        self.assertEqual(rec["result"], "success")
+        self.assertEqual(rec["actor"], "dashboard")
+        self.assertEqual(rec["pr_number"], 5)
+        self.assertEqual(rec["head_sha"], "abc1234")
+        with open(self.state, encoding="utf-8") as f:
+            st = json.load(f)
+        self.assertEqual(st["requested_head"]["5"], "abc1234")    # orchestrator state updated on success
+
+    def test_rejects_wrong_confirmation_and_posts_nothing(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError):
+            self._call(ro, writer, confirmation="post @codex review to #5")   # wrong case
+        self.assertEqual(calls, [])
+        self.assertEqual(self._audit_lines(), [])
+        self.assertFalse(os.path.exists(self.state))
+
+    def test_rejects_missing_confirmation(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError):
+            self._call(ro, writer, confirmation="")
+        self.assertEqual(calls, [])
+
+    def test_rejects_missing_expected_head(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError):
+            self._call(ro, writer, expected_head_sha="")
+        self.assertEqual(calls, [])
+
+    def test_rejects_head_mismatch_and_posts_nothing(self):
+        ro, writer, calls = self._fakes(head="zzz9999")          # current head != expected abc1234
+        with self.assertRaises(ValueError):
+            self._call(ro, writer)
+        self.assertEqual(calls, [])                              # never posts against a stale plan
+        self.assertEqual(self._audit_lines(), [])
+
+    def test_rejects_non_open_pr(self):
+        ro, writer, calls = self._fakes(state="MERGED")
+        with self.assertRaises(ValueError):
+            self._call(ro, writer)
+        self.assertEqual(calls, [])
+
+    def test_rejects_bad_pr_number(self):
+        ro, writer, _ = self._fakes()
+        for bad in ("0", "-3", "abc", ""):
+            with self.assertRaises(ValueError):
+                self._call(ro, writer, pr_number=bad, confirmation="POST @codex review to #%s" % bad)
+
+    def test_failed_post_records_failure_and_does_not_stamp_state(self):
+        ro, writer, calls = self._fakes(post_ok=False)
+        res = self._call(ro, writer)
+        self.assertFalse(res["ok"])
+        self.assertEqual(calls, [(5, "@codex review", True)])    # attempted, with the fixed body
+        lines = self._audit_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["result"], "failure")          # failure IS audited
+        self.assertFalse(os.path.exists(self.state))             # but requested_head is NOT stamped
+
+    def test_dry_run_uses_live_false_writer(self):
+        ro, writer, calls = self._fakes()
+        self._call(ro, writer, live=False)
+        self.assertEqual(calls, [(5, "@codex review", False)])   # live flag threaded through
+
+
+class WritesEnabledHttpTests(DashboardBase):
+    """End-to-end POST /codex-review-request against a server started WITH writes enabled."""
+
+    def setUp(self):
+        super().setUp()
+        self.httpd = app.run_server("127.0.0.1", 0, allow_writes=True)
+        self.assertTrue(self.httpd.allow_writes)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def _post(self, fields):
+        body = urllib.parse.urlencode(fields).encode()
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        self.addCleanup(c.close)
+        c.request("POST", "/codex-review-request", body=body,
+                  headers={"Content-Type": "application/x-www-form-urlencoded"})
+        return c.getresponse()
+
+    def test_success_path_reports_posted(self):
+        with mock.patch.object(service, "request_codex_review",
+                               return_value={"ok": True, "pr_number": 5, "head_sha": "abc1234"}) as m:
+            r = self._post({"repo": "owner/repo", "pr_number": "5",
+                            "expected_head_sha": "abc1234", "confirmation": "POST @codex review to #5"})
+            html = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Posted @codex review to #5", html)
+        m.assert_called_once()
+        # the handler forwards exactly the operator-supplied fields; body is NOT a parameter it controls
+        _, kwargs = m.call_args
+        args = m.call_args[0]
+        self.assertEqual(args[0], "owner/repo")
+
+    def test_refusal_is_shown_not_raised(self):
+        with mock.patch.object(service, "request_codex_review",
+                               side_effect=ValueError("confirmation does not match")):
+            r = self._post({"repo": "owner/repo", "pr_number": "5",
+                            "expected_head_sha": "abc1234", "confirmation": "nope"})
+            html = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Post refused", html)
+        self.assertIn("confirmation does not match", html)
 
 
 if __name__ == "__main__":
