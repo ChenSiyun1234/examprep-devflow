@@ -1,9 +1,5 @@
-<h1>Review Queue <span class="muted">(read-only orchestrator)</span></h1>
-<p class="muted">Shows the same cross-PR plan as <code>orchestrate-reviews</code>: who to request
-review from, findings to fix, mergeable / force-mergeable / ready-then-merge PRs, conflicts and
-retargets, and Codex rate-limit state. <strong>Advisory only</strong> — it recommends next actions and
-never mutates GitHub (no comments, reviewer requests, merges, mark-ready, retargets, pushes, or branch
-deletes), and it does not replace human approval. This is not a merge UI.</p>
+<h1>Review Queue <span class="muted">$mode_tag</span></h1>
+<p class="muted">$intro</p>
 $notice
 $result
 <form method="post" action="/orchestrator" class="card">
@@ -15,12 +11,10 @@ $result
 
   <div class="checkbox">
     <input type="checkbox" id="dryrun" checked disabled>
-    <label for="dryrun" style="margin:0;font-weight:400;">dry-run planning (always on — local tracking
-    state is never persisted from the dashboard, since it does not actually request reviews)</label>
+    <label for="dryrun" style="margin:0;font-weight:400;">dry-run planning (always on — computing the
+    plan is read-only: it never persists tracking state and never touches GitHub)</label>
   </div>
-  <p class="note">Read-only. Requires <code>gh</code> installed and authenticated. For each
-  <em>request review</em> PR you get copyable <code>@codex review</code> text — the dashboard never
-  posts it. For mergeable PRs it shows a human merge-preflight note, not a merge button.</p>
+  <p class="note">$form_note</p>
 
   <p><button type="submit">Compute plan</button></p>
 </form>

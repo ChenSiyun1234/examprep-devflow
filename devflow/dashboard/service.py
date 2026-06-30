@@ -41,6 +41,8 @@ from devflow.tools.fallback_review_prompt import (
 )
 from devflow.tools.codex_review_prompt import build_codex_review_prompt
 from devflow.tools import packet_store
+from devflow.tools import dashboard_writes
+from devflow.tools.dashboard_writes import confirmation_text  # noqa: F401 (re-exported for the app layer)
 
 # First-line markers cmd_watch_codex_reviews can emit (read-only watcher).
 WATCH_MARKERS = ("ACTIONABLE_CODEX_REVIEWS", "CODEX_WATCH_INCOMPLETE",
@@ -372,3 +374,31 @@ def set_packet_status(slug, status, base_dir=None) -> dict:
     """Update ONLY the local handoff-status.json for a packet. Raises ValueError on bad slug/status or a
     non-existent packet. No GitHub write."""
     return packet_store.write_status(base_dir or _cli.PACKETS_DIR, slug, status)
+
+
+# ----------------------------------------------------------------------------------------
+# The ONE real GitHub write the dashboard can do: post the fixed "@codex review" (gated by the app on
+# --allow-github-writes + localhost). Delegates to the narrow guarded helper; no generic comment API.
+# ----------------------------------------------------------------------------------------
+def _current_request_review_candidates(repo, limit=None) -> list:
+    """Recompute (READ-ONLY) the PR numbers the orchestrator CURRENTLY recommends requesting review for.
+    The dashboard write may only target one of these (least authority), so a stale form can't post to an
+    arbitrary OPEN PR. ``limit`` MUST be the same window the Review Queue page was rendered with, so a PR
+    shown only because the operator widened the limit beyond the default 50 is still recognized as a
+    candidate (run_orchestrator clamps/falls back on a bad value). Reuses the same persist_state=False
+    planner the Review Queue renders."""
+    result = run_orchestrator(repo, limit=limit if limit is not None else ORCH_LIMIT_DEFAULT)
+    return list((result.get("plan") or {}).get("request_review") or [])
+
+
+def request_codex_review(repo, pr_number, expected_head_sha, confirmation, *,
+                         limit=None, audit_dir=None) -> dict:
+    """Post EXACTLY '@codex review' to a PR. The APP gates this on --allow-github-writes + localhost
+    BEFORE calling here; this recomputes the CURRENT request_review candidate set server-side (using the
+    SAME ``limit`` the page was rendered with, so a stale/tampered form can only target a PR still
+    recommended for review) and delegates the confirmation / head / OPEN / fixed-body gating to the
+    guarded writer. Returns the helper result; raises ValueError on a gate failure, GhError on gh."""
+    candidates = _current_request_review_candidates(repo, limit=limit)
+    return dashboard_writes.post_codex_review_request(
+        repo, pr_number, expected_head_sha, confirmation,
+        live=True, candidates=candidates, audit_dir=audit_dir)
