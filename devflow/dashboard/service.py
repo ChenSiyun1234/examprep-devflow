@@ -380,9 +380,21 @@ def set_packet_status(slug, status, base_dir=None) -> dict:
 # The ONE real GitHub write the dashboard can do: post the fixed "@codex review" (gated by the app on
 # --allow-github-writes + localhost). Delegates to the narrow guarded helper; no generic comment API.
 # ----------------------------------------------------------------------------------------
+def _current_request_review_candidates(repo) -> list:
+    """Recompute (READ-ONLY) the PR numbers the orchestrator CURRENTLY recommends requesting review for.
+    The dashboard write may only target one of these (least authority), so a stale form can't post to an
+    arbitrary OPEN PR. Reuses the same persist_state=False planner the Review Queue renders."""
+    result = run_orchestrator(repo)                     # read-only; never persists; GhError propagates
+    return list((result.get("plan") or {}).get("request_review") or [])
+
+
 def request_codex_review(repo, pr_number, expected_head_sha, confirmation, *, audit_dir=None) -> dict:
     """Post EXACTLY '@codex review' to a PR. The APP gates this on --allow-github-writes + localhost
-    BEFORE calling here; this only validates the confirmation/head and delegates to the guarded writer.
-    Returns the helper result; raises ValueError on a gate failure, GhError on a gh failure."""
+    BEFORE calling here; this recomputes the CURRENT request_review candidate set server-side (so a
+    stale/tampered form can only target a PR still recommended for review) and delegates the confirmation
+    / head / OPEN / fixed-body gating to the guarded writer. Returns the helper result; raises ValueError
+    on a gate failure, GhError on a gh failure."""
+    candidates = _current_request_review_candidates(repo)
     return dashboard_writes.post_codex_review_request(
-        repo, pr_number, expected_head_sha, confirmation, live=True, audit_dir=audit_dir)
+        repo, pr_number, expected_head_sha, confirmation,
+        live=True, candidates=candidates, audit_dir=audit_dir)

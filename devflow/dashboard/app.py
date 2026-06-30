@@ -667,7 +667,35 @@ class Handler(BaseHTTPRequestHandler):
         self._send_html(_render("watcher.html", title="Codex watcher", notice=notice, result=result))
 
     def _page_orchestrator(self, notice: str = "", result: str = ""):
-        self._send_html(_render("orchestrator.html", title="Review Queue", notice=notice, result=result))
+        # mode-aware copy: the page's own header/intro/note must NOT claim "read-only / never posts" when
+        # the opt-in @codex review write button is live, or an operator could think the button is dry-run.
+        if getattr(self.server, "allow_writes", False):
+            mode_tag = "(writes ENABLED — can post @codex review)"
+            intro = ("Shows the same cross-PR plan as <code>orchestrate-reviews</code>. The plan is "
+                     "advisory with <strong>one exception</strong>: GitHub writes are <strong>enabled</strong> "
+                     "for this localhost session, so each <em>request review</em> PR below has a "
+                     "<strong>Post @codex review</strong> button that posts a REAL comment whose body is "
+                     "exactly <code>@codex review</code> (typed confirmation + head-match required). It "
+                     "still never merges, marks ready, retargets, requests reviewers, closes, pushes, or "
+                     "deletes branches. This is not a merge UI.")
+            form_note = ("Requires <code>gh</code> installed and authenticated. Computing the plan is "
+                         "read-only. For each <em>request review</em> PR you can post a REAL "
+                         "<code>@codex review</code> (typed confirmation required); for mergeable PRs it "
+                         "shows a human merge-preflight note, not a merge button.")
+        else:
+            mode_tag = "(read-only orchestrator)"
+            intro = ("Shows the same cross-PR plan as <code>orchestrate-reviews</code>: who to request "
+                     "review from, findings to fix, mergeable / force-mergeable / ready-then-merge PRs, "
+                     "conflicts and retargets, and Codex rate-limit state. <strong>Advisory only</strong> "
+                     "— it recommends next actions and never mutates GitHub (no comments, reviewer "
+                     "requests, merges, mark-ready, retargets, pushes, or branch deletes), and it does "
+                     "not replace human approval. This is not a merge UI.")
+            form_note = ("Read-only. Requires <code>gh</code> installed and authenticated. For each "
+                         "<em>request review</em> PR you get copyable <code>@codex review</code> text — "
+                         "the dashboard never posts it. For mergeable PRs it shows a human merge-preflight "
+                         "note, not a merge button.")
+        self._send_html(_render("orchestrator.html", title="Review Queue", notice=notice, result=result,
+                                mode_tag=mode_tag, intro=intro, form_note=form_note))
 
     # -- POST handlers ---------------------------------------------------------
     def _post_new_run(self, form):

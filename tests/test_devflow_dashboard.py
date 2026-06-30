@@ -995,6 +995,16 @@ class HttpIntegrationTests(DashboardBase):
         resp.read()
         self.assertEqual(resp.status, 403)
 
+    def test_orchestrator_page_copy_is_read_only_by_default(self):
+        c = self._conn()
+        c.request("GET", "/orchestrator")
+        resp = c.getresponse()
+        body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("read-only orchestrator", body)
+        self.assertIn("never mutates GitHub", body)
+        self.assertNotIn("writes ENABLED", body)                 # default page makes no write claims
+
     def test_bad_host_header_rejected(self):
         c = self._conn()
         c.putrequest("GET", "/", skip_host=True)
@@ -1874,7 +1884,11 @@ class CodexWriteHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._call(ro, writer, confirmation="post @codex review to #5")   # wrong case
         self.assertEqual(calls, [])
-        self.assertEqual(self._audit_lines(), [])
+        # the refusal IS audited (one refused line), but nothing is posted and no state is stamped
+        lines = self._audit_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["result"], "refused")
+        self.assertIn("confirmation does not match", lines[0]["reason"])
         self.assertFalse(os.path.exists(self.state))
 
     def test_rejects_missing_confirmation(self):
@@ -1894,7 +1908,10 @@ class CodexWriteHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._call(ro, writer)
         self.assertEqual(calls, [])                              # never posts against a stale plan
-        self.assertEqual(self._audit_lines(), [])
+        lines = self._audit_lines()                             # refusal audited as 'refused'
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["result"], "refused")
+        self.assertIn("head changed", lines[0]["reason"])
 
     def test_rejects_non_open_pr(self):
         ro, writer, calls = self._fakes(state="MERGED")
@@ -1922,6 +1939,80 @@ class CodexWriteHelperTests(unittest.TestCase):
         ro, writer, calls = self._fakes()
         self._call(ro, writer, live=False)
         self.assertEqual(calls, [(5, "@codex review", False)])   # live flag threaded through
+
+    # --- Codex #15 review fixes ---------------------------------------------------------------
+    def test_candidates_gate_refuses_non_member(self):
+        # least authority: a PR not in the CURRENT request_review set is refused (audited), nothing posted
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError) as cm:
+            self._call(ro, writer, candidates=[7, 8])            # #5 not a candidate
+        self.assertIn("not a current request_review candidate", str(cm.exception))
+        self.assertEqual(calls, [])
+        lines = self._audit_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["result"], "refused")
+
+    def test_candidates_gate_allows_member(self):
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer, candidates=[3, 5, 9])       # #5 IS a candidate
+        self.assertTrue(res["ok"])
+        self.assertEqual(calls, [(5, "@codex review", True)])
+
+    def test_candidates_none_skips_membership_gate(self):
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer, candidates=None)            # low-level use: gate not applied
+        self.assertTrue(res["ok"])
+
+    def test_audit_write_failure_does_not_mask_successful_post(self):
+        # if the audit log cannot be written (audit_dir is actually a FILE), _audit swallows the error and
+        # the already-posted comment is still reported ok + requested_head still stamped (no duplicate retry)
+        bogus = os.path.join(self.tmp, "audit_is_a_file")
+        with open(bogus, "w", encoding="utf-8") as f:
+            f.write("not a dir")
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer, audit_dir=bogus)            # makedirs(bogus) would raise -> swallowed
+        self.assertTrue(res["ok"])                               # success NOT masked by the audit failure
+        self.assertEqual(calls, [(5, "@codex review", True)])
+        with open(self.state, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["requested_head"]["5"], "abc1234")
+
+    def test_requested_head_update_preserves_other_prs(self):
+        # stamping #5 must MERGE into existing state, not clobber another PR's stamp (lost-bookkeeping
+        # regression behind the threaded-post race the lock guards)
+        import devflow.tools.review_orchestrator as orch
+        st0 = orch.load_state(self.state)
+        st0["requested_head"]["7"] = "oldhead7"
+        orch.save_state(st0, self.state)
+        ro, writer, _ = self._fakes(head="abc1234")
+        self._call(ro, writer)
+        with open(self.state, encoding="utf-8") as f:
+            rh = json.load(f)["requested_head"]
+        self.assertEqual(rh["5"], "abc1234")                     # new stamp present
+        self.assertEqual(rh["7"], "oldhead7")                    # pre-existing stamp NOT clobbered
+
+
+class CodexReviewServiceCandidatesTests(unittest.TestCase):
+    """`service.request_codex_review` recomputes the CURRENT request_review candidates and passes them
+    to the guarded helper (least authority — a stale form can't target an arbitrary OPEN PR)."""
+
+    def test_passes_current_request_review_candidates_to_helper(self):
+        plan_result = {"plan": {"request_review": [5, 9]}}
+        with mock.patch.object(service, "run_orchestrator", return_value=plan_result) as ro, \
+             mock.patch.object(service.dashboard_writes, "post_codex_review_request",
+                               return_value={"ok": True, "pr_number": 5, "head_sha": "abc"}) as post:
+            service.request_codex_review("o/r", "5", "abc", "POST @codex review to #5")
+        ro.assert_called_once_with("o/r")                         # recomputed read-only, server-side
+        _, kwargs = post.call_args
+        self.assertEqual(list(kwargs["candidates"]), [5, 9])      # current candidate set threaded through
+        self.assertTrue(kwargs["live"])
+
+    def test_empty_request_review_plan_yields_empty_candidates(self):
+        # rate-limited / nothing-to-request -> candidates [] -> the helper will refuse any PR (fail-closed)
+        with mock.patch.object(service, "run_orchestrator", return_value={"plan": {"request_review": []}}), \
+             mock.patch.object(service.dashboard_writes, "post_codex_review_request",
+                               return_value={"ok": True}) as post:
+            service.request_codex_review("o/r", "5", "abc", "POST @codex review to #5")
+        self.assertEqual(list(post.call_args[1]["candidates"]), [])
 
 
 class WritesEnabledHttpTests(DashboardBase):
@@ -1968,6 +2059,19 @@ class WritesEnabledHttpTests(DashboardBase):
         self.assertEqual(r.status, 200)
         self.assertIn("Post refused", html)
         self.assertIn("confirmation does not match", html)
+
+    def test_orchestrator_page_copy_reflects_write_mode(self):
+        # the page's own header/intro must NOT keep claiming read-only/never-posts when writes are live
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        self.addCleanup(c.close)
+        c.request("GET", "/orchestrator")
+        r = c.getresponse()
+        body = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("writes ENABLED", body)
+        self.assertIn("Post @codex review", body)
+        self.assertNotIn("never mutates GitHub", body)            # no contradictory read-only claim
+        self.assertNotIn("the dashboard never posts it", body)
 
 
 if __name__ == "__main__":
