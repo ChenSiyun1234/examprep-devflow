@@ -279,11 +279,12 @@ class WatcherTests(DashboardBase):
         with self.assertRaises(ValueError):
             service.run_watcher("")
 
-    def test_watcher_serializes_global_stdout_capture(self):
-        # the process-global stdout swap must be guarded (ThreadingHTTPServer -> concurrent /watcher)
-        self.assertTrue(hasattr(service, "_WATCHER_LOCK"))
+    def test_stdout_producers_share_one_lock(self):
+        # ALL stdout producers (create_run/decide_gate AND the watcher) must hold the SAME lock, so a
+        # concurrent dry-run print can't bleed into the watcher's redirect_stdout buffer.
+        self.assertTrue(hasattr(service, "_STDOUT_LOCK"))
         entered = []
-        real = service._WATCHER_LOCK
+        real = service._STDOUT_LOCK
 
         class Tracking:
             def __enter__(s):
@@ -294,13 +295,14 @@ class WatcherTests(DashboardBase):
                 return real.__exit__(*a)
 
         seen = os.path.join(self.tmp, "seen.json")
-        with mock.patch.object(service, "_WATCHER_LOCK", Tracking()), \
+        with mock.patch.object(service, "_STDOUT_LOCK", Tracking()), \
              mock.patch.object(_cli, "check_gh_available",
                                return_value={"available": True, "authenticated": True}), \
              mock.patch.object(_cli, "ReadOnlyGitHub", side_effect=lambda repo: _FakeReadOnlyGitHub(repo)), \
-             mock.patch.object(_cli, "_codex_seen_path", return_value=seen):
+             mock.patch.object(_cli, "_codex_seen_path", return_value=seen), _quiet():
+            service.create_run("lock-1", "docs-advisory", "owner/x", pause_at="advisory")
             service.run_watcher("owner/repo")
-        self.assertTrue(entered)             # the lock guarded the stdout capture
+        self.assertGreaterEqual(len(entered), 2)   # both create_run AND run_watcher took the shared lock
 
 
 class NoShellExecutionTests(unittest.TestCase):
@@ -390,6 +392,14 @@ class ServerTests(unittest.TestCase):
             rc = app.main(["--host", "0.0.0.0", "--port", "0"])
         self.assertEqual(rc, 0)
         self.assertIn("not localhost", err.getvalue().lower())
+
+    def test_main_brackets_ipv6_url(self):
+        fake = mock.Mock()
+        fake.serve_forever.side_effect = KeyboardInterrupt
+        out = io.StringIO()
+        with mock.patch.object(app, "run_server", return_value=fake), mock.patch("sys.stdout", out):
+            app.main(["--host", "::1", "--port", "0"])
+        self.assertIn("[::1]", out.getvalue())               # IPv6 literal bracketed in the printed URI
 
 
 class HttpIntegrationTests(DashboardBase):
@@ -543,6 +553,16 @@ class HttpIntegrationTests(DashboardBase):
         self.assertEqual(resp.getheader("X-Frame-Options"), "DENY")
         self.assertIn("frame-ancestors", resp.getheader("Content-Security-Policy") or "")
 
+    def test_export_offers_explicit_decision_buttons(self):
+        with _quiet():
+            service.create_run("exp-btn", "docs-advisory", "owner/x", pause_at="advisory")
+        c = self._conn()
+        c.request("GET", "/run/exp-btn")
+        resp = c.getresponse()
+        body = resp.read().decode("utf-8")
+        self.assertIn("Export approved packet", body)
+        self.assertIn("Export rejected packet", body)        # explicit decision, not a silent "approved"
+
     def test_real_github_run_is_export_only(self):
         with _quiet():
             service.create_run("rg-detail", "docs-advisory", "owner/x", pause_at="advisory")
@@ -556,7 +576,7 @@ class HttpIntegrationTests(DashboardBase):
         self.assertEqual(resp.status, 200)
         self.assertIn("real-github", body)
         self.assertNotIn("action='/decide'", body)            # no Approve/Reject form
-        self.assertIn("Export Implementation Packet", body)    # export still offered
+        self.assertIn("Export approved packet", body)          # export still offered
 
     def test_manual_packet_html_is_escaped(self):
         c = self._conn()

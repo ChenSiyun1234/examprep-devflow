@@ -41,8 +41,10 @@ WATCH_MARKERS = ("ACTIONABLE_CODEX_REVIEWS", "CODEX_WATCH_INCOMPLETE",
                  "CODEX_QUOTA_LIMITED", "NO_NEW_CODEX_REVIEWS")
 
 # run_watcher captures stdout by swapping the PROCESS-global sys.stdout; the dashboard's
-# ThreadingHTTPServer can dispatch two /watcher requests at once, so serialize that capture.
-_WATCHER_LOCK = threading.Lock()
+# ThreadingHTTPServer runs requests in threads, so a concurrent create_run/decide_gate (which the
+# dry-run nodes print from) would otherwise be captured into the watcher buffer. Serialize EVERY
+# stdout-producing service call on this one lock so the watcher only ever captures its own output.
+_STDOUT_LOCK = threading.Lock()
 
 # gate alias <-> full gate name, reused from the CLI so the dashboard can't drift from it.
 GATE_ALIASES = dict(_cli._GATE_ALIASES)            # {"advisory": "advisory_implementation", ...}
@@ -137,7 +139,8 @@ def create_run(thread_id: str, task_type: str = "docs-advisory", repo: str = "",
                       approvals=approvals, pause_at=pause_gate)
     state["real_github"] = False                      # belt-and-suspenders: dashboard never writes to GitHub
     app = build_graph(prefer_fallback=True)           # stdlib dry-run backend; never the LangGraph backend
-    final = app.invoke(state)
+    with _STDOUT_LOCK:                                 # dry-run nodes print -> guard vs the watcher's capture
+        final = app.invoke(state)
     _persist(thread_id, final)
     return final
 
@@ -180,7 +183,8 @@ def decide_gate(thread_id: str, gate: str, decision: str) -> dict:
         start = GATE_TO_NODE.get(paused_gate) or GATE_TO_NODE.get(full_gate)
     state["status"] = "running"
     app = build_graph(prefer_fallback=True)
-    final = app.invoke(state, start_node=start)
+    with _STDOUT_LOCK:                                 # dry-run nodes print -> guard vs the watcher's capture
+        final = app.invoke(state, start_node=start)
     _persist(thread_id, final)
     return final
 
@@ -262,7 +266,7 @@ def run_watcher(repo: str, init: bool = False, limit: int = 50) -> dict:
     ns = argparse.Namespace(repo=repo, limit=int(limit), seen_file=None, reset=False,
                             init=bool(init), json=False, body_chars=400, exit_actionable=False)
     buf = io.StringIO()
-    with _WATCHER_LOCK:                            # serialize the process-global stdout swap below
+    with _STDOUT_LOCK:                             # exclude ALL other stdout producers during the swap
         with contextlib.redirect_stdout(buf):
             rc = _cli.cmd_watch_codex_reviews(ns)
     output = buf.getvalue()

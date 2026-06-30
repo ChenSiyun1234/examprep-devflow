@@ -275,10 +275,13 @@ class Handler(BaseHTTPRequestHandler):
 
         if status == "paused" and gate_alias:
             payload = state.get("interrupt_payload") or {}
+            # explicit export decision — exporting "approved" must be a deliberate choice, not the
+            # default of a single button on an undecided gate.
             export_form = (
                 "<form method='post' action='/export' class='inline'>"
                 "<input type='hidden' name='thread_id' value='%s'>"
-                "<button name='decision' value='approved'>Export Implementation Packet</button>"
+                "<button name='decision' value='approved'>Export approved packet</button>"
+                "<button name='decision' value='rejected'>Export rejected packet</button>"
                 "</form>" % e(thread_id))
             if state.get("real_github"):
                 # a live (--real-github) checkpoint is read-only here — resuming it would clobber its
@@ -428,7 +431,8 @@ def main(argv=None) -> int:
             "[dashboard] WARNING: binding %s is NOT localhost. This dashboard is a local dev tool "
             "with no authentication — do not expose it on an untrusted network.\n" % args.host)
     httpd = run_server(args.host, args.port)
-    url = "http://%s:%d" % (args.host, args.port)
+    host_disp = "[%s]" % args.host if ":" in args.host else args.host    # bracket an IPv6 literal for the URI
+    url = "http://%s:%d" % (host_disp, args.port)
     print("[dashboard] serving on %s  (Ctrl-C to stop; localhost-only, dry-run/read-only)" % url)
     try:
         httpd.serve_forever()
