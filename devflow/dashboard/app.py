@@ -129,6 +129,13 @@ def _render_orchestration(result: dict) -> str:
         return ("<a href='/gpt-review?repo=%s&amp;pr=%s'>Build GPT fallback prompt</a>"
                 % (repo_q, urllib.parse.quote(str(n), safe="")))
 
+    def codex_link(n):
+        return ("<a href='/codex-review-prompt?repo=%s&amp;pr=%s'>Build guided Codex prompt</a>"
+                % (repo_q, urllib.parse.quote(str(n), safe="")))
+
+    def prompt_links(n):                      # navigation only — no GitHub write
+        return codex_link(n) + " · " + gpt_link(n)
+
     summary = (
         "<table class='kv'>"
         "<tr><th>marker</th><td><span class='marker'>%s</span></td></tr>"
@@ -161,8 +168,10 @@ def _render_orchestration(result: dict) -> str:
         ranking_html = "<p class='muted'>(no open PRs)</p>"
 
     rr = plan.get("request_review") or []
-    rr_html = (chips(rr, extra=gpt_link) + "<p class='muted'>Recommended — copy this onto each PR "
-               "yourself; the dashboard does <strong>not</strong> post it:</p><pre>@codex review</pre>") \
+    rr_html = (chips(rr, extra=prompt_links)
+               + "<p class='muted'>Preferred: <strong>build a guided Codex prompt</strong> (carries the "
+               "shared review policy) and paste it yourself. Minimal fallback — the bare trigger (the "
+               "dashboard does <strong>not</strong> post anything):</p><pre>@codex review</pre>") \
         if rr else "<p class='muted'>(none)</p>"
 
     rt_to = plan.get("retarget_to") or {}
@@ -190,7 +199,7 @@ def _render_orchestration(result: dict) -> str:
         + (card("Errors", errors_html) if errs else "")
         + card("Ranking", ranking_html)
         + card("Request review (priority-ordered, ≤3 in-flight)", rr_html)
-        + card("Findings to fix (P1/P2 or early P3)", chips(plan.get("findings_to_fix"), extra=gpt_link))
+        + card("Findings to fix (P1/P2 or early P3)", chips(plan.get("findings_to_fix"), extra=prompt_links))
         + card("Mergeable now (clean / converged)", mn_html)
         + card("Force-mergeable (≥3 rounds, only-minor P3)", chips(plan.get("force_mergeable")))
         + card("Ready then merge (un-draft first)", chips(plan.get("ready_then_merge")))
@@ -240,20 +249,56 @@ def _render_gpt_result(res: dict) -> str:
             "<tr><th>base &larr; head</th><td>%s &larr; %s</td></tr>"
             "<tr><th>head SHA</th><td><code>%s</code></td></tr>"
             "<tr><th>changed files</th><td>%s</td></tr>"
+            "<tr><th>review modes</th><td>%s</td></tr>"
             "<tr><th>diff chars</th><td>%s</td></tr>"
             "<tr><th>diff truncated</th><td>%s</td></tr>"
+            "<tr><th>feedback available</th><td>%s</td></tr>"
             "<tr><th>feedback truncated</th><td>%s</td></tr>"
             "<tr><th>description truncated</th><td>%s</td></tr>"
             "<tr><th>focus / budget</th><td>%s / %s</td></tr>"
             "</table></div>"
             % (e(res.get("repo")), e(res.get("pr_number")), url_html, e(res.get("title")),
                e(res.get("base")), e(res.get("head")), e(res.get("head_sha")),
-               e(len(res.get("changed_files") or [])), e(res.get("diff_chars")),
+               e(len(res.get("changed_files") or [])),
+               e(", ".join(res.get("review_modes") or []) or "—"), e(res.get("diff_chars")),
                ("yes" if res.get("diff_truncated") else "no"),
+               ("yes" if res.get("feedback_available", True) else "NO — read failed"),
                ("yes" if res.get("feedback_truncated") else "no"),
                ("yes" if res.get("body_truncated") else "no"),
                e(res.get("focus")), e(res.get("diff_budget"))))
     textarea = ("<div class='card'><h3>Prompt — copy &amp; paste into GPT/ChatGPT</h3>"
+                "<textarea readonly rows='24' onclick='this.select()'>%s</textarea></div>"
+                % e(res.get("prompt")))
+    return warn + meta + textarea
+
+
+def _render_codex_result(res: dict) -> str:
+    """Render the guided Codex prompt result: a copy/paste warning, the Codex-Cloud behavior caveat, a
+    copyable textarea (escaped), and a PR metadata card. The dashboard NEVER posts this."""
+    warn = _alert("info", "This page does NOT post to GitHub or call Codex — copy the prompt below and "
+                          "paste it into a GitHub PR comment yourself.")
+    warn += _alert("info", "Heads-up: on Codex Cloud a guided brief alongside <code>@codex review</code> "
+                           "can switch Codex into code-change mode instead of review. If you only want a "
+                           "review, the bare <code>@codex review</code> is the reliable trigger; use this "
+                           "guided prompt when you want the shared review policy applied.")
+    url = res.get("pr_url") or ""
+    url_html = ("<a href='%s'>%s</a>" % (e(url), e(url))) if str(url).startswith("http") else e(url) or "—"
+    meta = ("<div class='card'><h3>PR</h3><table class='kv'>"
+            "<tr><th>repo</th><td>%s</td></tr>"
+            "<tr><th>PR</th><td>#%s</td></tr>"
+            "<tr><th>url</th><td>%s</td></tr>"
+            "<tr><th>title</th><td>%s</td></tr>"
+            "<tr><th>base &larr; head</th><td>%s &larr; %s</td></tr>"
+            "<tr><th>changed files</th><td>%s</td></tr>"
+            "<tr><th>review modes</th><td>%s</td></tr>"
+            "<tr><th>diff chars</th><td>%s</td></tr>"
+            "<tr><th>diff truncated</th><td>%s</td></tr>"
+            "<tr><th>budget</th><td>%s</td></tr></table></div>"
+            % (e(res.get("repo")), e(res.get("pr_number")), url_html, e(res.get("title")),
+               e(res.get("base")), e(res.get("head")), e(len(res.get("changed_files") or [])),
+               e(", ".join(res.get("review_modes") or []) or "—"), e(res.get("diff_chars")),
+               ("yes" if res.get("diff_truncated") else "no"), e(res.get("diff_budget"))))
+    textarea = ("<div class='card'><h3>Guided Codex prompt — copy &amp; paste into a GitHub PR comment</h3>"
                 "<textarea readonly rows='24' onclick='this.select()'>%s</textarea></div>"
                 % e(res.get("prompt")))
     return warn + meta + textarea
@@ -373,6 +418,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/gpt-review":
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             return self._page_gpt_review(repo=qs.get("repo", [""])[0], pr=qs.get("pr", [""])[0])
+        if path == "/codex-review-prompt":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            return self._page_codex_review(repo=qs.get("repo", [""])[0], pr=qs.get("pr", [""])[0])
         if path.startswith("/run/"):
             return self._page_run_detail(urllib.parse.unquote(path[len("/run/"):]))
         return self._not_found()
@@ -396,6 +444,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_orchestrator(form)
         if path == "/gpt-review":
             return self._post_gpt_review(form)
+        if path == "/codex-review-prompt":
+            return self._post_codex_review(form)
         if path == "/decide":
             return self._post_decide(form)
         if path == "/export":
@@ -617,6 +667,23 @@ class Handler(BaseHTTPRequestHandler):
         self._page_gpt_review(result=_render_gpt_result(res), repo=res.get("repo") or repo,
                               pr=str(res.get("pr_number")), focus=res.get("focus") or focus,
                               diff_budget=res.get("diff_budget") or budget, include_feedback=include)
+
+    def _page_codex_review(self, notice: str = "", result: str = "", repo: str = "", pr: str = "",
+                           diff_budget: str = "compact"):
+        self._send_html(_render("codex_review.html", title="Codex Review Prompt", notice=notice,
+                                result=result, repo=e(repo), pr=e(pr),
+                                budget_options=_opts(_BUDGET_OPTS, diff_budget)))
+
+    def _post_codex_review(self, form):
+        repo, pr = form.get("repo", ""), form.get("pr_number", "")
+        budget = form.get("diff_budget", "compact")
+        try:
+            res = service.build_codex_prompt(repo, pr, diff_budget=budget)
+        except (ValueError, GhError) as ex:
+            msg = str(ex) if isinstance(ex, ValueError) else "gh error: %s" % ex
+            return self._page_codex_review(notice=_alert("err", msg), repo=repo, pr=pr, diff_budget=budget)
+        self._page_codex_review(result=_render_codex_result(res), repo=res.get("repo") or repo,
+                                pr=str(res.get("pr_number")), diff_budget=res.get("diff_budget") or budget)
 
 
 def _allowed_hosts(host: str) -> set:

@@ -1,0 +1,26 @@
+<h1>Codex Review Prompt <span class="muted">(guided, read-only)</span></h1>
+<p class="muted">Builds a <strong>copyable</strong> <code>@codex review</code> comment carrying devflow's
+shared review policy (role selection + Ponytail README / comma.ai report aesthetic references + output
+contract) — for <strong>Codex, the primary review path</strong>. This is different from the
+<a href="/gpt-review">GPT fallback prompt</a> (a manual ChatGPT/GPT second opinion). The dashboard
+<strong>never posts</strong> it, never calls Codex, and performs no GitHub writes — you paste it into a
+GitHub PR comment yourself.</p>
+$notice
+$result
+<form method="post" action="/codex-review-prompt" class="card">
+  <label for="repo">repo <span class="muted">(required, owner/name)</span></label>
+  <input type="text" id="repo" name="repo" placeholder="e.g. ChenSiyun1234/examprep-devflow" required>
+
+  <label for="pr_number">PR number <span class="muted">(required)</span></label>
+  <input type="text" id="pr_number" name="pr_number" placeholder="e.g. 12" required>
+
+  <label for="diff_budget">diff budget</label>
+  <select id="diff_budget" name="diff_budget">$budget_options</select>
+
+  <p class="note">Read-only. Requires <code>gh</code> installed and authenticated. Produces text only —
+  no provider/API key, no “send”, no “post comment”, no GitHub write. Heads-up: on Codex Cloud a guided
+  brief alongside <code>@codex review</code> can switch Codex into code-change mode; the bare
+  <code>@codex review</code> remains the reliable review trigger — you decide which form to paste.</p>
+
+  <p><button type="submit">Build guided Codex prompt</button></p>
+</form>

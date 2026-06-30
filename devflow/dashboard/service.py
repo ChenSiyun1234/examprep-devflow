@@ -39,6 +39,7 @@ from devflow.tools.review_orchestrator_runner import build_orchestration_result
 from devflow.tools.fallback_review_prompt import (
     build_fallback_review_prompt, FOCUS_MODES, DIFF_BUDGETS,
 )
+from devflow.tools.codex_review_prompt import build_codex_review_prompt
 
 # First-line markers cmd_watch_codex_reviews can emit (read-only watcher).
 WATCH_MARKERS = ("ACTIONABLE_CODEX_REVIEWS", "CODEX_WATCH_INCOMPLETE",
@@ -329,3 +330,21 @@ def build_gpt_review_prompt(repo: str, pr_number, focus: str = "general",
     diff_budget = diff_budget if diff_budget in DIFF_BUDGETS else "compact"   # clamp to a known budget
     return build_fallback_review_prompt(repo=repo, pr_number=n, focus=focus, diff_budget=diff_budget,
                                         include_existing_feedback=bool(include_existing_feedback))
+
+
+def build_codex_prompt(repo: str, pr_number, diff_budget: str = "compact") -> dict:
+    """Validate input and delegate to the read-only GUIDED Codex prompt builder. Builds copyable TEXT
+    only (a ``@codex review`` comment the human pastes manually): NO LLM/Codex call, NO GitHub write, NO
+    posting, NO shell beyond the existing read-only gh layer. Raises ValueError on bad input; GhError
+    propagates for a gh failure."""
+    repo = (repo or "").strip()
+    if not repo:
+        raise ValueError("repo is required")
+    try:
+        n = int(str(pr_number).strip())
+    except (TypeError, ValueError):
+        raise ValueError("PR number must be a positive integer")
+    if n <= 0:
+        raise ValueError("PR number must be a positive integer")
+    diff_budget = diff_budget if diff_budget in DIFF_BUDGETS else "compact"
+    return build_codex_review_prompt(repo=repo, pr_number=n, diff_budget=diff_budget)
