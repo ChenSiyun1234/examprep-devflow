@@ -168,6 +168,16 @@ def _render_orchestration(result: dict) -> str:
         mn_html += ("<p class='note'>Human merge preflight required — verify locally and merge via the "
                     "CLI/GitHub. The dashboard provides <strong>no</strong> merge button.</p>")
 
+    # build_plan folds the PRs it just RECOMMENDED into in_flight; but the dashboard neither posts the
+    # request nor persists it, so show only the PRs that were ALREADY awaiting (in_flight minus the
+    # freshly-recommended request_review set) — else a just-recommended PR would look "awaiting" already.
+    requested = set(plan.get("request_review") or [])
+    awaiting = [n for n in (plan.get("in_flight") or []) if n not in requested]
+    awaiting_html = chips(awaiting)
+    if requested:
+        awaiting_html += ("<p class='muted'>Freshly recommended PRs are under <em>Request review</em>, "
+                          "not here — the dashboard has not posted those requests.</p>")
+
     return (
         card("Summary", summary)
         + (card("Errors", errors_html) if errs else "")
@@ -180,7 +190,7 @@ def _render_orchestration(result: dict) -> str:
         + card("Resolve conflict (merge base in; never force-push)", chips(plan.get("needs_conflict")))
         + card("Needs retarget (parent PR merged)", rt_html)
         + card("Mergeability pending (GitHub still computing; re-run)", chips(plan.get("mergeable_unknown")))
-        + card("In-flight (awaiting Codex)", chips(plan.get("in_flight")))
+        + card("Awaiting Codex (already requested, not by this view)", awaiting_html)
         + card("Raw plan (debug)", "<pre>%s</pre>" % e(json.dumps(result, ensure_ascii=False, indent=2))))
 
 

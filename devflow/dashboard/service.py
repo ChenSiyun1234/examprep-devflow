@@ -283,14 +283,12 @@ ORCH_LIMIT_DEFAULT = 50
 ORCH_LIMIT_MAX = 200
 
 
-def run_orchestrator(repo: str, limit: int = ORCH_LIMIT_DEFAULT, persist_state: bool = False) -> dict:
+def run_orchestrator(repo: str, limit: int = ORCH_LIMIT_DEFAULT) -> dict:
     """Compute the READ-ONLY cross-PR orchestration plan for the dashboard.
 
     Validates input, clamps ``limit``, and delegates to the structured runner which uses ONLY
     ReadOnlyGitHub + the pure planner — no GitHub writes, no shell, no merge/comment/review-request.
-    By DEFAULT does not persist local tracking state: the dashboard never actually requests reviews, so
-    it must not record in-flight head tracking that would suppress a later real request. Returns the
-    structured result (``{marker, repo, default_branch, open_prs, plan, errors, state_path,
+    Returns the structured result (``{marker, repo, default_branch, open_prs, plan, errors, state_path,
     rate_limited}``). Raises ValueError on bad input; GhError propagates for a gh failure."""
     repo = (repo or "").strip()
     if not repo:
@@ -300,5 +298,7 @@ def run_orchestrator(repo: str, limit: int = ORCH_LIMIT_DEFAULT, persist_state: 
     except (TypeError, ValueError):
         lim = ORCH_LIMIT_DEFAULT
     lim = max(1, min(lim, ORCH_LIMIT_MAX))            # clamp to a sane window
-    # persist_state is forced False from the dashboard by the caller; never request reviews here.
-    return build_orchestration_result(repo=repo, limit=lim, persist_state=bool(persist_state))
+    # HARD-FORCE persist_state=False (not merely a default): the dashboard never actually requests
+    # reviews, so it must NEVER persist the planner's in-flight tracking — that would suppress a later
+    # real request. No caller can make the dashboard persist.
+    return build_orchestration_result(repo=repo, limit=lim, persist_state=False)

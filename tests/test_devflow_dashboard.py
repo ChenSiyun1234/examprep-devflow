@@ -384,6 +384,34 @@ class OrchestratorServiceTests(unittest.TestCase):
         self.assertEqual(bad["limit"], service.ORCH_LIMIT_DEFAULT)   # invalid -> default
 
 
+class OrchestratorRenderTests(unittest.TestCase):
+    def _result(self, request_review, in_flight):
+        return {"marker": "ORCHESTRATION_PLAN", "repo": "o/r", "default_branch": "main",
+                "state_path": "s", "rate_limited": False, "errors": [],
+                "open_prs": [{"number": 5, "title": "five", "branch": "f5"},
+                             {"number": 6, "title": "six", "branch": "f6"}],
+                "plan": {"ranking": [], "request_review": request_review, "findings_to_fix": [],
+                         "mergeable_now": [], "force_mergeable": [], "ready_then_merge": [],
+                         "needs_conflict": [], "needs_retarget": [], "retarget_to": {},
+                         "mergeable_unknown": [], "in_flight": in_flight, "rate_limited": False}}
+
+    def _awaiting_card(self, html):
+        idx = html.index("Awaiting Codex")     # slice from the card heading to the next card
+        rest = html[idx:]
+        nxt = rest.find("<h3>")
+        return rest[:nxt] if nxt != -1 else rest
+
+    def test_inflight_excludes_freshly_recommended(self):
+        # #5 is freshly recommended (in request_review AND in_flight); #6 was already awaiting
+        card = self._awaiting_card(app._render_orchestration(self._result([5], [5, 6])))
+        self.assertIn("#6", card)              # genuinely awaiting -> shown
+        self.assertNotIn("#5", card)           # freshly recommended -> NOT shown as awaiting
+
+    def test_already_awaiting_shown(self):
+        card = self._awaiting_card(app._render_orchestration(self._result([], [6])))
+        self.assertIn("#6", card)
+
+
 class NoShellExecutionTests(unittest.TestCase):
     def test_dashboard_layer_has_no_shell_execution(self):
         here = os.path.dirname(os.path.abspath(app.__file__))
