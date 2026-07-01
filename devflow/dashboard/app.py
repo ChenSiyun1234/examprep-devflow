@@ -316,6 +316,52 @@ def _opts(pairs, selected) -> str:
                    % (e(v), " selected" if v == selected else "", e(label)) for v, label in pairs)
 
 
+def _status_pill(ok: bool) -> str:
+    return "<span class='status-pill %s'>%s</span>" % ("ok" if ok else "warn",
+                                                      "OK" if ok else "needs attention")
+
+
+def _render_env_check(env: dict) -> str:
+    py = env.get("python_version") or "unknown"
+    exe = env.get("python_executable") or ""
+    gh_available = bool(env.get("gh_available"))
+    gh_auth = bool(env.get("gh_authenticated"))
+    account = env.get("gh_account") or "(unknown)"
+    gh_error = env.get("gh_error") or ""
+    rows = [
+        ("Python", py, True, exe),
+        ("gh CLI", "available" if gh_available else "not found", gh_available, gh_error),
+        ("GitHub auth", "authenticated" if gh_auth else "not authenticated", gh_auth, gh_error),
+        ("GitHub account", account if gh_auth else "-", gh_auth, ""),
+    ]
+    return ("<table class='kv start-env'><tbody>"
+            + "".join("<tr><th>%s</th><td>%s <span class='muted'>%s</span></td><td>%s</td></tr>"
+                      % (e(label), e(value), e(detail), _status_pill(ok))
+                      for label, value, ok, detail in rows)
+            + "</tbody></table>")
+
+
+def _render_start_result(final: dict) -> str:
+    if not final:
+        return ""
+    fields = []
+    for k in ("thread_id", "task_type", "repo", "agent_profile", "dashboard_start_mode",
+              "status", "paused_at_gate", "issue_number", "issue_url"):
+        v = final.get(k)
+        if v in (None, ""):
+            continue
+        if k == "issue_url" and str(v).startswith("http"):
+            val = "<a href='%s'>%s</a>" % (e(v), e(v))
+        else:
+            val = e(v)
+        fields.append("<tr><th>%s</th><td>%s</td></tr>" % (e(k), val))
+    errors = final.get("errors") or []
+    return ("<div class='card'><h3>Start result</h3>"
+            "<table class='kv'>%s</table><h4>Event log</h4>%s<h4>Errors</h4>%s</div>"
+            % ("".join(fields), _li(final.get("event_log")),
+               (_li(errors) if errors else "<p class='muted'>(no errors)</p>")))
+
+
 def _render_gpt_result(res: dict) -> str:
     """Render the fallback-review result: no-send warning, private-repo warning, a copyable textarea with
     the prompt, and a PR metadata card. All dynamic content escaped (the textarea too — the browser
@@ -579,6 +625,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path == "/":
             return self._page_runs()
+        if path == "/start":
+            return self._page_start()
         if path == "/new":
             return self._page_new_run()
         if path == "/manual":
@@ -610,6 +658,8 @@ class Handler(BaseHTTPRequestHandler):
         if not self._same_origin_ok():        # CSRF: reject cross-site browser POSTs
             return self._forbidden_csrf()
         path = urllib.parse.urlparse(self.path).path
+        if path == "/start":
+            return self._post_start(form)
         if path == "/new":
             return self._post_new_run(form)
         if path == "/manual":
@@ -652,7 +702,7 @@ class Handler(BaseHTTPRequestHandler):
                      + "".join(rows) + "</tbody></table>")
         else:
             table = ("<p class='muted'>No local runs yet. "
-                     "<a href='/new'>Create a dry-run run</a>.</p>")
+                     "<a href='/start'>Start an advisory flow</a>.</p>")
         done = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("done", [""])[0]
         notice = _alert("ok", "Run %s completed (no checkpoint to display)." % done) if done else ""
         self._send_html(_render("runs.html", title="Runs", rows=table, notice=notice))
@@ -666,7 +716,8 @@ class Handler(BaseHTTPRequestHandler):
         gate_alias = service.ALIAS_FOR_GATE.get(paused_gate)
 
         fields = []
-        for k in ("thread_id", "task_type", "repo", "status", "paused_at_gate", "paused_at_node",
+        for k in ("thread_id", "task_type", "task_text", "repo", "agent_profile",
+                  "dashboard_start_mode", "status", "paused_at_gate", "paused_at_node",
                   "issue_number", "pr_number", "human_approval", "fix_approval", "merge_approval"):
             if state.get(k) not in (None, ""):
                 fields.append("<tr><th>%s</th><td>%s</td></tr>" % (e(k), e(state.get(k))))
@@ -714,6 +765,33 @@ class Handler(BaseHTTPRequestHandler):
         self._send_html(_render(
             "run_detail.html", title="Run %s" % thread_id, thread_id=e(thread_id), notice=notice,
             fields=fields_html, event_log=event_log, errors=errors_html, gate_section=gate_section))
+
+    def _page_start(self, notice: str = "", result: str = "", values: dict = None, code: int = 200):
+        values = values or {}
+        task = values.get("task") or "docs-advisory"
+        thread_id = values.get("thread_id") or service.suggest_thread_id(task)
+        repo = values.get("repo") or service.START_DEFAULT_REPO
+        profile = values.get("agent_profile") or service.AGENT_PROFILES[0]
+        if profile not in service.AGENT_PROFILES:
+            profile = service.AGENT_PROFILES[0]
+        env = service.dashboard_environment_check()
+        writes_enabled = bool(getattr(self.server, "allow_writes", False))
+        real_note = (
+            "GitHub-write controls are enabled for this localhost session, but real advisory launch "
+            "from the Start Wizard is deferred in this PR. Use the CLI real-advisory command for live "
+            "issue creation until the dashboard gets advisory-specific audit/idempotency."
+            if writes_enabled else
+            "Real GitHub advisory launch is unavailable here. It requires a future dashboard write path "
+            "plus a localhost session started with --allow-github-writes."
+        )
+        self._send_html(_render(
+            "start.html", title="Start", notice=notice, result=result,
+            env_check=_render_env_check(env),
+            agent_options=_opts([(p, p) for p in service.AGENT_PROFILES], profile),
+            repo=e(repo), task=e(task), thread_id=e(thread_id),
+            confirmation_phrase=e(service.START_REAL_CONFIRMATION),
+            real_note=e(real_note), writes_status=("enabled" if writes_enabled else "disabled"),
+        ), code=code)
 
     def _page_new_run(self, notice: str = ""):
         self._send_html(_render("new_run.html", title="New run", notice=notice))
@@ -766,6 +844,38 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as ex:
             return self._page_new_run(notice=_alert("err", str(ex)))
         tid = final.get("thread_id") or form.get("thread_id", "")
+        self._redirect_for_run(tid)
+
+    def _post_start(self, form):
+        mode = form.get("mode") or service.START_MODE_DRY_RUN
+        if mode == service.START_MODE_REAL:
+            if not getattr(self.server, "allow_writes", False):
+                return self._page_start(
+                    notice=_alert("err", "Real GitHub advisory requires --allow-github-writes on "
+                                           "localhost and is deferred from the Start Wizard in this PR."),
+                    values=form, code=403)
+            if form.get("confirmation", "") != service.START_REAL_CONFIRMATION:
+                return self._page_start(
+                    notice=_alert("err", "Confirmation must exactly match %s; real advisory launch "
+                                           "is still deferred in this PR."
+                                  % service.START_REAL_CONFIRMATION),
+                    values=form)
+            return self._page_start(
+                notice=_alert("err", "Real GitHub advisory launch is deferred in this PR; no GitHub "
+                                       "write was attempted."),
+                values=form)
+        if mode != service.START_MODE_DRY_RUN:
+            return self._page_start(notice=_alert("err", "mode must be dry-run"), values=form)
+        try:
+            final = service.create_start_run(
+                task=form.get("task", ""), thread_id=form.get("thread_id", ""),
+                repo=form.get("repo", ""), agent_profile=form.get("agent_profile", "codex"))
+        except ValueError as ex:
+            return self._page_start(notice=_alert("err", str(ex)), values=form)
+        tid = final.get("thread_id") or form.get("thread_id", "")
+        if service.get_run(tid) is None:
+            return self._page_start(notice=_alert("ok", "Start flow completed."),
+                                    result=_render_start_result(final), values=form)
         self._redirect_for_run(tid)
 
     def _post_decide(self, form):

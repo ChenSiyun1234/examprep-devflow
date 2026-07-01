@@ -45,8 +45,11 @@ class DevflowState(TypedDict, total=False):
 
     # --- request / identity ---
     task_type: str
+    task_text: str
     thread_id: str
     repo: str
+    agent_profile: str
+    dashboard_start_mode: str
     branch_name: Optional[str]
 
     # --- GitHub artifacts (populated as simulated values in dry-run) ---

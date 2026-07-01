@@ -8,6 +8,7 @@ rejects non-localhost Host headers), and there is no arbitrary-shell-execution e
 """
 
 import contextlib
+import datetime
 import http.client
 import io
 import json
@@ -153,6 +154,28 @@ class DryRunSafetyTests(DashboardBase):
             final = service.create_run("complete-1", "docs-advisory", "owner/x", pause_at=None)
         self.assertNotEqual(final.get("status"), "paused")
         self.assertIsNone(service.get_run("complete-1"))   # checkpoint cleared on completion
+
+    def test_start_thread_id_suggestion_is_checkpoint_safe(self):
+        now = datetime.datetime(2026, 7, 1, 12, 30, 0, tzinfo=datetime.timezone.utc)
+        tid = service.suggest_thread_id("../Add <wizard> flow", now=now)
+        self.assertEqual(tid, "start-add-wizard-flow-20260701-123000")
+        for bad in ("/", "\\", "<", ">", " "):
+            self.assertNotIn(bad, tid)
+
+    def test_create_start_run_records_metadata_and_makes_no_real_gh_calls(self):
+        with mock.patch("devflow.tools.github_cli.subprocess.run",
+                        side_effect=AssertionError("real gh invoked!")) as m, _quiet():
+            final = service.create_start_run("Add wizard", "", "owner/x", "claude_code")
+        tid = final.get("thread_id")
+        self.assertTrue(tid.startswith("start-add-wizard-"))
+        self.assertFalse(final.get("real_github"))
+        self.assertEqual(final.get("status"), "paused")
+        self.assertEqual(final.get("repo"), "owner/x")
+        self.assertEqual(final.get("task_type"), "Add wizard")
+        self.assertEqual(final.get("agent_profile"), "claude_code")
+        self.assertEqual(final.get("dashboard_start_mode"), "dry-run")
+        self.assertTrue(any("agent_profile=claude_code" in x for x in final.get("event_log", [])))
+        m.assert_not_called()
 
 
 class DecideGateTests(DashboardBase):
@@ -767,7 +790,7 @@ class NoShellExecutionTests(unittest.TestCase):
         # the only state-changing endpoints; nothing accepts an arbitrary command
         import inspect
         src = inspect.getsource(app.Handler.do_POST)
-        for route in ('"/new"', '"/manual"', '"/watcher"', '"/orchestrator"', '"/gpt-review"',
+        for route in ('"/start"', '"/new"', '"/manual"', '"/watcher"', '"/orchestrator"', '"/gpt-review"',
                       '"/codex-review-prompt"', '"/decide"', '"/export"', '"/codex-review-request"',
                       '"/mark-ready"'):
             self.assertIn(route, src)
@@ -1009,6 +1032,77 @@ class HttpIntegrationTests(DashboardBase):
         body = resp.read().decode("utf-8")
         self.assertEqual(resp.status, 200)
         self.assertIn("DevFlow Dashboard", body)
+        self.assertIn('href="/start"', body)
+
+    def test_start_page_loads_with_environment_and_gated_real_mode(self):
+        env = {"python_version": "3.12.1", "python_executable": "py",
+               "gh_available": True, "gh_authenticated": True, "gh_account": "octo",
+               "gh_error": None, "ok": True}
+        with mock.patch.object(service, "dashboard_environment_check", return_value=env):
+            c = self._conn()
+            c.request("GET", "/start")
+            resp = c.getresponse()
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("Start", body)
+        self.assertIn("Python", body)
+        self.assertIn("3.12.1", body)
+        self.assertIn("gh CLI", body)
+        for profile in ("codex", "claude_code", "generic"):
+            self.assertIn("value='%s'" % profile, body)
+        self.assertIn('name="mode" value="dry-run" checked', body)
+        self.assertIn('name="mode" value="real" disabled', body)
+        self.assertIn("deferred", body.lower())
+
+    def test_start_page_escapes_environment_values(self):
+        env = {"python_version": "<3>", "python_executable": "<script>py</script>",
+               "gh_available": True, "gh_authenticated": True,
+               "gh_account": "<script>alert(1)</script>", "gh_error": None, "ok": True}
+        with mock.patch.object(service, "dashboard_environment_check", return_value=env):
+            c = self._conn()
+            c.request("GET", "/start")
+            resp = c.getresponse()
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertNotIn("<script>alert(1)</script>", body)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body)
+
+    def test_start_post_dry_run_redirects_and_preserves_metadata(self):
+        fields = {"mode": "dry-run", "task": "Ship start wizard", "thread_id": "start-http",
+                  "repo": "owner/repo", "agent_profile": "generic"}
+        with mock.patch("devflow.tools.github_cli.subprocess.run",
+                        side_effect=AssertionError("real gh invoked!")) as m, _quiet():
+            resp = self._post("/start", fields)
+            resp.read()
+        self.assertEqual(resp.status, 303)
+        self.assertEqual(resp.getheader("Location"), "/run/start-http")
+        st = service.get_run("start-http")
+        self.assertIsNotNone(st)
+        self.assertFalse(st.get("real_github"))
+        self.assertEqual(st.get("task_type"), "Ship start wizard")
+        self.assertEqual(st.get("repo"), "owner/repo")
+        self.assertEqual(st.get("agent_profile"), "generic")
+        self.assertTrue(any("dashboard_start" in x for x in st.get("event_log", [])))
+        m.assert_not_called()
+
+        c = self._conn()
+        c.request("GET", "/run/start-http")
+        detail = c.getresponse().read().decode("utf-8")
+        self.assertIn("Event log", detail)
+        self.assertIn("Ship start wizard", detail)
+        self.assertIn("generic", detail)
+
+    def test_start_real_mode_rejected_when_writes_disabled(self):
+        with mock.patch.object(service, "create_start_run",
+                               side_effect=AssertionError("dry-run helper should not run")) as start:
+            resp = self._post("/start", {"mode": "real", "task": "x", "thread_id": "real-off",
+                                         "repo": "owner/repo",
+                                         "confirmation": service.START_REAL_CONFIRMATION})
+            body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 403)
+        self.assertIn("deferred", body.lower())
+        self.assertIsNone(service.get_run("real-off"))
+        start.assert_not_called()
 
     def test_codex_review_post_forbidden_when_writes_disabled(self):
         # this server was started read-only (default) — the write route must 403 even with valid fields
@@ -2405,6 +2499,49 @@ class WritesEnabledHttpTests(DashboardBase):
         self.addCleanup(c.close)
         c.request("POST", path, body=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
         return c.getresponse()
+
+    def test_start_page_real_mode_still_deferred_when_writes_enabled(self):
+        env = {"python_version": "3.12.1", "python_executable": "py",
+               "gh_available": True, "gh_authenticated": True, "gh_account": "octo",
+               "gh_error": None, "ok": True}
+        with mock.patch.object(service, "dashboard_environment_check", return_value=env):
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            self.addCleanup(c.close)
+            c.request("GET", "/start")
+            r = c.getresponse()
+            body = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("GitHub writes are enabled", body)
+        self.assertIn("deferred", body.lower())
+        self.assertIn('name="mode" value="real" disabled', body)
+
+    def test_start_real_mode_rejects_without_exact_confirmation_even_with_writes_enabled(self):
+        for bad in ("", "START REAL ADVISORY ", " START REAL ADVISORY"):
+            with mock.patch.object(service, "create_start_run",
+                                   side_effect=AssertionError("no start helper")) as start:
+                r = self._post_path("/start", {"mode": "real", "task": "x", "thread_id": "real-bad",
+                                                "repo": "owner/repo", "confirmation": bad})
+                body = r.read().decode("utf-8")
+            self.assertEqual(r.status, 200)
+            self.assertIn("Confirmation must exactly match", body)
+            self.assertIsNone(service.get_run("real-bad"))
+            start.assert_not_called()
+
+    def test_start_real_mode_exact_confirmation_is_deferred_no_write(self):
+        with mock.patch.object(service, "create_start_run",
+                               side_effect=AssertionError("no start helper")) as start, \
+             mock.patch("devflow.nodes.advisory._writer",
+                        side_effect=AssertionError("no advisory write")) as writer:
+            r = self._post_path("/start", {"mode": "real", "task": "x", "thread_id": "real-deferred",
+                                            "repo": "owner/repo",
+                                            "confirmation": service.START_REAL_CONFIRMATION})
+            body = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("deferred", body.lower())
+        self.assertIn("no GitHub write was attempted", body)
+        self.assertIsNone(service.get_run("real-deferred"))
+        start.assert_not_called()
+        writer.assert_not_called()
 
     def test_mark_ready_success_message(self):
         with mock.patch.object(service, "mark_ready_for_review",

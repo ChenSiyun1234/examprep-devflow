@@ -25,6 +25,7 @@ import datetime
 import io
 import json
 import os
+import sys
 import threading
 from typing import Optional
 
@@ -36,7 +37,7 @@ from devflow.tools.packet_writer import (
     render_manual_markdown, write_packet, PacketError,  # noqa: F401 (re-exported for the app layer)
 )
 from devflow.tools.review_orchestrator_runner import build_orchestration_result
-from devflow.tools.github_cli import GhError
+from devflow.tools.github_cli import GhError, check_gh_available
 from devflow.tools.fallback_review_prompt import (
     build_fallback_review_prompt, FOCUS_MODES, DIFF_BUDGETS,
 )
@@ -60,10 +61,57 @@ GATE_ALIASES = dict(_cli._GATE_ALIASES)            # {"advisory": "advisory_impl
 ALIAS_FOR_GATE = {full: alias for alias, full in GATE_ALIASES.items()}
 
 _DEFAULT_REPO = "ZeKaiNie/universal-examprep-skill"
+START_DEFAULT_REPO = "ChenSiyun1234/examprep-devflow"
+AGENT_PROFILES = ("codex", "claude_code", "generic")
+START_MODE_DRY_RUN = "dry-run"
+START_MODE_REAL = "real"
+START_REAL_CONFIRMATION = "START REAL ADVISORY"
 
 
 def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _safe_slug(text: str, fallback: str = "task", limit: int = 36) -> str:
+    """ASCII-only slug for suggested thread ids; checkpoint paths add their own hash."""
+    out = []
+    last_dash = False
+    for ch in (text or "").lower():
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+            last_dash = False
+        elif not last_dash:
+            out.append("-")
+            last_dash = True
+    slug = "".join(out).strip("-")
+    return (slug or fallback)[:limit].strip("-") or fallback
+
+
+def suggest_thread_id(task: str = "", now: Optional[datetime.datetime] = None) -> str:
+    """Return a bounded, checkpoint-safe thread id suggestion based on task + UTC timestamp."""
+    ts = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(datetime.timezone.utc)
+    return "start-%s-%s" % (_safe_slug(task), ts.strftime("%Y%m%d-%H%M%S"))
+
+
+def dashboard_environment_check() -> dict:
+    """Read-only Start Wizard preflight: Python version plus gh availability/auth/account."""
+    gh = check_gh_available()
+    return {
+        "python_version": sys.version.split()[0],
+        "python_executable": sys.executable,
+        "gh_available": bool(gh.get("available")),
+        "gh_authenticated": bool(gh.get("authenticated")),
+        "gh_account": gh.get("account"),
+        "gh_error": gh.get("error"),
+        "ok": bool(gh.get("available")) and bool(gh.get("authenticated")),
+    }
+
+
+def _agent_profile(value: str) -> str:
+    value = (value or "").strip()
+    if value not in AGENT_PROFILES:
+        raise ValueError("agent_profile must be one of: %s" % ", ".join(AGENT_PROFILES))
+    return value
 
 
 # ----------------------------------------------------------------------------------------
@@ -149,6 +197,44 @@ def create_run(thread_id: str, task_type: str = "docs-advisory", repo: str = "",
     state["real_github"] = False                      # belt-and-suspenders: dashboard never writes to GitHub
     app = build_graph(prefer_fallback=True)           # stdlib dry-run backend; never the LangGraph backend
     with _STDOUT_LOCK:                                 # dry-run nodes print -> guard vs the watcher's capture
+        final = app.invoke(state)
+    _persist(thread_id, final)
+    return final
+
+
+def create_start_run(task: str, thread_id: str = "", repo: str = "",
+                     agent_profile: str = "codex") -> dict:
+    """Create the Start Wizard's dry-run advisory flow and pause at the advisory approval gate.
+
+    Agent profile is metadata only in this PR: it is recorded for future handoff wording and never
+    calls an LLM, reads API keys, or changes GitHub write behavior.
+    """
+    task = (task or "").strip()
+    if not task:
+        raise ValueError("task is required")
+    thread_id = (thread_id or "").strip() or suggest_thread_id(task)
+    if not thread_id:
+        raise ValueError("thread_id is required")
+    if get_run(thread_id) is not None:
+        raise ValueError("a run with thread_id %r already exists 鈥?choose a unique id "
+                         "(or remove the existing run first)" % (thread_id,))
+    profile = _agent_profile(agent_profile or AGENT_PROFILES[0])
+    repo = (repo or "").strip() or START_DEFAULT_REPO
+
+    approvals = {g: APPROVED for g in APPROVAL_GATES}
+    approvals.pop(GATE_ALIASES["advisory"], None)
+    state = new_state(task_type=task, thread_id=thread_id, repo=repo,
+                      approvals=approvals, pause_at=GATE_ALIASES["advisory"])
+    state["task_text"] = task
+    state["agent_profile"] = profile
+    state["dashboard_start_mode"] = START_MODE_DRY_RUN
+    state["real_github"] = False
+    state["event_log"].append(
+        "[dashboard_start] mode=dry-run agent_profile=%s repo=%s task=%s"
+        % (profile, repo, task)
+    )
+    app = build_graph(prefer_fallback=True)
+    with _STDOUT_LOCK:
         final = app.invoke(state)
     _persist(thread_id, final)
     return final

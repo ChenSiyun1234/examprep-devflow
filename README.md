@@ -192,6 +192,11 @@ and the suggested next Claude Code message.
 
 ## Dashboard (local web UI)
 
+A browser-first local app entry point is available at `/start`. It checks Python and GitHub CLI status,
+lets you choose an agent profile, repo, task, and thread id, then starts a dry-run advisory flow and
+redirects to Run detail so the `event_log` is visible. `devflow-dashboard --open` starts the app and
+opens the localhost URL when possible.
+
 A tiny **local** dashboard to drive the common safe workflow from buttons/forms instead of typing
 `python -m devflow.cli …`. It is pure Python standard library — **no install or dependency needed**:
 
@@ -200,11 +205,21 @@ python -m devflow.dashboard.app        # then open http://127.0.0.1:8765
 python -m devflow.dashboard.app --open # start + open the URL in your browser (localhost binds only)
 devflow-dashboard --open               # same, via the console script once the package is installed
 # options: --host 127.0.0.1 (default; localhost-only) --port 8765
-#          --allow-github-writes  opt-in: enable the ONE real write (post '@codex review'); localhost only
+#          --allow-github-writes  opt-in: enable narrow Review Queue writes; localhost only
 ```
 
 `--open` is a convenience (stdlib `webbrowser`, no shell); it is **skipped for a non-localhost `--host`**
 (the warning still prints) and changes nothing about the read-only / dry-run safety posture.
+
+**Start Wizard (`/start`) - recommended entry point.** The wizard records the selected agent profile
+(`codex`, `claude_code`, or `generic`) as metadata only. It does not call an LLM, install tools, read API
+keys, or change GitHub write behavior. If the thread id is blank, the server suggests a safe id from the
+task and timestamp.
+
+The Start Wizard defaults to **dry-run** and writes nothing to GitHub. The **real GitHub advisory** option
+is shown as deferred in this PR and remains disabled/unavailable from the browser; no advisory issue or
+comment is created by `/start`. Future real advisory launch will require `--allow-github-writes`, a
+localhost bind, and the exact typed confirmation `START REAL ADVISORY`.
 
 `--allow-github-writes` is **off by default**. Without it the dashboard performs **no** real GitHub writes
 at all (every button is read-only or dry-run). With it — and **only** on a localhost bind (enforced in the

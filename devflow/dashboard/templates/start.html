@@ -1,0 +1,58 @@
+<h1>Start</h1>
+<p class="muted">Set up a local advisory flow, then continue through the existing approval and packet handoff screens.</p>
+
+$notice
+
+<section class="card">
+  <h3>Environment</h3>
+  $env_check
+</section>
+
+<form method="post" action="/start" class="start-form">
+  <section class="card">
+    <h3>Agent Profile</h3>
+    <label for="agent_profile">profile</label>
+    <select id="agent_profile" name="agent_profile">
+      $agent_options
+    </select>
+    <p class="muted">Metadata only for this PR. It does not call an LLM or require API keys.</p>
+  </section>
+
+  <section class="card">
+    <h3>Repo</h3>
+    <label for="repo">owner/name</label>
+    <input type="text" id="repo" name="repo" value="$repo" required>
+  </section>
+
+  <section class="card">
+    <h3>Task</h3>
+    <label for="task">task</label>
+    <input type="text" id="task" name="task" value="$task" required>
+
+    <label for="thread_id">thread_id</label>
+    <input type="text" id="thread_id" name="thread_id" value="$thread_id">
+    <p class="muted">Leave this blank to let the server generate a safe id from the task and timestamp.</p>
+  </section>
+
+  <section class="card">
+    <h3>Mode</h3>
+    <label class="radio-line">
+      <input type="radio" name="mode" value="dry-run" checked>
+      <span>dry-run</span>
+      <span class="muted">Simulates the advisory and pauses at approval. No GitHub writes.</span>
+    </label>
+    <label class="radio-line disabled">
+      <input type="radio" name="mode" value="real" disabled>
+      <span>real GitHub advisory</span>
+      <span class="muted">Deferred. GitHub writes are $writes_status.</span>
+    </label>
+    <p class="note">$real_note</p>
+
+    <label for="confirmation">real-mode confirmation</label>
+    <input type="text" id="confirmation" name="confirmation" placeholder="$confirmation_phrase" disabled>
+  </section>
+
+  <p><button type="submit" class="primary">Start advisory flow</button></p>
+</form>
+
+$result
