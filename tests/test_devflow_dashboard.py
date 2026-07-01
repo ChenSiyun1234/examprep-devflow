@@ -769,39 +769,41 @@ class NoShellExecutionTests(unittest.TestCase):
         src = inspect.getsource(app.Handler.do_POST)
         for route in ('"/new"', '"/manual"', '"/watcher"', '"/orchestrator"', '"/gpt-review"',
                       '"/codex-review-prompt"', '"/decide"', '"/export"', '"/codex-review-request"',
-                      '"/mark-ready"'):
+                      '"/mark-ready"', '"/retarget-pr"'):
             self.assertIn(route, src)
 
     def test_no_destructive_github_write_routes_or_buttons(self):
-        # the dashboard's only real writes are post '@codex review' and 'gh pr ready' (mark-ready). The
-        # layer must not contain any OTHER gh write-verb shape or GitHub Actions trigger. (Tokens match
-        # real invocations, not the safety-disclaimer PROSE that legitimately mentions these words.)
+        # the dashboard's only real writes are post '@codex review', 'gh pr ready' (mark-ready), and
+        # 'gh pr edit --base' (base retarget, base-only). The layer must not contain any OTHER gh write
+        # shape, generic-edit/reviewer flag, or GitHub Actions trigger. (Tokens match real invocations,
+        # not the safety-disclaimer PROSE that legitimately mentions these words.)
         src = ""
         for path in (app.__file__, service.__file__, dw.__file__):
             with open(path, encoding="utf-8") as f:
                 src += f.read().lower()
-        for forbidden in ("gh pr merge", "gh pr edit", "gh pr close", "pr ready --undo", "delete-branch",
+        for forbidden in ("gh pr merge", "gh pr close", "pr ready --undo", "delete-branch",
                           "--force", "force-with-lease", "gh workflow", "actions/workflows",
-                          ".github/workflows"):
+                          ".github/workflows", "--add-reviewer", "--remove-reviewer", "--title",
+                          "--body", "--milestone"):
             self.assertNotIn(forbidden, src,
                              "dashboard layer must not contain destructive write %r" % forbidden)
 
     def test_post_handler_has_no_destructive_route_literals(self):
-        # the do_POST dispatcher must not route any destructive endpoint (mark-ready is NOT destructive —
-        # it only un-drafts; merge/retarget/reviewer/close/delete/push remain forbidden)
+        # the do_POST dispatcher must not route any destructive endpoint. mark-ready (un-draft) and
+        # retarget-pr (base-only) are NOT destructive; merge/reviewer/close/delete/push remain forbidden.
         import inspect
         src = inspect.getsource(app.Handler.do_POST)
-        for route in ('"/merge"', '"/retarget"', '"/request-review"', '"/request-reviewer"', '"/close"',
+        for route in ('"/merge"', '"/request-review"', '"/request-reviewer"', '"/close"',
                       '"/delete-branch"', '"/push"', '"/force-push"'):
             self.assertNotIn(route, src,
                              "do_POST must not route destructive endpoint %s" % route)
 
     def test_dashboard_write_helpers_take_no_generic_body_or_action(self):
-        # no generic write API: the comment body is a module constant, and neither helper accepts an
+        # no generic write API: the comment body is a module constant, and no helper accepts an
         # arbitrary body/action/command argument
         import inspect
         self.assertEqual(dw.CODEX_REVIEW_BODY, "@codex review")
-        for fn in (dw.post_codex_review_request, dw.mark_pr_ready_for_review):
+        for fn in (dw.post_codex_review_request, dw.mark_pr_ready_for_review, dw.retarget_pr_base):
             params = inspect.signature(fn).parameters
             for forbidden in ("body", "message", "comment", "action", "command", "cmd", "flags", "args"):
                 self.assertNotIn(forbidden, params, "%s must not take %r" % (fn.__name__, forbidden))
@@ -1023,6 +1025,15 @@ class HttpIntegrationTests(DashboardBase):
         resp = self._post("/mark-ready",
                           {"repo": "owner/repo", "pr_number": "9", "expected_head_sha": "abc1234",
                            "confirmation": "MARK #9 READY"})
+        resp.read()
+        self.assertEqual(resp.status, 403)
+
+    def test_retarget_post_forbidden_when_writes_disabled(self):
+        # the retarget route must also 403 on the default read-only server, even with valid fields
+        resp = self._post("/retarget-pr",
+                          {"repo": "owner/repo", "pr_number": "9", "expected_head_sha": "abc1234",
+                           "expected_current_base": "feat/parent", "target_base": "main",
+                           "confirmation": "RETARGET #9 TO main"})
         resp.read()
         self.assertEqual(resp.status, 403)
 
@@ -1859,6 +1870,50 @@ class OrchestratorWriteRenderTests(unittest.TestCase):
         self.assertIn("ready_for_review", html)
         self.assertIn("never invokes", html)               # "...the dashboard itself never invokes Actions"
 
+    def _with_needs_retarget(self):
+        res = _CannedOrchestration.make()                  # request_review=[5]
+        res["plan"]["needs_retarget"] = [9]
+        res["plan"]["retarget_to"] = {"9": "main"}
+        res["open_prs"].append({"number": 9, "title": "stacked", "branch": "feat/child",
+                                "head": "child99head1", "base_ref": "feat/parent"})
+        return res
+
+    def test_no_retarget_form_when_writes_disabled(self):
+        html = app._render_orchestration(self._with_needs_retarget(), False, 50)
+        self.assertNotIn("/retarget-pr", html)
+        self.assertNotIn("RETARGET #9 TO main", html)
+
+    def test_retarget_form_only_for_needs_retarget_when_enabled(self):
+        html = app._render_orchestration(self._with_needs_retarget(), True, 50)
+        self.assertIn("action='/retarget-pr'", html)
+        self.assertIn("name='pr_number' value='9'", html)
+        self.assertIn("child99head1", html)                        # head pinned
+        self.assertIn("name='target_base' value='main'", html)     # EXACT planner target
+        self.assertIn("name='expected_current_base' value='feat/parent'", html)   # current base pinned
+        self.assertIn("RETARGET #9 TO main", html)                 # exact confirmation phrase
+        self.assertIn("name='limit' value='50'", html)
+        self.assertIn("Retarget base to main", html)
+        self.assertIn("does <strong>not</strong> merge", html)
+
+    def test_retarget_absent_for_other_buckets(self):
+        res = _CannedOrchestration.make()                  # request_review=[5], no needs_retarget
+        res["plan"]["ready_then_merge"] = [7]
+        res["plan"]["mergeable_now"] = [8]
+        html = app._render_orchestration(res, True, 50)
+        self.assertNotIn("/retarget-pr", html)             # nothing in needs_retarget -> no retarget form
+        self.assertIn("/codex-review-request", html)       # other write forms still render
+
+    def test_retarget_form_carries_the_plan_limit(self):
+        html = app._render_orchestration(self._with_needs_retarget(), True, 120)
+        self.assertIn("name='limit' value='120'", html)
+
+    def test_retarget_form_warns_about_edited_actions(self):
+        # Codex PR#17 R4: `gh pr edit --base` can trigger the target repo's pull_request:edited workflows —
+        # the retarget button copy must carry that honest caveat (like the codex/mark-ready caveats)
+        html = app._render_orchestration(self._with_needs_retarget(), True, 50)
+        self.assertIn("pull_request: edited", html)
+        self.assertIn("never invokes", html)
+
 
 class CodexWriteFlagTests(unittest.TestCase):
     """`--allow-github-writes` enables the write path ONLY on a localhost bind."""
@@ -1889,6 +1944,16 @@ class CodexWriteFlagTests(unittest.TestCase):
         rc, rs, _, _ = self._main(["--host", "localhost", "--port", "8765", "--allow-github-writes"],
                                   bound_host="localhost")
         self.assertTrue(rs.call_args.kwargs.get("allow_writes"))
+
+    def test_write_enabled_banner_does_not_undercount_writes(self):
+        # Codex PR#17: the serving banner must not stale-claim "post @codex review only" now that there
+        # are three writes — it must mention all three, not just the first
+        rc, rs, out, _ = self._main(["--host", "127.0.0.1", "--port", "8765", "--allow-github-writes"])
+        self.assertIn("writes ENABLED", out)
+        self.assertNotIn("@codex review only", out)
+        low = out.lower()
+        for w in ("@codex review", "mark ready", "retarget"):
+            self.assertIn(w, low)
 
     def test_flag_on_non_localhost_refuses_writes(self):
         rc, rs, out, err = self._main(["--host", "0.0.0.0", "--port", "8765", "--allow-github-writes"],
@@ -2254,6 +2319,195 @@ class MarkReadyHelperTests(unittest.TestCase):
         save.assert_not_called()
 
 
+class RetargetHelperTests(unittest.TestCase):
+    """The narrow `retarget_pr_base` helper: gating, safe-ref, exact planner target, audit, no state."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rt_")
+        self.audit = os.path.join(self.tmp, "actions")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        dw._POSTED.clear()
+        self.addCleanup(dw._POSTED.clear)
+
+    def _fakes(self, head="abc1234", state="OPEN", base="feat/parent", write_ok=True):
+        ro = mock.Mock()
+        ro_inst = mock.Mock()
+        ro_inst.get_pr_meta.return_value = {"number": 9, "head_oid": head, "state": state,
+                                            "base_ref": base}
+        ro.return_value = ro_inst
+        calls = []
+
+        class _Writer:
+            def __init__(self, repo, live=False, logger=None):
+                self.repo, self.live = repo, live
+
+            def retarget_pr_base(self, n, target):
+                calls.append((n, target, self.live))
+                return {"executed": True, "base": target} if write_ok else {"executed": False,
+                                                                            "error": "boom"}
+        return ro, _Writer, calls
+
+    def _call(self, ro, writer, **over):
+        kw = dict(repo="owner/repo", pr_number=9, expected_head_sha="abc1234",
+                  expected_current_base="feat/parent", target_base="main",
+                  confirmation="RETARGET #9 TO main", live=True, audit_dir=self.audit)
+        kw.update(over)
+        with mock.patch.object(dw, "ReadOnlyGitHub", ro), mock.patch.object(dw, "GitHubWriter", writer):
+            return dw.retarget_pr_base(**kw)
+
+    def _audit_lines(self):
+        p = os.path.join(self.audit, dw.AUDIT_FILE)
+        if not os.path.exists(p):
+            return []
+        with open(p, encoding="utf-8") as f:
+            return [json.loads(x) for x in f if x.strip()]
+
+    def test_retargets_on_success_via_narrow_writer(self):
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["action"], "retarget_pr_base")
+        self.assertEqual(res["from_base"], "feat/parent")
+        self.assertEqual(res["to_base"], "main")
+        self.assertEqual(calls, [(9, "main", True)])           # ONLY the narrow retarget writer, live
+        rec = self._audit_lines()[-1]
+        self.assertEqual(rec["action"], "retarget_pr_base")
+        self.assertEqual(rec["result"], "success")
+        self.assertEqual(rec["from_base"], "feat/parent")
+        self.assertEqual(rec["to_base"], "main")
+        self.assertNotIn("body", rec)                          # retarget has no comment body
+
+    def test_rejects_wrong_confirmation(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError):
+            self._call(ro, writer, confirmation="retarget #9 to main")   # wrong case
+        self.assertEqual(calls, [])
+        self.assertEqual(self._audit_lines()[-1]["result"], "refused")
+
+    def test_rejects_confirmation_with_whitespace(self):
+        ro, writer, calls = self._fakes()
+        for bad in ("RETARGET #9 TO main ", " RETARGET #9 TO main", "RETARGET  #9 TO main"):
+            with self.assertRaises(ValueError):
+                self._call(ro, writer, confirmation=bad)
+        self.assertEqual(calls, [])                             # literal, whitespace-sensitive
+
+    def test_rejects_missing_expected_head(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError):
+            self._call(ro, writer, expected_head_sha="")
+        self.assertEqual(calls, [])
+
+    def test_rejects_missing_expected_current_base(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError):
+            self._call(ro, writer, expected_current_base="")
+        self.assertEqual(calls, [])
+
+    def test_rejects_missing_target_base(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError):
+            self._call(ro, writer, target_base="", confirmation="RETARGET #9 TO ")
+        self.assertEqual(calls, [])
+
+    def test_rejects_unsafe_target_base(self):
+        ro, writer, calls = self._fakes()
+        for bad in ("a b; rm", "../evil", "-main", "a:b", "a\\b", "feat/", "/lead"):
+            with self.assertRaises(ValueError):
+                self._call(ro, writer, target_base=bad,
+                           confirmation="RETARGET #9 TO %s" % bad)      # even matching confirmation -> refused
+        self.assertEqual(calls, [])                            # unsafe ref never reaches the writer
+
+    def test_rejects_head_mismatch(self):
+        ro, writer, calls = self._fakes(head="zzz9999")
+        with self.assertRaises(ValueError):
+            self._call(ro, writer)                             # expected abc1234 != zzz9999
+        self.assertEqual(calls, [])
+        self.assertEqual(self._audit_lines()[-1]["result"], "refused")
+
+    def test_rejects_current_base_mismatch(self):
+        ro, writer, calls = self._fakes(base="something-else")
+        with self.assertRaises(ValueError) as cm:
+            self._call(ro, writer)                             # expected feat/parent != something-else
+        self.assertIn("base changed", str(cm.exception))
+        self.assertEqual(calls, [])
+
+    def test_rejects_non_open_pr(self):
+        ro, writer, calls = self._fakes(state="MERGED")
+        with self.assertRaises(ValueError):
+            self._call(ro, writer)
+        self.assertEqual(calls, [])
+
+    def test_rejects_pr_not_in_needs_retarget(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError) as cm:
+            self._call(ro, writer, candidates=[3, 4])          # #9 not a needs_retarget candidate
+        self.assertIn("needs_retarget", str(cm.exception))
+        self.assertEqual(calls, [])
+
+    def test_rejects_target_disagreeing_with_planner(self):
+        ro, writer, calls = self._fakes()
+        with self.assertRaises(ValueError) as cm:
+            self._call(ro, writer, candidates=[9], targets={"9": "develop"})   # planner says develop
+        self.assertIn("retarget_to", str(cm.exception))
+        self.assertEqual(calls, [])                            # submitted 'main' != planner 'develop'
+
+    def test_candidate_and_target_match_proceeds(self):
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer, candidates=[5, 9], targets={"9": "main"})
+        self.assertTrue(res["ok"])
+        self.assertEqual(calls, [(9, "main", True)])
+
+    def test_rejects_bad_pr_number(self):
+        ro, writer, _ = self._fakes()
+        for bad in ("0", "-1", "abc", ""):
+            with self.assertRaises(ValueError):
+                self._call(ro, writer, pr_number=bad, confirmation="RETARGET #%s TO main" % bad)
+
+    def test_failed_write_audits_failure_with_bases(self):
+        ro, writer, calls = self._fakes(write_ok=False)
+        res = self._call(ro, writer)
+        self.assertFalse(res["ok"])
+        self.assertEqual(calls, [(9, "main", True)])           # attempted
+        rec = self._audit_lines()[-1]
+        self.assertEqual(rec["result"], "failure")
+        self.assertEqual(rec["from_base"], "feat/parent")
+        self.assertEqual(rec["to_base"], "main")
+
+    def test_audit_failure_does_not_mask_successful_retarget(self):
+        bogus = os.path.join(self.tmp, "audit_is_a_file")
+        with open(bogus, "w", encoding="utf-8") as f:
+            f.write("x")
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer, audit_dir=bogus)          # makedirs(bogus) raises -> swallowed
+        self.assertTrue(res["ok"])                             # success not masked by the audit failure
+        self.assertEqual(calls, [(9, "main", True)])
+
+    def test_does_not_mutate_orchestrator_state(self):
+        # retarget must NOT write requested_head / converged / done — it touches NO orchestrator state
+        import devflow.tools.review_orchestrator as orch
+        ro, writer, calls = self._fakes()
+        with mock.patch.object(orch, "save_state") as save:
+            res = self._call(ro, writer)
+        self.assertTrue(res["ok"])
+        save.assert_not_called()
+
+    def test_success_clears_codex_post_dedup_marker(self):
+        # Codex PR#17 R3: the base change makes a prior @codex review (same head) stale, so the operator's
+        # follow-up review request must NOT be skipped as a duplicate — clear _POSTED[(repo, n)] on success
+        dw._POSTED[("owner/repo", 9)] = "abc1234"           # a prior post at this (unchanged) head
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer)
+        self.assertTrue(res["ok"])
+        self.assertNotIn(("owner/repo", 9), dw._POSTED)      # marker cleared -> re-request will post
+
+    def test_failed_retarget_keeps_dedup_marker(self):
+        dw._POSTED[("owner/repo", 9)] = "abc1234"
+        ro, writer, calls = self._fakes(write_ok=False)
+        res = self._call(ro, writer)
+        self.assertFalse(res["ok"])
+        self.assertIn(("owner/repo", 9), dw._POSTED)         # no clear on a failed write
+
+
 class CodexReviewServiceCandidatesTests(unittest.TestCase):
     """`service.request_codex_review` recomputes the CURRENT request_review candidates and passes them
     to the guarded helper (least authority — a stale form can't target an arbitrary OPEN PR)."""
@@ -2296,6 +2550,48 @@ class CodexReviewServiceCandidatesTests(unittest.TestCase):
         ro.assert_called_once_with("o/r", limit="80")
         self.assertEqual(list(mk.call_args[1]["candidates"]), [9, 12])
         self.assertTrue(mk.call_args[1]["live"])
+
+    def test_retarget_passes_needs_retarget_candidates_targets_and_limit(self):
+        # the retarget write may only target the CURRENT needs_retarget set, to the planner's exact target
+        plan = {"plan": {"needs_retarget": [9, 12], "retarget_to": {"9": "main", "12": "develop"}}}
+        with mock.patch.object(service, "run_orchestrator", return_value=plan) as ro, \
+             mock.patch.object(service.dashboard_writes, "retarget_pr_base",
+                               return_value={"ok": True, "pr_number": 9}) as rt:
+            service.retarget_pr_base("o/r", "9", "abc", "feat/parent", "main",
+                                     "RETARGET #9 TO main", limit="80")
+        ro.assert_called_once_with("o/r", limit="80")
+        self.assertEqual(list(rt.call_args[1]["candidates"]), [9, 12])
+        self.assertEqual(rt.call_args[1]["targets"], {"9": "main", "12": "develop"})
+        self.assertTrue(rt.call_args[1]["live"])
+
+    def test_gh_error_during_retarget_recompute_is_audited_as_failure(self):
+        from devflow.tools.github_cli import GhError
+        tmp = tempfile.mkdtemp(prefix="svc_aud3_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        audit = os.path.join(tmp, "actions")
+        with mock.patch.object(service, "run_orchestrator", side_effect=GhError("gh down")):
+            with self.assertRaises(GhError):
+                service.retarget_pr_base("o/r", "9", "abc", "feat/parent", "main",
+                                         "RETARGET #9 TO main", audit_dir=audit)
+        rec = self._audit_lines(audit)[-1]
+        self.assertEqual(rec["action"], "retarget_pr_base")
+        self.assertEqual(rec["result"], "failure")
+        self.assertIn("plan recompute failed", rec["reason"])
+
+    def test_valueerror_during_retarget_recompute_is_audited(self):
+        # Codex PR#17 R3: a ValueError from the recompute (e.g. empty repo) must ALSO be audited before
+        # re-raising — the helper's own audited gates never run in that case, so the trail would miss it
+        tmp = tempfile.mkdtemp(prefix="svc_rt_ve_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        audit = os.path.join(tmp, "actions")
+        with mock.patch.object(service, "run_orchestrator", side_effect=ValueError("repo is required")):
+            with self.assertRaises(ValueError):
+                service.retarget_pr_base("", "9", "abc", "feat/parent", "main",
+                                         "RETARGET #9 TO main", audit_dir=audit)
+        rec = self._audit_lines(audit)[-1]
+        self.assertEqual(rec["action"], "retarget_pr_base")
+        self.assertEqual(rec["result"], "failure")
+        self.assertIn("plan recompute failed", rec["reason"])
 
     def _audit_lines(self, audit_dir):
         p = os.path.join(audit_dir, dw.AUDIT_FILE)
@@ -2386,6 +2682,9 @@ class WritesEnabledHttpTests(DashboardBase):
         self.assertIn("Post @codex review", body)
         self.assertNotIn("never mutates GitHub", body)            # no contradictory read-only claim
         self.assertNotIn("the dashboard never posts it", body)
+        # Codex PR#17 F2: the write-mode copy must acknowledge the retarget button, not deny it
+        self.assertIn("Retarget base", body)
+        self.assertNotIn("never retargets", body)                # the read-only-only claim must be gone
 
     def test_duplicate_post_shows_honest_not_posted_message(self):
         # an idempotent no-op must NOT claim "Posted" (Codex R3 P1 honesty)
@@ -2428,6 +2727,37 @@ class WritesEnabledHttpTests(DashboardBase):
         self.assertEqual(r.status, 200)
         self.assertIn("Mark-ready refused", html)
         self.assertIn("not a draft", html)
+
+    def test_retarget_success_message(self):
+        with mock.patch.object(service, "retarget_pr_base",
+                               return_value={"ok": True, "pr_number": 9, "head_sha": "abc1234",
+                                             "from_base": "feat/parent", "to_base": "main"}) as m:
+            r = self._post_path("/retarget-pr",
+                                {"repo": "owner/repo", "pr_number": "9", "expected_head_sha": "abc1234",
+                                 "expected_current_base": "feat/parent", "target_base": "main",
+                                 "confirmation": "RETARGET #9 TO main", "limit": "50"})
+            html = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Retargeted #9", html)
+        self.assertIn("feat/parent", html)
+        self.assertIn("main", html)
+        self.assertIn("Not merged", html)                        # makes clear it did NOT merge
+        m.assert_called_once()
+        # the handler forwards exactly the operator-supplied fields
+        args = m.call_args[0]
+        self.assertEqual(args[0], "owner/repo")
+
+    def test_retarget_refusal_is_shown_not_raised(self):
+        with mock.patch.object(service, "retarget_pr_base",
+                               side_effect=ValueError("PR #9 base changed (now main, expected feat/parent)")):
+            r = self._post_path("/retarget-pr",
+                                {"repo": "owner/repo", "pr_number": "9", "expected_head_sha": "abc1234",
+                                 "expected_current_base": "feat/parent", "target_base": "main",
+                                 "confirmation": "RETARGET #9 TO main"})
+            html = r.read().decode("utf-8")
+        self.assertEqual(r.status, 200)
+        self.assertIn("Retarget refused", html)
+        self.assertIn("base changed", html)
 
 
 if __name__ == "__main__":

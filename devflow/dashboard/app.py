@@ -152,6 +152,46 @@ def _mark_ready_forms(repo, nums, prs_by_num, limit=50) -> str:
             + "".join(rows))
 
 
+def _retarget_forms(repo, nums, targets, prs_by_num, limit=50) -> str:
+    """Strongly-confirmed 'retarget base' forms (one per needs_retarget PR). Each runs EXACTLY
+    ``gh pr edit --base <target>`` to the planner's computed target — never merges/rebases/pushes. The
+    head + current base are pinned and a PR+target-specific confirmation phrase is required. ``limit`` is
+    carried through so the POST-time recompute matches."""
+    rows = []
+    for n in nums:
+        pr = prs_by_num.get(n) or {}
+        head = pr.get("head") or ""
+        cur_base = pr.get("base_ref") or ""
+        target = (targets or {}).get(str(n)) or ""
+        if not target:
+            continue                                    # no computed target -> nothing safe to offer
+        conf = "RETARGET #%s TO %s" % (n, target)
+        rows.append(
+            "<form method='post' action='/retarget-pr' style='margin:8px 0'>"
+            "<input type='hidden' name='repo' value='%s'>"
+            "<input type='hidden' name='pr_number' value='%s'>"
+            "<input type='hidden' name='expected_head_sha' value='%s'>"
+            "<input type='hidden' name='expected_current_base' value='%s'>"
+            "<input type='hidden' name='target_base' value='%s'>"
+            "<input type='hidden' name='limit' value='%s'>"
+            "<strong>#%s</strong> <span class='muted'>base <code>%s</code> &rarr; <code>%s</code></span> "
+            "— type <code>%s</code>: <input type='text' name='confirmation' autocomplete='off' size='36' "
+            "placeholder='%s' required> <button type='submit'>Retarget base to %s</button></form>"
+            % (e(repo), e(n), e(head), e(cur_base), e(target), e(limit),
+               e(n), e(cur_base), e(target), e(conf), e(conf), e(target)))
+    return ("<p class='note'>Each button performs a <strong>real</strong> GitHub write — it changes the "
+            "PR's <strong>base branch</strong> to the exact target the planner computed (runs "
+            "<code>gh pr edit --base</code>) and nothing else. It does <strong>not</strong> merge, rebase "
+            "locally, push, force-push, delete branches, or request reviewers. It is refused unless the "
+            "PR is still OPEN, still in needs_retarget, its head and current base still match, the target "
+            "equals the planner's, and the confirmation is exact. Afterwards the PR diff has changed, so "
+            "<strong>re-request <code>@codex review</code></strong> (any prior review is stale against the "
+            "new base) and recompute the Review Queue. (Honest caveat: like editing <em>any</em> PR, "
+            "changing the base can trigger the <strong>target repo's own</strong> "
+            "<code>pull_request: edited</code> workflows if defined — inherent to a base edit; the "
+            "dashboard itself never invokes GitHub Actions.)</p>" + "".join(rows))
+
+
 def _render_orchestration(result: dict, allow_writes: bool = False, limit: int = 50) -> str:
     """Render the read-only orchestration plan as escaped cards + a ranking table + a raw debug blob.
     Recommends actions only; emits NO merge/comment/retarget buttons."""
@@ -242,9 +282,12 @@ def _render_orchestration(result: dict, allow_writes: bool = False, limit: int =
                    "<pre>@codex review</pre>")
 
     rt_to = plan.get("retarget_to") or {}
-    rt_html = chips(plan.get("needs_retarget"),
-                    extra=lambda n: "retarget base &rarr; <code>%s</code>"
+    nr = plan.get("needs_retarget") or []
+    rt_html = chips(nr, extra=lambda n: "retarget base &rarr; <code>%s</code>"
                     % e(rt_to.get(str(n)) or result.get("default_branch")))
+    # the retarget write lives INSIDE the "Needs retarget" card — the only bucket it may target
+    if allow_writes and nr:
+        rt_html += _retarget_forms(result.get("repo"), nr, rt_to, prs_by_num, limit)
 
     mn_html = chips(plan.get("mergeable_now"))
     if plan.get("mergeable_now"):
@@ -274,8 +317,9 @@ def _render_orchestration(result: dict, allow_writes: bool = False, limit: int =
         rtm_html += _mark_ready_forms(result.get("repo"), rtm, prs_by_num, limit)
 
     banner = (_alert("info", "GitHub writes ENABLED (localhost, opt-in): post @codex review to "
-                             "request_review PRs, and mark a ready_then_merge DRAFT ready for review. "
-                             "These are the ONLY writes — no merge/retarget/reviewer/close/push/delete.")
+                             "request_review PRs, mark a ready_then_merge DRAFT ready, and retarget a "
+                             "needs_retarget PR's base to the planner's target. These are the ONLY writes "
+                             "— no merge/reviewer/close/push/force-push/delete.")
               if allow_writes else "")
 
     return (
@@ -482,9 +526,10 @@ class DashboardServer(ThreadingHTTPServer):
             self.address_family = socket.AF_INET6
         super().__init__(addr, handler)
         self.allowed_hosts = set(allowed_hosts)
-        # the ONE opt-in real-GitHub-write capability (post @codex review). Enforce the localhost-only
-        # boundary HERE (not just in main()) so an embedding/test harness calling run_server() directly
-        # can't enable writes on a non-loopback bind: writes stay off unless the bind host is a loopback.
+        # the opt-in real-GitHub-write capabilities (post @codex review / mark ready / retarget base).
+        # Enforce the localhost-only boundary HERE (not just in main()) so an embedding/test harness
+        # calling run_server() directly can't enable writes on a non-loopback bind: writes stay off
+        # unless the bind host is a loopback.
         self.allow_writes = _writes_allowed_for_host(addr[0], allow_writes)
 
 
@@ -628,6 +673,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_codex_review_request(form)
         if path == "/mark-ready":
             return self._post_mark_ready(form)
+        if path == "/retarget-pr":
+            return self._post_retarget(form)
         if path == "/decide":
             return self._post_decide(form)
         if path == "/export":
@@ -729,19 +776,22 @@ class Handler(BaseHTTPRequestHandler):
         # mode-aware copy: the page's own header/intro/note must NOT claim "read-only / never posts" when
         # the opt-in @codex review write button is live, or an operator could think the button is dry-run.
         if getattr(self.server, "allow_writes", False):
-            mode_tag = "(writes ENABLED — post @codex review · mark draft ready)"
+            mode_tag = "(writes ENABLED — post @codex review · mark draft ready · retarget base)"
             intro = ("Shows the same cross-PR plan as <code>orchestrate-reviews</code>. The plan is "
-                     "advisory with <strong>two exceptions</strong>: GitHub writes are "
+                     "advisory with <strong>three exceptions</strong>: GitHub writes are "
                      "<strong>enabled</strong> for this localhost session — each <em>request review</em> PR "
                      "has a <strong>Post @codex review</strong> button (posts the exact comment "
-                     "<code>@codex review</code>), and each <em>ready then merge</em> DRAFT has a "
-                     "<strong>Mark ready for review</strong> button (runs <code>gh pr ready</code>). Both "
-                     "require a typed confirmation + head-match. Neither merges; it still never retargets, "
-                     "requests reviewers, closes, pushes, or deletes branches. This is not a merge UI.")
+                     "<code>@codex review</code>), each <em>ready then merge</em> DRAFT has a "
+                     "<strong>Mark ready for review</strong> button (runs <code>gh pr ready</code>), and "
+                     "each <em>needs retarget</em> PR has a <strong>Retarget base</strong> button (runs "
+                     "<code>gh pr edit --base</code> to the planner's exact target — base only). All three "
+                     "require a typed confirmation + head-match. None merges; it still never rebases, "
+                     "requests reviewers, closes, pushes, force-pushes, or deletes branches. Not a merge UI.")
             form_note = ("Requires <code>gh</code> installed and authenticated. Computing the plan is "
                          "read-only. <em>Request review</em> PRs offer a real <code>@codex review</code> "
-                         "post; <em>ready then merge</em> drafts offer a real <strong>mark ready</strong> "
-                         "(not a merge). Mergeable PRs show a human merge-preflight note, not a merge button.")
+                         "post; <em>ready then merge</em> drafts offer a real <strong>mark ready</strong>; "
+                         "<em>needs retarget</em> PRs offer a real <strong>base retarget</strong> — none "
+                         "merges. Mergeable PRs show a human merge-preflight note, not a merge button.")
         else:
             mode_tag = "(read-only orchestrator)"
             intro = ("Shows the same cross-PR plan as <code>orchestrate-reviews</code>: who to request "
@@ -914,6 +964,33 @@ class Handler(BaseHTTPRequestHandler):
             notice = _alert("err", "Mark-ready failed: %s" % res.get("error"))
         self._write_result_page(notice)
 
+    def _post_retarget(self, form):
+        # GATE: writes must be enabled at startup (--allow-github-writes + localhost bind). Host + CSRF
+        # checks already ran for this POST. Nothing is written unless allow_writes is True.
+        if not getattr(self.server, "allow_writes", False):
+            return self._forbidden_writes()
+        repo = form.get("repo", "")
+        try:
+            res = service.retarget_pr_base(repo, form.get("pr_number", ""),
+                                           form.get("expected_head_sha", ""),
+                                           form.get("expected_current_base", ""),
+                                           form.get("target_base", ""),
+                                           form.get("confirmation", ""),
+                                           limit=form.get("limit"))
+        except ValueError as ex:
+            return self._write_result_page(_alert("err", "Retarget refused: %s" % ex))
+        except GhError as ex:
+            return self._write_result_page(_alert("err", "gh error: %s" % ex))
+        if res.get("ok"):
+            # _alert escapes the whole message; from_base/to_base are validated safe refs regardless
+            notice = _alert("ok", "Retargeted #%s base %s -> %s. Not merged. The base change alters the PR "
+                            "diff, so any prior Codex review is now STALE — re-request @codex review and "
+                            "recompute the Review Queue before merging."
+                            % (res.get("pr_number"), res.get("from_base"), res.get("to_base")))
+        else:
+            notice = _alert("err", "Retarget failed: %s" % res.get("error"))
+        self._write_result_page(notice)
+
     def _write_result_page(self, notice):
         self._send_html(_render("message.html", title="GitHub write", heading="GitHub write",
                                 body=notice + "<p><a href='/orchestrator'>&larr; back to Review Queue</a></p>"))
@@ -991,8 +1068,8 @@ def _allowed_hosts(host: str) -> set:
 def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                allow_writes: bool = False) -> DashboardServer:
     """Build (but do not serve) the dashboard server bound to ``host:port``. Caller serves it.
-    ``allow_writes`` enables the single opt-in GitHub-write control (post @codex review) — callers must
-    pass it True ONLY for a localhost bind (main() enforces this)."""
+    ``allow_writes`` enables the opt-in GitHub-write controls (post @codex review / mark ready / retarget
+    base) — callers must pass it True ONLY for a localhost bind (the factory also enforces this)."""
     httpd = DashboardServer((host, port), Handler, _allowed_hosts(host), allow_writes=allow_writes)
     return httpd
 
@@ -1025,15 +1102,16 @@ def main(argv=None) -> int:
     p.add_argument("--open", action="store_true",
                    help="after starting, open the dashboard URL in your browser (localhost binds only)")
     p.add_argument("--allow-github-writes", action="store_true",
-                   help="opt-in: enable the ONE real GitHub-write control (post '@codex review' from the "
-                        "Review Queue, with typed confirmation). Localhost binds ONLY; off by default")
+                   help="opt-in: enable the 3 narrow GitHub-write controls (post '@codex review' / mark a "
+                        "draft ready / retarget base) from the Review Queue, each with typed confirmation. "
+                        "Localhost binds ONLY; off by default")
     args = p.parse_args(argv)
     is_local = args.host.strip().lower() in _LOCALHOST_NAMES
     if not is_local:
         sys.stderr.write(
             "[dashboard] WARNING: binding %s is NOT localhost. This dashboard is a local dev tool "
             "with no authentication — do not expose it on an untrusted network.\n" % args.host)
-    # the ONE opt-in write capability is enabled ONLY with the flag AND a localhost bind.
+    # the opt-in write capabilities are enabled ONLY with the flag AND a localhost bind.
     allow_writes = bool(args.allow_github_writes) and is_local
     if args.allow_github_writes and not is_local:
         sys.stderr.write(
@@ -1043,7 +1121,7 @@ def main(argv=None) -> int:
     host_disp = "[%s]" % args.host if ":" in args.host else args.host    # bracket an IPv6 literal for the URI
     url = "http://%s:%d" % (host_disp, httpd.server_address[1])          # ACTUAL bound port (handles --port 0)
     print("[dashboard] serving on %s  (Ctrl-C to stop; localhost-only; %s)"
-          % (url, "GitHub writes ENABLED (post @codex review only)" if allow_writes
+          % (url, "GitHub writes ENABLED (post @codex review / mark ready / retarget base)" if allow_writes
              else "read-only / dry-run"))
     if args.open:
         # convenience only, stdlib webbrowser (no shell). NEVER auto-open a non-localhost bind.
