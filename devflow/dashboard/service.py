@@ -439,3 +439,31 @@ def mark_ready_for_review(repo, pr_number, expected_head_sha, confirmation, *,
         dashboard_writes.audit_failure(dashboard_writes.MARK_READY_ACTION, repo, pr_number,
                                        "gh error: %s" % ex, audit_dir=audit_dir)
         raise
+
+
+def _current_needs_retarget(repo, limit=None):
+    """Recompute (READ-ONLY) the CURRENT ``needs_retarget`` PR numbers AND the planner's ``retarget_to``
+    map (pr -> exact target base). The retarget write may only target one of these PRs, and only to the
+    exact base the planner computed (least authority). ``limit`` MUST be the window the page used."""
+    result = run_orchestrator(repo, limit=limit if limit is not None else ORCH_LIMIT_DEFAULT)
+    plan = result.get("plan") or {}
+    return list(plan.get("needs_retarget") or []), dict(plan.get("retarget_to") or {})
+
+
+def retarget_pr_base(repo, pr_number, expected_head_sha, expected_current_base, target_base,
+                     confirmation, *, limit=None, audit_dir=None) -> dict:
+    """Retarget a PR's base branch. The APP gates this on --allow-github-writes + localhost BEFORE calling
+    here; this recomputes the CURRENT needs_retarget set + retarget_to map server-side (using the SAME
+    ``limit`` the page was rendered with, so a stale/tampered form can only retarget a PR the planner
+    still lists, and only to the planner's exact target) and delegates the confirmation / head / base /
+    OPEN / safe-ref / fixed-shape gating to the guarded writer. This does NOT merge and touches no
+    orchestrator state. Returns the helper result; raises ValueError on a gate failure, GhError on gh."""
+    try:
+        candidates, targets = _current_needs_retarget(repo, limit=limit)
+        return dashboard_writes.retarget_pr_base(
+            repo, pr_number, expected_head_sha, expected_current_base, target_base, confirmation,
+            live=True, candidates=candidates, targets=targets, audit_dir=audit_dir)
+    except GhError as ex:
+        dashboard_writes.audit_failure(dashboard_writes.RETARGET_ACTION, repo, pr_number,
+                                       "gh error: %s" % ex, audit_dir=audit_dir)
+        raise

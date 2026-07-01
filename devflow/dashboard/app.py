@@ -152,6 +152,42 @@ def _mark_ready_forms(repo, nums, prs_by_num, limit=50) -> str:
             + "".join(rows))
 
 
+def _retarget_forms(repo, nums, targets, prs_by_num, limit=50) -> str:
+    """Strongly-confirmed 'retarget base' forms (one per needs_retarget PR). Each runs EXACTLY
+    ``gh pr edit --base <target>`` to the planner's computed target — never merges/rebases/pushes. The
+    head + current base are pinned and a PR+target-specific confirmation phrase is required. ``limit`` is
+    carried through so the POST-time recompute matches."""
+    rows = []
+    for n in nums:
+        pr = prs_by_num.get(n) or {}
+        head = pr.get("head") or ""
+        cur_base = pr.get("base_ref") or ""
+        target = (targets or {}).get(str(n)) or ""
+        if not target:
+            continue                                    # no computed target -> nothing safe to offer
+        conf = "RETARGET #%s TO %s" % (n, target)
+        rows.append(
+            "<form method='post' action='/retarget-pr' style='margin:8px 0'>"
+            "<input type='hidden' name='repo' value='%s'>"
+            "<input type='hidden' name='pr_number' value='%s'>"
+            "<input type='hidden' name='expected_head_sha' value='%s'>"
+            "<input type='hidden' name='expected_current_base' value='%s'>"
+            "<input type='hidden' name='target_base' value='%s'>"
+            "<input type='hidden' name='limit' value='%s'>"
+            "<strong>#%s</strong> <span class='muted'>base <code>%s</code> &rarr; <code>%s</code></span> "
+            "— type <code>%s</code>: <input type='text' name='confirmation' autocomplete='off' size='36' "
+            "placeholder='%s' required> <button type='submit'>Retarget base to %s</button></form>"
+            % (e(repo), e(n), e(head), e(cur_base), e(target), e(limit),
+               e(n), e(cur_base), e(target), e(conf), e(conf), e(target)))
+    return ("<p class='note'>Each button performs a <strong>real</strong> GitHub write — it changes the "
+            "PR's <strong>base branch</strong> to the exact target the planner computed (runs "
+            "<code>gh pr edit --base</code>) and nothing else. It does <strong>not</strong> merge, rebase "
+            "locally, push, force-push, delete branches, or request reviewers. It is refused unless the "
+            "PR is still OPEN, still in needs_retarget, its head and current base still match, the target "
+            "equals the planner's, and the confirmation is exact. Recompute the Review Queue "
+            "afterwards.</p>" + "".join(rows))
+
+
 def _render_orchestration(result: dict, allow_writes: bool = False, limit: int = 50) -> str:
     """Render the read-only orchestration plan as escaped cards + a ranking table + a raw debug blob.
     Recommends actions only; emits NO merge/comment/retarget buttons."""
@@ -242,9 +278,12 @@ def _render_orchestration(result: dict, allow_writes: bool = False, limit: int =
                    "<pre>@codex review</pre>")
 
     rt_to = plan.get("retarget_to") or {}
-    rt_html = chips(plan.get("needs_retarget"),
-                    extra=lambda n: "retarget base &rarr; <code>%s</code>"
+    nr = plan.get("needs_retarget") or []
+    rt_html = chips(nr, extra=lambda n: "retarget base &rarr; <code>%s</code>"
                     % e(rt_to.get(str(n)) or result.get("default_branch")))
+    # the retarget write lives INSIDE the "Needs retarget" card — the only bucket it may target
+    if allow_writes and nr:
+        rt_html += _retarget_forms(result.get("repo"), nr, rt_to, prs_by_num, limit)
 
     mn_html = chips(plan.get("mergeable_now"))
     if plan.get("mergeable_now"):
@@ -274,8 +313,9 @@ def _render_orchestration(result: dict, allow_writes: bool = False, limit: int =
         rtm_html += _mark_ready_forms(result.get("repo"), rtm, prs_by_num, limit)
 
     banner = (_alert("info", "GitHub writes ENABLED (localhost, opt-in): post @codex review to "
-                             "request_review PRs, and mark a ready_then_merge DRAFT ready for review. "
-                             "These are the ONLY writes — no merge/retarget/reviewer/close/push/delete.")
+                             "request_review PRs, mark a ready_then_merge DRAFT ready, and retarget a "
+                             "needs_retarget PR's base to the planner's target. These are the ONLY writes "
+                             "— no merge/reviewer/close/push/force-push/delete.")
               if allow_writes else "")
 
     return (
@@ -628,6 +668,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._post_codex_review_request(form)
         if path == "/mark-ready":
             return self._post_mark_ready(form)
+        if path == "/retarget-pr":
+            return self._post_retarget(form)
         if path == "/decide":
             return self._post_decide(form)
         if path == "/export":
@@ -912,6 +954,31 @@ class Handler(BaseHTTPRequestHandler):
                             % res.get("pr_number"))
         else:
             notice = _alert("err", "Mark-ready failed: %s" % res.get("error"))
+        self._write_result_page(notice)
+
+    def _post_retarget(self, form):
+        # GATE: writes must be enabled at startup (--allow-github-writes + localhost bind). Host + CSRF
+        # checks already ran for this POST. Nothing is written unless allow_writes is True.
+        if not getattr(self.server, "allow_writes", False):
+            return self._forbidden_writes()
+        repo = form.get("repo", "")
+        try:
+            res = service.retarget_pr_base(repo, form.get("pr_number", ""),
+                                           form.get("expected_head_sha", ""),
+                                           form.get("expected_current_base", ""),
+                                           form.get("target_base", ""),
+                                           form.get("confirmation", ""),
+                                           limit=form.get("limit"))
+        except ValueError as ex:
+            return self._write_result_page(_alert("err", "Retarget refused: %s" % ex))
+        except GhError as ex:
+            return self._write_result_page(_alert("err", "gh error: %s" % ex))
+        if res.get("ok"):
+            # _alert escapes the whole message; from_base/to_base are validated safe refs regardless
+            notice = _alert("ok", "Retargeted #%s base %s -> %s. (Not merged — recompute the Review Queue.)"
+                            % (res.get("pr_number"), res.get("from_base"), res.get("to_base")))
+        else:
+            notice = _alert("err", "Retarget failed: %s" % res.get("error"))
         self._write_result_page(notice)
 
     def _write_result_page(self, notice):

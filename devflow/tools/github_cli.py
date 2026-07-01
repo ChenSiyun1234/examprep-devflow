@@ -671,12 +671,34 @@ _ALLOWED_WRITE_PREFIXES = {
     ("pr", "create"),
     ("pr", "comment"),
     ("pr", "ready"),          # mark a DRAFT pr ready for review — un-draft only (NEVER --undo / draft)
+    ("pr", "edit"),           # ONLY the exact base-retarget shape — enforced by _assert_write_allowed
 }
 _FORBIDDEN_WRITE_TOKENS = {
     "merge", "delete", "--delete", "-d", "-D", "--force", "-f",
     "--force-with-lease", "push", "close", "--admin",
     "undo", "--undo",        # `pr ready --undo` converts BACK to draft — forbidden (mark-ready is one-way)
 }
+# `pr edit` is NOT a generic editor here: the ONLY flags it may carry are ``-R`` (repo) and ``--base``
+# (retarget). Any other pr-edit flag (--title/--body/--add-reviewer/--state/--draft/--ready/…) is refused,
+# so `pr edit` can only ever change the base branch — never title/body/reviewers/state/draft.
+_PR_EDIT_ALLOWED_FLAGS = {"-r", "--base"}
+
+# a safe base-branch / ref name for --base: only [A-Za-z0-9._/-], no leading '-'/'/', no trailing '/',
+# no '..', no whitespace/backslash/':'/control chars/shell metachars (the charset already excludes them).
+_BRANCH_CHARSET = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def is_safe_base_ref(name) -> bool:
+    """True iff ``name`` is a safe, simple branch/ref name usable as a ``--base`` value: non-empty,
+    only ``[A-Za-z0-9._/-]`` (so no whitespace, backslash, ``:``, control chars or shell metacharacters),
+    not starting with ``-`` or ``/``, not ending with ``/``, and containing no ``..``."""
+    if not name or not isinstance(name, str) or len(name) > 255:
+        return False
+    if not _BRANCH_CHARSET.match(name):
+        return False
+    if name.startswith("-") or name.startswith("/") or name.endswith("/") or ".." in name:
+        return False
+    return True
 # obvious secret/token shapes — refuse to post content that looks like a credential.
 # Covers all GitHub token prefixes (ghp_/gho_/ghu_/ghs_/ghr_ + fine-grained github_pat_),
 # AWS keys, Slack tokens, Google API keys, and PEM private keys.
@@ -696,14 +718,24 @@ def _norm_token(a: str) -> str:
 
 
 def _assert_write_allowed(args: list[str]) -> None:
-    """Refuse any write that is not an allow-listed create/comment/ready, or that smells like
-    merge/delete/force-push/undo. The single write-safety chokepoint."""
-    if tuple(args[:2]) not in _ALLOWED_WRITE_PREFIXES:
+    """Refuse any write that is not an allow-listed create/comment/ready/base-retarget, or that smells
+    like merge/delete/force-push/undo. The single write-safety chokepoint."""
+    prefix = tuple(args[:2])
+    if prefix not in _ALLOWED_WRITE_PREFIXES:
         raise GhError(f"refused: write op not in allow-list: {' '.join(args[:2]) or '(empty)'}")
     low = {_norm_token(a) for a in args}
     bad = low & _FORBIDDEN_WRITE_TOKENS
     if bad:
         raise GhError(f"refused: forbidden token(s) in write op: {sorted(bad)}")
+    if prefix == ("pr", "edit"):
+        # `pr edit` is permitted ONLY for base retarget: the sole flags may be -R and --base. Any other
+        # flag (title/body/reviewer/state/draft/ready/milestone/…) turns this into a generic editor — reject.
+        flags = {_norm_token(a) for a in args if a.startswith("-")}
+        extra = flags - _PR_EDIT_ALLOWED_FLAGS
+        if extra:
+            raise GhError(f"refused: `pr edit` may only retarget the base (-R/--base); got {sorted(extra)}")
+        if "--base" not in flags:
+            raise GhError("refused: `pr edit` is allowed only to set --base (base retarget)")
 
 
 def _assert_no_secrets(*texts: Optional[str]) -> None:
@@ -828,3 +860,17 @@ class GitHubWriter:
         args = ["pr", "ready", str(int(pr_number)), "-R", self.repo]
         sim = {"ready": True, "simulated": True}
         return self._exec(args, "mark_pr_ready", f"mark PR #{pr_number} ready for review", sim)
+
+    def retarget_pr_base(self, pr_number: int, target_base: str) -> dict:
+        """Change a PR's base branch: EXACTLY ``gh pr edit <pr> -R <repo> --base <target_base>`` — and
+        nothing else. NOT a generic ``pr edit``: the guard rejects any pr-edit flag other than -R/--base,
+        so title/body/reviewers/state/draft are never touched, and there is no merge/close/push. The base
+        must be a safe simple branch name (validated here as defense-in-depth; the dashboard also checks)."""
+        if not is_safe_base_ref(target_base):
+            self.calls.append({"op": "retarget_pr_base", "args": [], "live": self.live, "executed": False})
+            return {"executed": False, "error": "refused: unsafe base ref %r" % (target_base,),
+                    "log": "[github-write:REFUSED] retarget PR #%s base :: unsafe ref" % pr_number}
+        args = ["pr", "edit", str(int(pr_number)), "-R", self.repo, "--base", str(target_base)]
+        sim = {"retargeted": True, "base": str(target_base), "simulated": True}
+        return self._exec(args, "retarget_pr_base",
+                          f"retarget PR #{pr_number} base -> {target_base}", sim)

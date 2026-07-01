@@ -62,6 +62,51 @@ class TestWriteGuard(unittest.TestCase):
         self.assertTrue(res.get("dry_run"))
         self.assertEqual(w.calls[-1]["args"], ["pr", "ready", "7", "-R", "o/r"])
 
+    def test_retarget_base_exact_shape_is_allowed(self):
+        _assert_write_allowed(["pr", "edit", "9", "-R", "o/r", "--base", "main"])   # base-retarget only
+
+    def test_generic_pr_edit_flags_are_refused(self):
+        # `pr edit` is permitted ONLY for --base; anything else makes it a generic editor / missing --base
+        for bad in (["pr", "edit", "9", "-R", "o/r", "--title", "x"],
+                    ["pr", "edit", "9", "-R", "o/r", "--body", "x"],
+                    ["pr", "edit", "9", "-R", "o/r", "--base", "main", "--add-reviewer", "bob"],
+                    ["pr", "edit", "9", "-R", "o/r", "--base", "main", "--remove-reviewer", "bob"],
+                    ["pr", "edit", "9", "-R", "o/r", "--base", "main", "--milestone", "m"],
+                    ["pr", "edit", "9", "-R", "o/r", "--base=main", "--title=x"],   # valued form too
+                    ["pr", "edit", "9", "-R", "o/r"]):                              # missing --base
+            with self.assertRaises(GhError):
+                _assert_write_allowed(bad)
+
+    def test_pr_merge_close_api_still_refused(self):
+        for bad in (["pr", "merge", "9"], ["pr", "close", "9"],
+                    ["api", "repos/o/r/pulls/9", "-X", "PATCH", "-f", "base=main"]):
+            with self.assertRaises(GhError):
+                _assert_write_allowed(bad)
+
+    def test_is_safe_base_ref(self):
+        for good in ("main", "develop", "feat/x", "release-1.2", "a_b.c", "user/feat/deep"):
+            self.assertTrue(G.is_safe_base_ref(good), good)
+        for bad in ("", None, "   ", "a b", "a;b", "a|b", "a$b", "a&b", "`x`", "a>b", "a<b", "a(b)",
+                    "-lead", "/lead", "trail/", "a..b", "a\\b", "a:b", "a\tb", "a\nb", "x" * 300):
+            self.assertFalse(G.is_safe_base_ref(bad), repr(bad))
+
+    def test_retarget_writer_builds_exact_argv(self):
+        # the ONLY shape the retarget writer constructs is `gh pr edit <n> -R <repo> --base <target>`
+        w = GitHubWriter("o/r", live=False, logger=quiet)
+        res = w.retarget_pr_base(9, "main")
+        self.assertTrue(res.get("dry_run"))
+        self.assertEqual(w.calls[-1]["args"], ["pr", "edit", "9", "-R", "o/r", "--base", "main"])
+        self.assertEqual(res.get("base"), "main")
+
+    def test_retarget_writer_refuses_unsafe_base(self):
+        # an unsafe --base value is refused by the writer BEFORE any exec — never reaches gh
+        w = GitHubWriter("o/r", live=False, logger=quiet)
+        for bad in ("a b; rm -rf", "../evil", "-main", "a:b"):
+            res = w.retarget_pr_base(9, bad)
+            self.assertFalse(res.get("executed"))
+            self.assertIn("unsafe", res.get("error", ""))
+            self.assertFalse(res.get("dry_run"))               # not even simulated
+
     def test_writer_has_no_merge_capability(self):
         w = GitHubWriter("o/r", logger=quiet)
         self.assertFalse(hasattr(w, "merge_pr"))
