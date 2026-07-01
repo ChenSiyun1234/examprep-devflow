@@ -5,25 +5,25 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>$title · DevFlow Dashboard</title>
 <style>
-  :root { --fg:#1c2330; --muted:#6b7686; --bg:#f6f7f9; --card:#fff; --line:#e3e7ee;
-          --accent:#2d6cdf; --ok:#1c7c43; --danger:#b3261e; }
+  :root { --fg:#111; --muted:#666; --bg:#f7f7f7; --card:#fff; --line:#e6e6e6;
+          --accent:#111; --ok:#166534; --danger:#991b1b; }
   * { box-sizing: border-box; }
-  body { margin:0; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  body { margin:0; font:14px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
          color:var(--fg); background:var(--bg); }
-  header { background:var(--card); border-bottom:1px solid var(--line); padding:10px 20px;
+  header { background:var(--card); border-bottom:1px solid var(--line); padding:12px 22px;
            display:flex; align-items:center; gap:18px; flex-wrap:wrap; }
   header .brand { font-weight:700; }
-  header nav a { color:var(--accent); text-decoration:none; margin-right:14px; }
-  header nav a:hover { text-decoration:underline; }
+  header nav a { color:var(--fg); text-decoration:none; margin-right:14px; }
+  header nav a:hover { color:#000; text-decoration:underline; text-underline-offset:3px; }
   header .tag { margin-left:auto; color:var(--muted); font-size:12px; }
-  main { max-width:980px; margin:22px auto; padding:0 20px; }
-  h1 { font-size:20px; margin:0 0 14px; }
+  main { max-width:980px; margin:28px auto; padding:0 22px; }
+  h1 { font-size:22px; margin:0 0 12px; }
   h3 { margin:0 0 8px; } h4 { margin:14px 0 6px; }
   a { color:var(--accent); }
   table { width:100%; border-collapse:collapse; background:var(--card);
           border:1px solid var(--line); border-radius:8px; overflow:hidden; }
   th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
-  thead th { background:#eef1f6; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }
+  thead th { background:#f2f2f2; font-size:12px; text-transform:uppercase; letter-spacing:0; }
   table.kv th { width:170px; color:var(--muted); font-weight:600; }
   .muted { color:var(--muted); }
   .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
@@ -31,32 +31,45 @@
   .card.gate { border-color:var(--accent); }
   form.inline { display:inline-block; margin:6px 8px 0 0; }
   label { display:block; margin:10px 0 4px; font-weight:600; }
-  input[type=text], textarea, select { width:100%; padding:8px; border:1px solid var(--line);
+  input[type=text], textarea, select { width:100%; padding:9px 10px; border:1px solid var(--line);
           border-radius:6px; font:inherit; background:#fff; }
   textarea { min-height:200px; font-family:ui-monospace,Menlo,Consolas,monospace; }
   button { padding:8px 14px; border:1px solid var(--line); border-radius:6px; background:#fff;
            cursor:pointer; font:inherit; }
-  button:hover { background:#f0f3f8; }
+  button:hover { background:#f2f2f2; }
+  button.primary { background:#111; border-color:#111; color:#fff; }
+  button.primary:hover { background:#333; }
   button.ok { border-color:var(--ok); color:var(--ok); }
   button.danger { border-color:var(--danger); color:var(--danger); }
   .checkbox { display:flex; align-items:center; gap:8px; margin-top:10px; }
   .checkbox input { width:auto; }
   pre { background:#0f1729; color:#e6edf7; padding:12px; border-radius:8px; overflow:auto;
         white-space:pre-wrap; word-break:break-word; }
-  code { background:#eef1f6; padding:1px 5px; border-radius:4px; }
+  code { background:#f1f1f1; padding:1px 5px; border-radius:4px; }
   .alert { padding:9px 12px; border-radius:6px; margin:10px 0; border:1px solid var(--line); }
   .alert.ok { background:#e7f5ec; border-color:#bfe3cc; color:var(--ok); }
   .alert.err { background:#fdecea; border-color:#f3c4c0; color:var(--danger); }
-  .alert.info { background:#eaf1fc; border-color:#c6d8f6; color:var(--accent); }
+  .alert.info { background:#f2f2f2; border-color:#dedede; color:var(--fg); }
   .marker { font-weight:700; }
-  .note { background:#fff8e6; border:1px solid #f0e3b8; border-radius:6px; padding:8px 12px;
-          font-size:12px; color:#6a5b1f; }
+  .note { background:#f8f8f8; border:1px solid var(--line); border-radius:6px; padding:8px 12px;
+          font-size:12px; color:var(--muted); }
+  .status-pill { display:inline-block; min-width:96px; text-align:center; border:1px solid var(--line);
+          border-radius:999px; padding:2px 8px; font-size:12px; color:var(--muted); }
+  .status-pill.ok { color:var(--ok); border-color:#c8decf; }
+  .status-pill.warn { color:var(--danger); border-color:#edc7c7; }
+  .radio-line { display:grid; grid-template-columns:auto minmax(120px, 190px) 1fr; gap:10px;
+          align-items:start; margin:10px 0; font-weight:400; }
+  .radio-line input { margin-top:4px; }
+  .radio-line.disabled { color:var(--muted); }
+  .start-form .card { margin:12px 0; }
+  .start-env td:last-child { width:130px; text-align:right; }
 </style>
 </head>
 <body>
 <header>
   <span class="brand">DevFlow Dashboard</span>
   <nav>
+    <a href="/start">Start</a>
     <a href="/">Runs</a>
     <a href="/new">New run</a>
     <a href="/manual">Manual packet</a>
