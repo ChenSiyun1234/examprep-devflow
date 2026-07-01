@@ -184,8 +184,9 @@ def _retarget_forms(repo, nums, targets, prs_by_num, limit=50) -> str:
             "<code>gh pr edit --base</code>) and nothing else. It does <strong>not</strong> merge, rebase "
             "locally, push, force-push, delete branches, or request reviewers. It is refused unless the "
             "PR is still OPEN, still in needs_retarget, its head and current base still match, the target "
-            "equals the planner's, and the confirmation is exact. Recompute the Review Queue "
-            "afterwards.</p>" + "".join(rows))
+            "equals the planner's, and the confirmation is exact. Afterwards the PR diff has changed, so "
+            "<strong>re-request <code>@codex review</code></strong> (any prior review is stale against the "
+            "new base) and recompute the Review Queue.</p>" + "".join(rows))
 
 
 def _render_orchestration(result: dict, allow_writes: bool = False, limit: int = 50) -> str:
@@ -979,7 +980,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._write_result_page(_alert("err", "gh error: %s" % ex))
         if res.get("ok"):
             # _alert escapes the whole message; from_base/to_base are validated safe refs regardless
-            notice = _alert("ok", "Retargeted #%s base %s -> %s. (Not merged — recompute the Review Queue.)"
+            notice = _alert("ok", "Retargeted #%s base %s -> %s. Not merged. The base change alters the PR "
+                            "diff, so any prior Codex review is now STALE — re-request @codex review and "
+                            "recompute the Review Queue before merging."
                             % (res.get("pr_number"), res.get("from_base"), res.get("to_base")))
         else:
             notice = _alert("err", "Retarget failed: %s" % res.get("error"))
