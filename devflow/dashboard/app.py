@@ -9,8 +9,10 @@ Safety posture (see :mod:`devflow.dashboard.service` for the enforcement):
 
 * binds **127.0.0.1 by default** (localhost-only; never public) and rejects requests whose ``Host``
   header is not a localhost name (DNS-rebinding defense);
-* performs ONLY read-only or DRY-RUN/local-file operations — **no** real GitHub writes, merge,
-  branch delete, force-push, or arbitrary shell execution; there is no endpoint that runs a command;
+* defaults to read-only or dry-run/local-file operations; real GitHub writes require the explicit
+  localhost-only ``--allow-github-writes`` flag and are limited to narrow guarded helpers;
+* never merges, deletes branches, force-pushes, or runs arbitrary shell commands; there is no endpoint
+  that runs a command;
 * all dynamic content is HTML-escaped; request bodies are size-capped;
 * adds **no** dependency — pure Python standard library.
 """
@@ -390,7 +392,8 @@ def _render_start_result(final: dict) -> str:
         return ""
     fields = []
     for k in ("thread_id", "task_type", "repo", "agent_profile", "dashboard_start_mode",
-              "status", "paused_at_gate", "issue_number", "issue_url"):
+              "real_github", "status", "paused_at_gate", "codex_advisory_status",
+              "max_polls", "poll_seconds", "issue_number", "issue_url"):
         v = final.get(k)
         if v in (None, ""):
             continue
@@ -400,9 +403,20 @@ def _render_start_result(final: dict) -> str:
             val = e(v)
         fields.append("<tr><th>%s</th><td>%s</td></tr>" % (e(k), val))
     errors = final.get("errors") or []
+    next_step = ""
+    if final.get("real_github") and final.get("status") == "paused":
+        next_step = ("<p class='note'>Real advisory paused at the approval gate. Open the run detail "
+                     "to inspect the advisory and export an Implementation Packet. The dashboard does "
+                     "not implement, create a PR, push, or merge from this flow.</p>")
+    elif final.get("real_github") and final.get("codex_advisory_status") == "timeout":
+        next_step = ("<p class='note'>No Codex advisory arrived within this bounded request. Nothing "
+                     "else ran. Use the watcher/orchestrator later to continue after Codex responds.</p>")
+    elif final.get("real_github"):
+        next_step = ("<p class='note'>The real advisory launch stopped safely. Inspect the event log "
+                     "and errors before retrying; duplicate thread ids are refused.</p>")
     return ("<div class='card'><h3>Start result</h3>"
-            "<table class='kv'>%s</table><h4>Event log</h4>%s<h4>Errors</h4>%s</div>"
-            % ("".join(fields), _li(final.get("event_log")),
+            "<table class='kv'>%s</table>%s<h4>Event log</h4>%s<h4>Errors</h4>%s</div>"
+            % ("".join(fields), next_step, _li(final.get("event_log")),
                (_li(errors) if errors else "<p class='muted'>(no errors)</p>")))
 
 
@@ -764,10 +778,17 @@ class Handler(BaseHTTPRequestHandler):
 
         fields = []
         for k in ("thread_id", "task_type", "task_text", "repo", "agent_profile",
-                  "dashboard_start_mode", "status", "paused_at_gate", "paused_at_node",
-                  "issue_number", "pr_number", "human_approval", "fix_approval", "merge_approval"):
+                  "dashboard_start_mode", "real_github", "status", "paused_at_gate",
+                  "paused_at_node", "codex_advisory_status", "max_polls", "poll_seconds",
+                  "issue_number", "issue_url", "pr_number", "pr_url",
+                  "human_approval", "fix_approval", "merge_approval"):
             if state.get(k) not in (None, ""):
-                fields.append("<tr><th>%s</th><td>%s</td></tr>" % (e(k), e(state.get(k))))
+                v = state.get(k)
+                if k.endswith("_url") and str(v).startswith("http"):
+                    val = "<a href='%s'>%s</a>" % (e(v), e(v))
+                else:
+                    val = e(v)
+                fields.append("<tr><th>%s</th><td>%s</td></tr>" % (e(k), val))
         fields_html = "<table class='kv'>" + "".join(fields) + "</table>"
 
         event_log = _li(state.get("event_log"))
@@ -786,13 +807,13 @@ class Handler(BaseHTTPRequestHandler):
                 "<button name='decision' value='rejected'>Export rejected packet</button>"
                 "</form>" % e(thread_id))
             if state.get("real_github"):
-                # a live (--real-github) checkpoint is read-only here — resuming it would clobber its
-                # real provenance. Offer inspect + export only; Approve/Reject are disabled.
+                # a live checkpoint is export-only here; resuming it would cross from advisory into
+                # implementation/PR behavior, which the dashboard intentionally does not do.
                 gate_section = (
                     "<div class='card gate'><h3>Paused at gate: %s</h3>%s"
-                    "<p class='note'>This run was started with <code>--real-github</code> (a live flow). "
-                    "The dashboard is dry-run only — Approve/Reject are disabled; resume it via the CLI "
-                    "(<code>devflow resume --real-github</code>). You can still export a packet.</p>"
+                    "<p class='note'>This run used <code>real-github</code> advisory mode. Approve/Reject are disabled "
+                    "in the dashboard; export a packet for a human-controlled implementation handoff. "
+                    "This page does not implement, create a PR, push, or merge.</p>"
                     "%s</div>"
                     % (e(gate_alias), _payload_html(payload), export_form))
             else:
@@ -821,24 +842,44 @@ class Handler(BaseHTTPRequestHandler):
         profile = values.get("agent_profile") or service.AGENT_PROFILES[0]
         if profile not in service.AGENT_PROFILES:
             profile = service.AGENT_PROFILES[0]
+        mode = values.get("mode") or service.START_MODE_DRY_RUN
         env = service.dashboard_environment_check()
         writes_enabled = bool(getattr(self.server, "allow_writes", False))
         real_note = (
-            "GitHub-write controls are enabled for this localhost session, but real advisory launch "
-            "from the Start Wizard is deferred in this PR. Use "
-            "python -m devflow.cli run-docs-advisory --real-github --repo owner/name "
-            "--thread-id your-thread for live issue creation until the dashboard gets "
-            "advisory-specific audit/idempotency."
+            "Real GitHub advisory is enabled for this localhost session. It creates a real issue and "
+            "posts the fixed advisory request comment only; it does not create a PR, push, merge, or call "
+            "an LLM/API. Polling is bounded by the fields below; there is no background worker."
             if writes_enabled else
-            "Real GitHub advisory launch is unavailable here. It requires a future dashboard write path "
-            "plus a localhost session started with --allow-github-writes."
+            "Real GitHub advisory launch is unavailable here. It requires a localhost session started "
+            "with --allow-github-writes. Dry-run remains available and writes nothing to GitHub."
         )
+        real_enabled = writes_enabled
+        if mode == service.START_MODE_REAL and real_enabled:
+            dry_checked, real_checked = "", " checked"
+        else:
+            dry_checked, real_checked = " checked", ""
+        real_disabled = "" if real_enabled else " disabled"
+        confirmation_disabled = "" if real_enabled else " disabled"
+        max_polls = values.get("max_polls")
+        if max_polls in (None, ""):
+            max_polls = service.START_REAL_MAX_POLLS_DEFAULT
+        poll_seconds = values.get("poll_seconds")
+        if poll_seconds in (None, ""):
+            poll_seconds = service.START_REAL_POLL_SECONDS_DEFAULT
         self._send_html(_render(
             "start.html", title="Start", notice=notice, result=result,
             env_check=_render_env_check(env),
             agent_options=_opts([(p, p) for p in service.AGENT_PROFILES], profile),
             repo=e(repo), task=e(task), thread_id=e(thread_id),
             confirmation_phrase=e(service.START_REAL_CONFIRMATION),
+            confirmation=e(values.get("confirmation") or ""),
+            dry_checked=dry_checked, real_checked=real_checked,
+            real_disabled_attr=real_disabled,
+            confirmation_disabled_attr=confirmation_disabled,
+            real_label_class=("radio-line" if real_enabled else "radio-line disabled"),
+            max_polls=e(max_polls), poll_seconds=e(poll_seconds),
+            max_polls_limit=e(service.START_REAL_MAX_POLLS_LIMIT),
+            poll_seconds_limit=e(service.START_REAL_POLL_SECONDS_LIMIT),
             real_note=e(real_note), writes_status=("enabled" if writes_enabled else "disabled"),
         ), code=code)
 
@@ -901,23 +942,29 @@ class Handler(BaseHTTPRequestHandler):
     def _post_start(self, form):
         mode = form.get("mode") or service.START_MODE_DRY_RUN
         if mode == service.START_MODE_REAL:
-            if not getattr(self.server, "allow_writes", False):
-                return self._page_start(
-                    notice=_alert("err", "Real GitHub advisory requires --allow-github-writes on "
-                                           "localhost and is deferred from the Start Wizard in this PR."),
-                    values=form, code=403)
-            if form.get("confirmation", "") != service.START_REAL_CONFIRMATION:
-                return self._page_start(
-                    notice=_alert("err", "Confirmation must exactly match %s; real advisory launch "
-                                           "is still deferred in this PR."
-                                  % service.START_REAL_CONFIRMATION),
-                    values=form)
-            return self._page_start(
-                notice=_alert("err", "Real GitHub advisory launch is deferred in this PR; no GitHub "
-                                       "write was attempted."),
-                values=form)
+            writes_enabled = bool(getattr(self.server, "allow_writes", False))
+            try:
+                final = service.create_start_real_advisory_run(
+                    task=form.get("task", ""), thread_id=form.get("thread_id", ""),
+                    repo=form.get("repo", ""), agent_profile=form.get("agent_profile", "codex"),
+                    confirmation=form.get("confirmation", ""),
+                    max_polls=form.get("max_polls"), poll_seconds=form.get("poll_seconds"),
+                    writes_enabled=writes_enabled)
+            except ValueError as ex:
+                return self._page_start(notice=_alert("err", str(ex)), values=form,
+                                        code=(403 if not writes_enabled else 200))
+            except GhError as ex:
+                return self._page_start(notice=_alert("err", "gh error: %s" % ex), values=form)
+            tid = final.get("thread_id") or form.get("thread_id", "")
+            if service.get_run(tid) is None:
+                notice = "Real advisory flow stopped safely."
+                if final.get("codex_advisory_status") == "timeout":
+                    notice = "Real advisory request timed out after bounded polling."
+                return self._page_start(notice=_alert("info", notice),
+                                        result=_render_start_result(final), values=form)
+            self._redirect_for_run(tid)
         if mode != service.START_MODE_DRY_RUN:
-            return self._page_start(notice=_alert("err", "mode must be dry-run"), values=form)
+            return self._page_start(notice=_alert("err", "mode must be dry-run or real"), values=form)
         try:
             final = service.create_start_run(
                 task=form.get("task", ""), thread_id=form.get("thread_id", ""),
@@ -1025,8 +1072,9 @@ class Handler(BaseHTTPRequestHandler):
                                 heading="403 — GitHub writes disabled",
                                 body="<p>GitHub-write controls are off. Restart the dashboard with "
                                      "<code>--allow-github-writes</code> on a localhost bind to enable the "
-                                     "opt-in writes (post <code>@codex review</code> · mark a draft "
-                                     "ready).</p>"), code=403)
+                                     "opt-in writes (Start real advisory issue/comment · post "
+                                     "<code>@codex review</code> · mark a draft ready · retarget "
+                                     "base).</p>"), code=403)
 
     def _post_codex_review_request(self, form):
         # GATE: writes must be enabled at startup (--allow-github-writes + localhost bind). The Host check
@@ -1180,8 +1228,9 @@ def _allowed_hosts(host: str) -> set:
 def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                allow_writes: bool = False) -> DashboardServer:
     """Build (but do not serve) the dashboard server bound to ``host:port``. Caller serves it.
-    ``allow_writes`` enables the opt-in GitHub-write controls (post @codex review / mark ready / retarget
-    base) — callers must pass it True ONLY for a localhost bind (the factory also enforces this)."""
+    ``allow_writes`` enables the opt-in GitHub-write controls (Start real advisory issue/comment,
+    post @codex review, mark ready, retarget base) — callers must pass it True ONLY for a localhost bind
+    (the factory also enforces this)."""
     httpd = DashboardServer((host, port), Handler, _allowed_hosts(host), allow_writes=allow_writes)
     return httpd
 
@@ -1214,9 +1263,9 @@ def main(argv=None) -> int:
     p.add_argument("--open", action="store_true",
                    help="after starting, open the dashboard URL in your browser (localhost binds only)")
     p.add_argument("--allow-github-writes", action="store_true",
-                   help="opt-in: enable the 3 narrow GitHub-write controls (post '@codex review' / mark a "
-                        "draft ready / retarget base) from the Review Queue, each with typed confirmation. "
-                        "Localhost binds ONLY; off by default")
+                   help="opt-in: enable narrow GitHub-write controls (Start real advisory issue/comment; "
+                        "Review Queue post '@codex review' / mark a draft ready / retarget base), each "
+                        "with typed confirmation where applicable. Localhost binds ONLY; off by default")
     args = p.parse_args(argv)
     is_local = args.host.strip().lower() in _LOCALHOST_NAMES
     if not is_local:
@@ -1233,7 +1282,7 @@ def main(argv=None) -> int:
     host_disp = "[%s]" % args.host if ":" in args.host else args.host    # bracket an IPv6 literal for the URI
     url = "http://%s:%d" % (host_disp, httpd.server_address[1])          # ACTUAL bound port (handles --port 0)
     print("[dashboard] serving on %s  (Ctrl-C to stop; localhost-only; %s)"
-          % (url, "GitHub writes ENABLED (post @codex review / mark ready / retarget base)" if allow_writes
+          % (url, "GitHub writes ENABLED (real advisory issue/comment / post @codex review / mark ready / retarget base)" if allow_writes
              else "read-only / dry-run"))
     if args.open:
         # convenience only, stdlib webbrowser (no shell). NEVER auto-open a non-localhost bind.

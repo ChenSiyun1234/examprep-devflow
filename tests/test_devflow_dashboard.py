@@ -41,6 +41,8 @@ import devflow.tools.review_prompt_policy as policy
 import devflow.dashboard.app as app
 import devflow.dashboard.service as service
 import devflow.tools.dashboard_writes as dw
+import devflow.nodes.advisory as advisory_nodes
+import devflow.nodes.pr_review as pr_review_nodes
 
 _CODEX = "chatgpt-codex-connector[bot]"
 
@@ -96,13 +98,16 @@ class DashboardBase(unittest.TestCase):
         # or the cwd's .devflow (the HTTP /export route uses the default PACKETS_DIR).
         self._orig_ckpt = _cli.CKPT_DIR
         self._orig_packets = _cli.PACKETS_DIR
+        self._orig_audit_dir = dw.AUDIT_DIR
         _cli.CKPT_DIR = os.path.join(self.tmp, "runs")
         _cli.PACKETS_DIR = self.packets
+        dw.AUDIT_DIR = os.path.join(self.tmp, "actions")
         os.makedirs(_cli.CKPT_DIR, exist_ok=True)
 
     def tearDown(self):
         _cli.CKPT_DIR = self._orig_ckpt
         _cli.PACKETS_DIR = self._orig_packets
+        dw.AUDIT_DIR = self._orig_audit_dir
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
@@ -184,6 +189,227 @@ class DryRunSafetyTests(DashboardBase):
             service.create_start_run("Add wizard", "dup-start", "owner/x", "codex")
         self.assertIn("already exists - choose a unique id", str(cm.exception))
         self.assertNotIn("鈥?", str(cm.exception))
+
+
+class _FakeAdvisoryWriter:
+    def __init__(self, create_error=None, comment_error=None):
+        self.create_error = create_error
+        self.comment_error = comment_error
+        self.calls = []
+
+    def create_advisory_issue(self, title, body, labels=None):
+        self.calls.append(("create_advisory_issue", title, body, labels))
+        if self.create_error:
+            return {"error": self.create_error, "log": "create failed"}
+        return {"number": 77, "url": "https://github.com/owner/repo/issues/77",
+                "executed": True, "log": "created"}
+
+    def comment_on_issue(self, issue_number, body):
+        self.calls.append(("comment_on_issue", issue_number, body))
+        if self.comment_error:
+            return {"error": self.comment_error, "log": "comment failed"}
+        return {"executed": True, "log": "commented"}
+
+
+class _FakeAdvisoryReader:
+    def __init__(self, repo, packet):
+        self.repo = repo
+        self.packet = packet
+
+    def find_latest_codex_advisory(self, issue_number):
+        return self.packet
+
+
+_DEFAULT_ADVISORY_PACKET = object()
+
+
+class StartRealAdvisoryServiceTests(DashboardBase):
+    def setUp(self):
+        super().setUp()
+        self.audit = os.path.join(self.tmp, "actions")
+        self.state_file = os.path.join(self.tmp, "actions", service.START_REAL_STATE_FILE)
+
+    def _ok_gh(self):
+        return {"available": True, "authenticated": True, "account": "octo", "error": None}
+
+    def _audit_lines(self, audit_dir=None):
+        p = os.path.join(audit_dir or self.audit, dw.AUDIT_FILE)
+        if not os.path.exists(p):
+            return []
+        with open(p, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def _call_real(self, *, writer=None, packet=_DEFAULT_ADVISORY_PACKET,
+                   thread_id="real-ready", max_polls=1,
+                   poll_seconds=0, audit_dir=None, state_file=None):
+        writer = writer or _FakeAdvisoryWriter()
+        if packet is _DEFAULT_ADVISORY_PACKET:
+            packet = {
+                "body": "Do the safe thing",
+                "recommended_steps": ["keep scope narrow"],
+                "source": "codex",
+            }
+        with mock.patch.object(service, "check_gh_available", return_value=self._ok_gh()), \
+             mock.patch.object(advisory_nodes, "_writer", return_value=writer), \
+             mock.patch.object(advisory_nodes, "ReadOnlyGitHub",
+                               side_effect=lambda repo: _FakeAdvisoryReader(repo, packet)), \
+             mock.patch.object(pr_review_nodes, "_writer",
+                               side_effect=AssertionError("implementation/PR writer must not run")), \
+             _quiet():
+            final = service.create_start_real_advisory_run(
+                "Ship real advisory", thread_id, "owner/repo", "codex",
+                service.START_REAL_CONFIRMATION, max_polls=max_polls, poll_seconds=poll_seconds,
+                writes_enabled=True, audit_dir=audit_dir or self.audit,
+                state_file=state_file or self.state_file)
+        return final, writer
+
+    def test_real_advisory_ready_pauses_saves_checkpoint_and_audits_success(self):
+        final, writer = self._call_real(max_polls=1, poll_seconds=0)
+        self.assertTrue(final.get("real_github"))
+        self.assertEqual(final.get("dashboard_start_mode"), service.START_REAL_DASHBOARD_MODE)
+        self.assertEqual(final.get("status"), "paused")
+        self.assertEqual(final.get("paused_at_gate"), service.GATE_ALIASES["advisory"])
+        self.assertEqual(final.get("issue_number"), 77)
+        self.assertIsNone(final.get("pr_number"))
+        self.assertEqual([c[0] for c in writer.calls],
+                         ["create_advisory_issue", "comment_on_issue"])
+        self.assertIn("@codex please provide an implementation advisory", writer.calls[1][2])
+
+        ckpt = service.get_run("real-ready")
+        self.assertIsNotNone(ckpt)
+        self.assertTrue(ckpt.get("real_github"))
+        self.assertIn("Advisory", (ckpt.get("advisory_packet") or {}).get("summary", ""))
+
+        rec = self._audit_lines()[-1]
+        self.assertEqual(rec["action"], service.START_REAL_ACTION)
+        self.assertEqual(rec["result"], "success")
+        self.assertEqual(rec["repo"], "owner/repo")
+        self.assertEqual(rec["thread_id"], "real-ready")
+        self.assertEqual(rec["issue_number"], 77)
+        self.assertEqual(rec["actor"], "dashboard")
+
+        with open(self.state_file, encoding="utf-8") as f:
+            remembered = json.load(f)
+        self.assertEqual(remembered["real-ready"]["issue_number"], 77)
+
+    def test_real_advisory_paused_checkpoint_exports_packet_but_does_not_resume(self):
+        self._call_real(thread_id="real-export")
+        with self.assertRaises(ValueError):
+            service.decide_gate("real-export", "advisory", "approved")
+        res = service.export_packet("real-export", decision="approved", out_dir=self.packets)
+        self.assertTrue(os.path.exists(res["paths"]["json_path"]))
+        self.assertIn("do not commit/push/merge", res["handoff"])
+
+    def test_real_advisory_timeout_renders_terminal_state_and_remembers_issue(self):
+        final, writer = self._call_real(packet=None, thread_id="real-timeout",
+                                        max_polls=1, poll_seconds=0)
+        self.assertEqual(final.get("codex_advisory_status"), "timeout")
+        self.assertEqual(final.get("status"), "done")
+        self.assertIsNone(service.get_run("real-timeout"))
+        self.assertEqual([c[0] for c in writer.calls],
+                         ["create_advisory_issue", "comment_on_issue"])
+        rec = self._audit_lines()[-1]
+        self.assertEqual(rec["result"], "timeout")
+        self.assertEqual(rec["issue_number"], 77)
+        with open(self.state_file, encoding="utf-8") as f:
+            remembered = json.load(f)
+        self.assertEqual(remembered["real-timeout"]["result"], "timeout")
+
+    def test_real_advisory_duplicate_thread_refused_from_checkpoint_or_state(self):
+        self._call_real(thread_id="real-dup")
+        with mock.patch.object(advisory_nodes, "_writer",
+                               side_effect=AssertionError("duplicate must not write")):
+            with self.assertRaises(ValueError) as cm:
+                service.create_start_real_advisory_run(
+                    "Ship real advisory", "real-dup", "owner/repo", "codex",
+                    service.START_REAL_CONFIRMATION, writes_enabled=True,
+                    audit_dir=self.audit, state_file=self.state_file)
+        self.assertIn("already exists", str(cm.exception))
+        self.assertEqual(self._audit_lines()[-1]["result"], "refused")
+
+        self._call_real(packet=None, thread_id="real-dup-timeout")
+        with mock.patch.object(advisory_nodes, "_writer",
+                               side_effect=AssertionError("state duplicate must not write")):
+            with self.assertRaises(ValueError) as cm:
+                service.create_start_real_advisory_run(
+                    "Ship real advisory", "real-dup-timeout", "owner/repo", "codex",
+                    service.START_REAL_CONFIRMATION, writes_enabled=True,
+                    audit_dir=self.audit, state_file=self.state_file)
+        self.assertIn("already started", str(cm.exception))
+
+    def test_real_advisory_validation_refusals_are_audited_before_gh_or_write(self):
+        cases = [
+            dict(writes_enabled=False, confirmation=service.START_REAL_CONFIRMATION,
+                 repo="owner/repo", task="x", thread_id="t", agent_profile="codex",
+                 reason="requires --allow-github-writes"),
+            dict(writes_enabled=True, confirmation="START REAL ADVISORY ",
+                 repo="owner/repo", task="x", thread_id="t", agent_profile="codex",
+                 reason="confirmation does not match"),
+            dict(writes_enabled=True, confirmation=service.START_REAL_CONFIRMATION,
+                 repo="", task="x", thread_id="t", agent_profile="codex",
+                 reason="repo is required"),
+            dict(writes_enabled=True, confirmation=service.START_REAL_CONFIRMATION,
+                 repo="owner/repo", task="", thread_id="t", agent_profile="codex",
+                 reason="task is required"),
+            dict(writes_enabled=True, confirmation=service.START_REAL_CONFIRMATION,
+                 repo="owner/repo", task="x", thread_id="", agent_profile="codex",
+                 reason="thread_id is required"),
+            dict(writes_enabled=True, confirmation=service.START_REAL_CONFIRMATION,
+                 repo="owner/repo", task="x", thread_id="t", agent_profile="bad",
+                 reason="agent_profile"),
+        ]
+        for c in cases:
+            with mock.patch.object(service, "check_gh_available",
+                                   side_effect=AssertionError("validation should precede gh")), \
+                 mock.patch.object(advisory_nodes, "_writer",
+                                   side_effect=AssertionError("validation should precede writes")):
+                with self.assertRaises(ValueError) as cm:
+                    service.create_start_real_advisory_run(
+                        c["task"], c["thread_id"], c["repo"],
+                        c["agent_profile"], c["confirmation"], writes_enabled=c["writes_enabled"],
+                        audit_dir=self.audit, state_file=self.state_file)
+            self.assertIn(c["reason"], str(cm.exception))
+            self.assertEqual(self._audit_lines()[-1]["result"], "refused")
+
+    def test_real_advisory_poll_field_validation_and_gh_failure_audits(self):
+        for fields in ({"max_polls": "11"}, {"poll_seconds": "61"}, {"max_polls": "NaN"}):
+            with self.assertRaises(ValueError):
+                service.create_start_real_advisory_run(
+                    "x", "bad-poll-" + str(len(self._audit_lines())), "owner/repo", "codex",
+                    service.START_REAL_CONFIRMATION, writes_enabled=True,
+                    audit_dir=self.audit, state_file=self.state_file, **fields)
+            self.assertEqual(self._audit_lines()[-1]["result"], "refused")
+
+        with mock.patch.object(service, "check_gh_available",
+                               return_value={"available": False, "authenticated": False,
+                                             "error": "gh missing"}):
+            with self.assertRaises(GhError):
+                service.create_start_real_advisory_run(
+                    "x", "gh-down", "owner/repo", "codex", service.START_REAL_CONFIRMATION,
+                    writes_enabled=True, audit_dir=self.audit, state_file=self.state_file)
+        self.assertEqual(self._audit_lines()[-1]["result"], "failure")
+
+    def test_real_advisory_create_or_comment_failures_audit_failure(self):
+        final, writer = self._call_real(writer=_FakeAdvisoryWriter(create_error="boom"),
+                                        packet=None, thread_id="real-create-fail")
+        self.assertEqual(final.get("status"), "done")
+        self.assertEqual(self._audit_lines()[-1]["result"], "failure")
+        self.assertEqual([c[0] for c in writer.calls], ["create_advisory_issue"])
+
+        final, writer = self._call_real(writer=_FakeAdvisoryWriter(comment_error="nope"),
+                                        packet=None, thread_id="real-comment-fail")
+        self.assertEqual(final.get("status"), "done")
+        self.assertEqual(self._audit_lines()[-1]["result"], "failure")
+        self.assertEqual([c[0] for c in writer.calls],
+                         ["create_advisory_issue", "comment_on_issue"])
+
+    def test_real_advisory_audit_failure_does_not_mask_success(self):
+        audit_file = os.path.join(self.tmp, "audit_is_a_file")
+        with open(audit_file, "w", encoding="utf-8") as f:
+            f.write("not a dir")
+        final, _ = self._call_real(thread_id="real-audit-fails", audit_dir=audit_file,
+                                   state_file=os.path.join(self.tmp, "state.json"))
+        self.assertEqual(final.get("status"), "paused")
 
 
 class DecideGateTests(DashboardBase):
@@ -1063,7 +1289,9 @@ class HttpIntegrationTests(DashboardBase):
             self.assertIn("value='%s'" % profile, body)
         self.assertIn('name="mode" value="dry-run" checked', body)
         self.assertIn('name="mode" value="real" disabled', body)
-        self.assertIn("deferred", body.lower())
+        self.assertIn("requires a localhost session started with --allow-github-writes", body)
+        self.assertIn("max_polls", body)
+        self.assertIn("poll_seconds", body)
 
     def test_start_page_escapes_environment_values(self):
         env = {"python_version": "<3>", "python_executable": "<script>py</script>",
@@ -1103,6 +1331,14 @@ class HttpIntegrationTests(DashboardBase):
         self.assertIn("Ship start wizard", detail)
         self.assertIn("generic", detail)
 
+    def test_start_post_bad_mode_is_rejected(self):
+        resp = self._post("/start", {"mode": "bogus", "task": "x", "thread_id": "bad-mode",
+                                     "repo": "owner/repo", "agent_profile": "codex"})
+        body = resp.read().decode("utf-8")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("mode must be dry-run or real", body)
+        self.assertIsNone(service.get_run("bad-mode"))
+
     def test_start_real_mode_rejected_when_writes_disabled(self):
         with mock.patch.object(service, "create_start_run",
                                side_effect=AssertionError("dry-run helper should not run")) as start:
@@ -1111,7 +1347,7 @@ class HttpIntegrationTests(DashboardBase):
                                          "confirmation": service.START_REAL_CONFIRMATION})
             body = resp.read().decode("utf-8")
         self.assertEqual(resp.status, 403)
-        self.assertIn("deferred", body.lower())
+        self.assertIn("requires --allow-github-writes", body)
         self.assertIsNone(service.get_run("real-off"))
         start.assert_not_called()
 
@@ -2055,7 +2291,7 @@ class CodexWriteFlagTests(unittest.TestCase):
         self.assertIn("writes ENABLED", out)
         self.assertNotIn("@codex review only", out)
         low = out.lower()
-        for w in ("@codex review", "mark ready", "retarget"):
+        for w in ("real advisory", "@codex review", "mark ready", "retarget"):
             self.assertIn(w, low)
 
     def test_flag_on_non_localhost_refuses_writes(self):
@@ -2808,7 +3044,7 @@ class WritesEnabledHttpTests(DashboardBase):
         c.request("POST", path, body=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
         return c.getresponse()
 
-    def test_start_page_real_mode_still_deferred_when_writes_enabled(self):
+    def test_start_page_real_mode_enabled_when_writes_enabled(self):
         env = {"python_version": "3.12.1", "python_executable": "py",
                "gh_available": True, "gh_authenticated": True, "gh_account": "octo",
                "gh_error": None, "ok": True}
@@ -2819,38 +3055,79 @@ class WritesEnabledHttpTests(DashboardBase):
             r = c.getresponse()
             body = r.read().decode("utf-8")
         self.assertEqual(r.status, 200)
-        self.assertIn("GitHub writes are enabled", body)
-        self.assertIn("run-docs-advisory --real-github", body)
-        self.assertIn("deferred", body.lower())
-        self.assertIn('name="mode" value="real" disabled', body)
+        self.assertIn("Real GitHub advisory is enabled", body)
+        self.assertIn("Creates a real issue", body)
+        self.assertNotIn("deferred", body.lower())
+        self.assertIn('name="mode" value="real"', body)
+        self.assertNotIn('name="mode" value="real" disabled', body)
+        self.assertIn("max_polls", body)
+        self.assertIn("poll_seconds", body)
 
     def test_start_real_mode_rejects_without_exact_confirmation_even_with_writes_enabled(self):
         for bad in ("", "START REAL ADVISORY ", " START REAL ADVISORY"):
-            with mock.patch.object(service, "create_start_run",
-                                   side_effect=AssertionError("no start helper")) as start:
+            with mock.patch.object(service, "dashboard_environment_check",
+                                   return_value={"python_version": "3.12", "python_executable": "py",
+                                                 "gh_available": True, "gh_authenticated": True,
+                                                 "gh_account": "octo", "gh_error": None, "ok": True}), \
+                 mock.patch.object(advisory_nodes, "_writer",
+                                   side_effect=AssertionError("confirmation should precede writes")):
                 r = self._post_path("/start", {"mode": "real", "task": "x", "thread_id": "real-bad",
                                                 "repo": "owner/repo", "confirmation": bad})
                 body = r.read().decode("utf-8")
             self.assertEqual(r.status, 200)
-            self.assertIn("Confirmation must exactly match", body)
+            self.assertIn("confirmation does not match", body)
             self.assertIsNone(service.get_run("real-bad"))
-            start.assert_not_called()
 
-    def test_start_real_mode_exact_confirmation_is_deferred_no_write(self):
-        with mock.patch.object(service, "create_start_run",
-                               side_effect=AssertionError("no start helper")) as start, \
-             mock.patch("devflow.nodes.advisory._writer",
-                        side_effect=AssertionError("no advisory write")) as writer:
+    def test_start_real_mode_exact_confirmation_runs_real_advisory_and_redirects(self):
+        writer = _FakeAdvisoryWriter()
+        packet = {"body": "Looks good", "recommended_steps": ["ship it safely"]}
+        with mock.patch.object(service, "check_gh_available",
+                               return_value={"available": True, "authenticated": True,
+                                             "account": "octo", "error": None}), \
+             mock.patch.object(advisory_nodes, "_writer", return_value=writer), \
+             mock.patch.object(advisory_nodes, "ReadOnlyGitHub",
+                               side_effect=lambda repo: _FakeAdvisoryReader(repo, packet)), \
+             mock.patch.object(pr_review_nodes, "_writer",
+                               side_effect=AssertionError("implementation/PR writer must not run")), \
+             _quiet():
             r = self._post_path("/start", {"mode": "real", "task": "x", "thread_id": "real-deferred",
                                             "repo": "owner/repo",
+                                            "agent_profile": "codex",
+                                            "max_polls": "1", "poll_seconds": "0",
+                                            "confirmation": service.START_REAL_CONFIRMATION})
+            r.read()
+        self.assertEqual(r.status, 303)
+        self.assertEqual(r.getheader("Location"), "/run/real-deferred")
+        st = service.get_run("real-deferred")
+        self.assertIsNotNone(st)
+        self.assertTrue(st.get("real_github"))
+        self.assertEqual(st.get("dashboard_start_mode"), service.START_REAL_DASHBOARD_MODE)
+        self.assertEqual([c[0] for c in writer.calls],
+                         ["create_advisory_issue", "comment_on_issue"])
+
+    def test_start_real_mode_timeout_shows_result_page_with_issue_url(self):
+        writer = _FakeAdvisoryWriter()
+        with mock.patch.object(service, "check_gh_available",
+                               return_value={"available": True, "authenticated": True,
+                                             "account": "octo", "error": None}), \
+             mock.patch.object(advisory_nodes, "_writer", return_value=writer), \
+             mock.patch.object(advisory_nodes, "ReadOnlyGitHub",
+                               side_effect=lambda repo: _FakeAdvisoryReader(repo, None)), \
+             mock.patch.object(pr_review_nodes, "_writer",
+                               side_effect=AssertionError("implementation/PR writer must not run")), \
+             _quiet():
+            r = self._post_path("/start", {"mode": "real", "task": "x", "thread_id": "real-timeout-http",
+                                            "repo": "owner/repo", "agent_profile": "codex",
+                                            "max_polls": "1", "poll_seconds": "0",
                                             "confirmation": service.START_REAL_CONFIRMATION})
             body = r.read().decode("utf-8")
         self.assertEqual(r.status, 200)
-        self.assertIn("deferred", body.lower())
-        self.assertIn("no GitHub write was attempted", body)
-        self.assertIsNone(service.get_run("real-deferred"))
-        start.assert_not_called()
-        writer.assert_not_called()
+        self.assertIn("Real advisory request timed out", body)
+        self.assertIn("Start result", body)
+        self.assertIn("https://github.com/owner/repo/issues/77", body)
+        self.assertIsNone(service.get_run("real-timeout-http"))
+        self.assertEqual([c[0] for c in writer.calls],
+                         ["create_advisory_issue", "comment_on_issue"])
 
     def test_mark_ready_success_message(self):
         with mock.patch.object(service, "mark_ready_for_review",
