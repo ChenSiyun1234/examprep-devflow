@@ -31,13 +31,43 @@ class TestWriteGuard(unittest.TestCase):
                 _assert_write_allowed(bad)
 
     def test_allows_create_comment(self):
-        for ok in (["issue", "create"], ["issue", "comment"], ["pr", "create"], ["pr", "comment"]):
+        for ok in (["issue", "create"], ["issue", "comment"], ["pr", "create"], ["pr", "comment"],
+                   ["pr", "ready"]):                       # mark-ready is an allow-listed write shape
             _assert_write_allowed(ok)
+
+    def test_refuses_pr_ready_undo_and_other_pr_writes(self):
+        # `pr ready` is allowed, but NEVER --undo (convert back to draft), nor merge/edit/close
+        for bad in (["pr", "ready", "7", "--undo"], ["pr", "ready", "7", "undo"],
+                    ["pr", "merge", "7"], ["pr", "edit", "7"], ["pr", "close", "7"]):
+            with self.assertRaises(GhError):
+                _assert_write_allowed(bad)
+
+    def test_refuses_valued_long_flag_forms(self):
+        # gh/pflag accepts `--flag=value`; the guard must normalize and still reject the forbidden flag
+        for bad in (["pr", "ready", "7", "--undo=true"], ["pr", "ready", "7", "--undo=1"],
+                    ["pr", "create", "--force=yes"], ["pr", "comment", "1", "--force-with-lease=x"]):
+            with self.assertRaises(GhError):
+                _assert_write_allowed(bad)
+
+    def test_value_with_equals_in_body_is_not_a_false_positive(self):
+        # a comment/title VALUE that merely contains '=' must NOT be mistaken for a bare forbidden token
+        # (only flag-like args starting with '-' are split on '=')
+        _assert_write_allowed(["pr", "comment", "1", "-R", "o/r", "--body", "let's merge=now please"])
+        _assert_write_allowed(["issue", "create", "--title", "push=hard", "--body", "delete=maybe"])
+
+    def test_mark_pr_ready_builds_exact_argv(self):
+        # the ONLY shape the mark-ready writer constructs is `gh pr ready <n> -R <repo>`
+        w = GitHubWriter("o/r", live=False, logger=quiet)
+        res = w.mark_pr_ready(7)
+        self.assertTrue(res.get("dry_run"))
+        self.assertEqual(w.calls[-1]["args"], ["pr", "ready", "7", "-R", "o/r"])
 
     def test_writer_has_no_merge_capability(self):
         w = GitHubWriter("o/r", logger=quiet)
         self.assertFalse(hasattr(w, "merge_pr"))
         self.assertFalse(hasattr(w, "merge"))
+        self.assertFalse(hasattr(w, "close_pr"))
+        self.assertFalse(hasattr(w, "delete_branch"))
 
 
 class TestDryRunWrites(unittest.TestCase):

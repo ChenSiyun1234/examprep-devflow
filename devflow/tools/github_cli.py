@@ -670,10 +670,12 @@ _ALLOWED_WRITE_PREFIXES = {
     ("issue", "comment"),
     ("pr", "create"),
     ("pr", "comment"),
+    ("pr", "ready"),          # mark a DRAFT pr ready for review — un-draft only (NEVER --undo / draft)
 }
 _FORBIDDEN_WRITE_TOKENS = {
     "merge", "delete", "--delete", "-d", "-D", "--force", "-f",
     "--force-with-lease", "push", "close", "--admin",
+    "undo", "--undo",        # `pr ready --undo` converts BACK to draft — forbidden (mark-ready is one-way)
 }
 # obvious secret/token shapes — refuse to post content that looks like a credential.
 # Covers all GitHub token prefixes (ghp_/gho_/ghu_/ghs_/ghr_ + fine-grained github_pat_),
@@ -684,12 +686,21 @@ _SECRET_RE = re.compile(
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----)")
 
 
+def _norm_token(a: str) -> str:
+    """Normalize an arg for the forbidden-token check: a long flag may be passed as ``--flag=value``
+    (gh/pflag accepts that), so strip ``=value`` from FLAG-like args (those starting with ``-``) so
+    ``--undo=true`` / ``--force=1`` still match. Non-flag args are left intact, so a comment body that
+    merely contains ``=`` (e.g. ``merge=now``) is NOT mistaken for the bare token ``merge``."""
+    a = a.lower()
+    return a.split("=", 1)[0] if a.startswith("-") else a
+
+
 def _assert_write_allowed(args: list[str]) -> None:
-    """Refuse any write that is not an allow-listed create/comment, or that smells like
-    merge/delete/force-push. The single write-safety chokepoint."""
+    """Refuse any write that is not an allow-listed create/comment/ready, or that smells like
+    merge/delete/force-push/undo. The single write-safety chokepoint."""
     if tuple(args[:2]) not in _ALLOWED_WRITE_PREFIXES:
         raise GhError(f"refused: write op not in allow-list: {' '.join(args[:2]) or '(empty)'}")
-    low = {a.lower() for a in args}
+    low = {_norm_token(a) for a in args}
     bad = low & _FORBIDDEN_WRITE_TOKENS
     if bad:
         raise GhError(f"refused: forbidden token(s) in write op: {sorted(bad)}")
@@ -809,3 +820,11 @@ class GitHubWriter:
         args = ["pr", "comment", str(int(pr_number)), "-R", self.repo, "--body", body]
         sim = {"posted": False, "simulated": True}
         return self._exec(args, "comment_on_pr", f"comment on PR #{pr_number}", sim)
+
+    def mark_pr_ready(self, pr_number: int) -> dict:
+        """Mark a DRAFT pull request ready for review: EXACTLY ``gh pr ready <pr> -R <repo>`` and nothing
+        else. A single fixed write shape — no ``--undo`` (convert-to-draft), no other flags, no merge /
+        close / edit. Passes ``_assert_write_allowed`` via the ``(pr, ready)`` prefix."""
+        args = ["pr", "ready", str(int(pr_number)), "-R", self.repo]
+        sim = {"ready": True, "simulated": True}
+        return self._exec(args, "mark_pr_ready", f"mark PR #{pr_number} ready for review", sim)
