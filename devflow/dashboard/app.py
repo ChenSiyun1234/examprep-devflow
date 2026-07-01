@@ -392,7 +392,8 @@ def _render_start_result(final: dict) -> str:
         return ""
     fields = []
     for k in ("thread_id", "task_type", "repo", "agent_profile", "dashboard_start_mode",
-              "real_github", "status", "paused_at_gate", "codex_advisory_status",
+              "dashboard_start_result", "real_github", "status", "paused_at_gate",
+              "codex_advisory_status",
               "max_polls", "poll_seconds", "issue_number", "issue_url"):
         v = final.get(k)
         if v in (None, ""):
@@ -403,12 +404,19 @@ def _render_start_result(final: dict) -> str:
             val = e(v)
         fields.append("<tr><th>%s</th><td>%s</td></tr>" % (e(k), val))
     errors = final.get("errors") or []
+    start_result = final.get("dashboard_start_result") or ""
     next_step = ""
     if final.get("real_github") and final.get("status") == "paused":
-        next_step = ("<p class='note'>Real advisory paused at the approval gate. Open the run detail "
-                     "to inspect the advisory and export an Implementation Packet. The dashboard does "
-                     "not implement, create a PR, push, or merge from this flow.</p>")
-    elif final.get("real_github") and final.get("codex_advisory_status") == "timeout":
+        if start_result == "timeout":
+            next_step = ("<p class='note'>No Codex advisory arrived within this bounded request. "
+                         "The issue/comment were created and a checkpoint was saved for inspection "
+                         "and packet export. Use the watcher/orchestrator later to continue after "
+                         "Codex responds.</p>")
+        else:
+            next_step = ("<p class='note'>Real advisory paused at the approval gate. Open the run detail "
+                         "to inspect the advisory and export an Implementation Packet. The dashboard does "
+                         "not implement, create a PR, push, or merge from this flow.</p>")
+    elif final.get("real_github") and start_result == "timeout":
         next_step = ("<p class='note'>No Codex advisory arrived within this bounded request. Nothing "
                      "else ran. Use the watcher/orchestrator later to continue after Codex responds.</p>")
     elif final.get("real_github"):
@@ -778,9 +786,9 @@ class Handler(BaseHTTPRequestHandler):
 
         fields = []
         for k in ("thread_id", "task_type", "task_text", "repo", "agent_profile",
-                  "dashboard_start_mode", "real_github", "status", "paused_at_gate",
-                  "paused_at_node", "codex_advisory_status", "max_polls", "poll_seconds",
-                  "issue_number", "issue_url", "pr_number", "pr_url",
+                  "dashboard_start_mode", "dashboard_start_result", "real_github", "status",
+                  "paused_at_gate", "paused_at_node", "codex_advisory_status", "max_polls",
+                  "poll_seconds", "issue_number", "issue_url", "pr_number", "pr_url",
                   "human_approval", "fix_approval", "merge_approval"):
             if state.get(k) not in (None, ""):
                 v = state.get(k)
@@ -956,10 +964,13 @@ class Handler(BaseHTTPRequestHandler):
             except GhError as ex:
                 return self._page_start(notice=_alert("err", "gh error: %s" % ex), values=form)
             tid = final.get("thread_id") or form.get("thread_id", "")
+            start_result = final.get("dashboard_start_result") or ""
             if service.get_run(tid) is None:
                 notice = "Real advisory flow stopped safely."
-                if final.get("codex_advisory_status") == "timeout":
+                if start_result == "timeout":
                     notice = "Real advisory request timed out after bounded polling."
+                elif start_result == "failure":
+                    notice = "Real advisory launch failed before completion."
                 return self._page_start(notice=_alert("info", notice),
                                         result=_render_start_result(final), values=form)
             self._redirect_for_run(tid)

@@ -288,8 +288,10 @@ class StartRealAdvisoryServiceTests(DashboardBase):
         self.assertEqual(rec["issue_number"], 77)
         self.assertEqual(rec["actor"], "dashboard")
 
-        with open(self.state_file, encoding="utf-8") as f:
-            remembered = json.load(f)
+        remembered = {}
+        if os.path.exists(self.state_file):
+            with open(self.state_file, encoding="utf-8") as f:
+                remembered = json.load(f)
         self.assertEqual(remembered["real-ready"]["issue_number"], 77)
 
     def test_real_advisory_paused_checkpoint_exports_packet_but_does_not_resume(self):
@@ -300,14 +302,18 @@ class StartRealAdvisoryServiceTests(DashboardBase):
         self.assertTrue(os.path.exists(res["paths"]["json_path"]))
         self.assertIn("do not commit/push/merge", res["handoff"])
 
-    def test_real_advisory_timeout_renders_terminal_state_and_remembers_issue(self):
+    def test_real_advisory_timeout_preserves_checkpoint_and_remembers_issue(self):
         final, writer = self._call_real(packet=None, thread_id="real-timeout",
                                         max_polls=1, poll_seconds=0)
         self.assertEqual(final.get("codex_advisory_status"), "timeout")
-        self.assertEqual(final.get("status"), "done")
-        self.assertIsNone(service.get_run("real-timeout"))
+        self.assertEqual(final.get("dashboard_start_result"), "timeout")
+        self.assertEqual(final.get("status"), "paused")
+        self.assertEqual(final.get("paused_at_gate"), service.GATE_ALIASES["advisory"])
+        self.assertIsNotNone(service.get_run("real-timeout"))
         self.assertEqual([c[0] for c in writer.calls],
                          ["create_advisory_issue", "comment_on_issue"])
+        res = service.export_packet("real-timeout", decision="rejected", out_dir=self.packets)
+        self.assertTrue(os.path.exists(res["paths"]["json_path"]))
         rec = self._audit_lines()[-1]
         self.assertEqual(rec["result"], "timeout")
         self.assertEqual(rec["issue_number"], 77)
@@ -335,7 +341,7 @@ class StartRealAdvisoryServiceTests(DashboardBase):
                     "Ship real advisory", "real-dup-timeout", "owner/repo", "codex",
                     service.START_REAL_CONFIRMATION, writes_enabled=True,
                     audit_dir=self.audit, state_file=self.state_file)
-        self.assertIn("already started", str(cm.exception))
+        self.assertIn("already exists", str(cm.exception))
 
     def test_real_advisory_validation_refusals_are_audited_before_gh_or_write(self):
         cases = [
@@ -399,7 +405,17 @@ class StartRealAdvisoryServiceTests(DashboardBase):
         final, writer = self._call_real(writer=_FakeAdvisoryWriter(comment_error="nope"),
                                         packet=None, thread_id="real-comment-fail")
         self.assertEqual(final.get("status"), "done")
+        self.assertEqual(final.get("dashboard_start_result"), "failure")
         self.assertEqual(self._audit_lines()[-1]["result"], "failure")
+        self.assertEqual([c[0] for c in writer.calls],
+                         ["create_advisory_issue", "comment_on_issue"])
+        remembered = {}
+        if os.path.exists(self.state_file):
+            with open(self.state_file, encoding="utf-8") as f:
+                remembered = json.load(f)
+        self.assertNotIn("real-comment-fail", remembered)
+        final, writer = self._call_real(thread_id="real-comment-fail")
+        self.assertEqual(final.get("status"), "paused")
         self.assertEqual([c[0] for c in writer.calls],
                          ["create_advisory_issue", "comment_on_issue"])
 
@@ -3105,7 +3121,7 @@ class WritesEnabledHttpTests(DashboardBase):
         self.assertEqual([c[0] for c in writer.calls],
                          ["create_advisory_issue", "comment_on_issue"])
 
-    def test_start_real_mode_timeout_shows_result_page_with_issue_url(self):
+    def test_start_real_mode_timeout_redirects_to_saved_checkpoint(self):
         writer = _FakeAdvisoryWriter()
         with mock.patch.object(service, "check_gh_available",
                                return_value={"available": True, "authenticated": True,
@@ -3121,11 +3137,39 @@ class WritesEnabledHttpTests(DashboardBase):
                                             "max_polls": "1", "poll_seconds": "0",
                                             "confirmation": service.START_REAL_CONFIRMATION})
             body = r.read().decode("utf-8")
+        self.assertEqual(r.status, 303)
+        self.assertEqual(r.getheader("Location"), "/run/real-timeout-http")
+        self.assertEqual(body, "")
+        st = service.get_run("real-timeout-http")
+        self.assertIsNotNone(st)
+        self.assertEqual(st.get("dashboard_start_result"), "timeout")
+        self.assertEqual(st.get("codex_advisory_status"), "timeout")
+        self.assertEqual(st.get("issue_url"), "https://github.com/owner/repo/issues/77")
+        self.assertEqual([c[0] for c in writer.calls],
+                         ["create_advisory_issue", "comment_on_issue"])
+
+    def test_start_real_mode_comment_failure_shows_failure_not_timeout(self):
+        writer = _FakeAdvisoryWriter(comment_error="nope")
+        with mock.patch.object(service, "check_gh_available",
+                               return_value={"available": True, "authenticated": True,
+                                             "account": "octo", "error": None}), \
+             mock.patch.object(advisory_nodes, "_writer", return_value=writer), \
+             mock.patch.object(advisory_nodes, "ReadOnlyGitHub",
+                               side_effect=AssertionError("comment failure must not poll")), \
+             mock.patch.object(pr_review_nodes, "_writer",
+                               side_effect=AssertionError("implementation/PR writer must not run")), \
+             _quiet():
+            r = self._post_path("/start", {"mode": "real", "task": "x",
+                                            "thread_id": "real-comment-fail-http",
+                                            "repo": "owner/repo", "agent_profile": "codex",
+                                            "max_polls": "1", "poll_seconds": "0",
+                                            "confirmation": service.START_REAL_CONFIRMATION})
+            body = r.read().decode("utf-8")
         self.assertEqual(r.status, 200)
-        self.assertIn("Real advisory request timed out", body)
-        self.assertIn("Start result", body)
-        self.assertIn("https://github.com/owner/repo/issues/77", body)
-        self.assertIsNone(service.get_run("real-timeout-http"))
+        self.assertIn("Real advisory launch failed before completion", body)
+        self.assertNotIn("Real advisory request timed out", body)
+        self.assertIn("request_codex_advisory: nope", body)
+        self.assertIsNone(service.get_run("real-comment-fail-http"))
         self.assertEqual([c[0] for c in writer.calls],
                          ["create_advisory_issue", "comment_on_issue"])
 

@@ -225,9 +225,49 @@ def _remember_start_real(final: dict, result: str, task: str,
         "issue_number": final.get("issue_number"),
         "issue_url": final.get("issue_url") or "",
         "result": result,
+        "request_sent": _start_real_request_sent(final),
         "checkpoint_thread_id": thread_id if final.get("status") == "paused" else "",
     }
     _write_start_real_state(data, audit_dir, state_file)
+
+
+def _start_real_errors(final: dict) -> list[str]:
+    return [str(e) for e in (final.get("errors") or [])]
+
+
+def _start_real_request_failed(final: dict) -> bool:
+    return any(
+        e.startswith("create_advisory_issue:")
+        or e.startswith("request_codex_advisory:")
+        for e in _start_real_errors(final)
+    )
+
+
+def _start_real_request_sent(final: dict) -> bool:
+    return bool(final.get("issue_number")) and not _start_real_request_failed(final)
+
+
+def _pause_start_real_timeout_checkpoint(final: dict) -> dict:
+    """Keep a browser-inspectable/exportable checkpoint after a sent request times out."""
+    paused = dict(final)
+    gate = GATE_ALIASES["advisory"]
+    event_log = list(paused.get("event_log") or [])
+    event_log.append("[dashboard_start] real advisory request timed out; saved an advisory "
+                     "gate checkpoint for inspection/export.")
+    payload = dict(paused.get("interrupt_payload") or {})
+    payload.update({
+        "gate": gate,
+        "question": "Codex advisory did not arrive within the bounded poll window.",
+        "advisory": (paused.get("advisory_packet") or {}).get("summary"),
+    })
+    paused.update({
+        "status": "paused",
+        "paused_at_gate": gate,
+        "paused_at_node": GATE_TO_NODE.get(gate),
+        "interrupt_payload": payload,
+        "event_log": event_log,
+    })
+    return paused
 
 
 # ----------------------------------------------------------------------------------------
@@ -359,16 +399,17 @@ def create_start_run(task: str, thread_id: str = "", repo: str = "",
 def _classify_start_real_result(final: dict) -> str:
     if final.get("status") == "paused":
         return "success"
-    errors = [str(e) for e in (final.get("errors") or [])]
-    write_or_read_failure = any(
+    errors = _start_real_errors(final)
+    request_or_poll_failure = any(
         e.startswith("create_advisory_issue:")
         or e.startswith("request_codex_advisory:")
         or e.startswith("wait_for_codex_advisory:")
         for e in errors
     )
-    if write_or_read_failure:
+    if request_or_poll_failure:
         return "failure"
-    if final.get("codex_advisory_status") == "timeout":
+    if (final.get("codex_advisory_status") == "timeout"
+            and _start_real_request_sent(final)):
         return "timeout"
     return "failure" if errors else "success"
 
@@ -430,7 +471,8 @@ def create_start_real_advisory_run(task: str, thread_id: str = "", repo: str = "
                                "(or remove the existing run first)" % (thread_id,),
                                audit_dir=audit_dir)
         seen = _read_start_real_state(audit_dir, state_file).get(thread_id)
-        if isinstance(seen, dict) and (seen.get("issue_number") or
+        if isinstance(seen, dict) and (seen.get("request_sent") or
+                                       seen.get("checkpoint_thread_id") or
                                        seen.get("result") in ("success", "timeout")):
             msg = "real advisory already started for thread_id %r" % thread_id
             if seen.get("issue_url"):
@@ -459,15 +501,20 @@ def create_start_real_advisory_run(task: str, thread_id: str = "", repo: str = "
         app = build_graph(prefer_fallback=True)
         with _STDOUT_LOCK:
             final = app.invoke(state)
-        _persist(thread_id, final)
 
         result = _classify_start_real_result(final)
+        final["dashboard_start_result"] = result
+        if result == "timeout":
+            final = _pause_start_real_timeout_checkpoint(final)
+            final["dashboard_start_result"] = result
+        _persist(thread_id, final)
+
         _audit_start_attempt(result, repo, thread_id, task, profile,
                              "; ".join(str(e) for e in (final.get("errors") or [])),
                              issue_number=final.get("issue_number"),
                              issue_url=final.get("issue_url") or "",
                              audit_dir=audit_dir)
-        if final.get("issue_number") or result in ("success", "timeout"):
+        if result in ("success", "timeout") or _start_real_request_sent(final):
             _remember_start_real(final, result, task, audit_dir=audit_dir, state_file=state_file)
         return final
 
