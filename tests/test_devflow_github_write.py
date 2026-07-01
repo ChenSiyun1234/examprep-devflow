@@ -36,11 +36,23 @@ class TestWriteGuard(unittest.TestCase):
             _assert_write_allowed(ok)
 
     def test_refuses_pr_ready_undo_and_other_pr_writes(self):
-        # `pr ready` is allowed, but NEVER --undo (convert back to draft), nor merge/edit/close
-        for bad in (["pr", "ready", "7", "--undo"], ["pr", "ready", "7", "undo"],
-                    ["pr", "merge", "7"], ["pr", "edit", "7"], ["pr", "close", "7"]):
+        # `pr ready` is allowed, but NEVER the --undo FLAG (convert back to draft), nor merge/close
+        # subcommands, nor a bare `pr edit` (missing --base)
+        for bad in (["pr", "ready", "7", "--undo"], ["pr", "merge", "7"], ["pr", "edit", "7"],
+                    ["pr", "close", "7"]):
             with self.assertRaises(GhError):
                 _assert_write_allowed(bad)
+
+    def test_base_value_named_like_a_forbidden_word_is_allowed(self):
+        # Codex PR#17 R1: a real base branch literally named 'merge'/'push'/'close'/'delete' is a VALID
+        # ref — the guard must NOT mistake the --base VALUE for a forbidden subcommand (fail-closed bug)
+        for base in ("merge", "push", "close", "delete", "release-1"):
+            self.assertTrue(G.is_safe_base_ref(base), base)
+            _assert_write_allowed(["pr", "edit", "9", "-R", "o/r", "--base", base])   # passes the guard
+        w = GitHubWriter("o/r", live=False, logger=quiet)
+        r = w.retarget_pr_base(9, "merge")                     # and the writer proceeds (dry-run)
+        self.assertTrue(r.get("dry_run"))
+        self.assertEqual(w.calls[-1]["args"], ["pr", "edit", "9", "-R", "o/r", "--base", "merge"])
 
     def test_refuses_valued_long_flag_forms(self):
         # gh/pflag accepts `--flag=value`; the guard must normalize and still reject the forbidden flag

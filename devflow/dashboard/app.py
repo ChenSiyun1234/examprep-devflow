@@ -771,19 +771,22 @@ class Handler(BaseHTTPRequestHandler):
         # mode-aware copy: the page's own header/intro/note must NOT claim "read-only / never posts" when
         # the opt-in @codex review write button is live, or an operator could think the button is dry-run.
         if getattr(self.server, "allow_writes", False):
-            mode_tag = "(writes ENABLED — post @codex review · mark draft ready)"
+            mode_tag = "(writes ENABLED — post @codex review · mark draft ready · retarget base)"
             intro = ("Shows the same cross-PR plan as <code>orchestrate-reviews</code>. The plan is "
-                     "advisory with <strong>two exceptions</strong>: GitHub writes are "
+                     "advisory with <strong>three exceptions</strong>: GitHub writes are "
                      "<strong>enabled</strong> for this localhost session — each <em>request review</em> PR "
                      "has a <strong>Post @codex review</strong> button (posts the exact comment "
-                     "<code>@codex review</code>), and each <em>ready then merge</em> DRAFT has a "
-                     "<strong>Mark ready for review</strong> button (runs <code>gh pr ready</code>). Both "
-                     "require a typed confirmation + head-match. Neither merges; it still never retargets, "
-                     "requests reviewers, closes, pushes, or deletes branches. This is not a merge UI.")
+                     "<code>@codex review</code>), each <em>ready then merge</em> DRAFT has a "
+                     "<strong>Mark ready for review</strong> button (runs <code>gh pr ready</code>), and "
+                     "each <em>needs retarget</em> PR has a <strong>Retarget base</strong> button (runs "
+                     "<code>gh pr edit --base</code> to the planner's exact target — base only). All three "
+                     "require a typed confirmation + head-match. None merges; it still never rebases, "
+                     "requests reviewers, closes, pushes, force-pushes, or deletes branches. Not a merge UI.")
             form_note = ("Requires <code>gh</code> installed and authenticated. Computing the plan is "
                          "read-only. <em>Request review</em> PRs offer a real <code>@codex review</code> "
-                         "post; <em>ready then merge</em> drafts offer a real <strong>mark ready</strong> "
-                         "(not a merge). Mergeable PRs show a human merge-preflight note, not a merge button.")
+                         "post; <em>ready then merge</em> drafts offer a real <strong>mark ready</strong>; "
+                         "<em>needs retarget</em> PRs offer a real <strong>base retarget</strong> — none "
+                         "merges. Mergeable PRs show a human merge-preflight note, not a merge button.")
         else:
             mode_tag = "(read-only orchestrator)"
             intro = ("Shows the same cross-PR plan as <code>orchestrate-reviews</code>: who to request "

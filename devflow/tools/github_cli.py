@@ -673,10 +673,14 @@ _ALLOWED_WRITE_PREFIXES = {
     ("pr", "ready"),          # mark a DRAFT pr ready for review — un-draft only (NEVER --undo / draft)
     ("pr", "edit"),           # ONLY the exact base-retarget shape — enforced by _assert_write_allowed
 }
-_FORBIDDEN_WRITE_TOKENS = {
-    "merge", "delete", "--delete", "-d", "-D", "--force", "-f",
-    "--force-with-lease", "push", "close", "--admin",
-    "undo", "--undo",        # `pr ready --undo` converts BACK to draft — forbidden (mark-ready is one-way)
+# Forbidden gh SUBCOMMANDS (the verb at args[1]) — redundant with the allow-list but kept as defense.
+# Checked ONLY at the verb position, never against flag VALUES, so a legitimate --base/--body VALUE that
+# happens to equal one of these words (e.g. a real branch literally named `merge`) is NOT mis-refused.
+_FORBIDDEN_SUBCOMMANDS = {"merge", "delete", "close", "push", "undo"}
+# Forbidden FLAGS — checked against flag-like args (starting with '-') anywhere in the argv, so a
+# dangerous flag on an allow-listed subcommand (e.g. `pr create --force`, `pr ready --undo`) is refused.
+_FORBIDDEN_FLAGS = {
+    "--delete", "-d", "-D", "--force", "-f", "--force-with-lease", "--admin", "--undo",
 }
 # `pr edit` is NOT a generic editor here: the ONLY flags it may carry are ``-R`` (repo) and ``--base``
 # (retarget). Any other pr-edit flag (--title/--body/--add-reviewer/--state/--draft/--ready/…) is refused,
@@ -723,14 +727,18 @@ def _assert_write_allowed(args: list[str]) -> None:
     prefix = tuple(args[:2])
     if prefix not in _ALLOWED_WRITE_PREFIXES:
         raise GhError(f"refused: write op not in allow-list: {' '.join(args[:2]) or '(empty)'}")
-    low = {_norm_token(a) for a in args}
-    bad = low & _FORBIDDEN_WRITE_TOKENS
+    # forbidden SUBCOMMAND at the verb position (args[1]) — never scans flag VALUES, so a --base/--body
+    # value that merely equals a word like 'merge'/'push' (a real branch name) is not mis-refused.
+    if len(args) > 1 and _norm_token(args[1]) in _FORBIDDEN_SUBCOMMANDS:
+        raise GhError(f"refused: forbidden subcommand: {args[1]}")
+    # forbidden FLAGS anywhere (flag-like args only) — catches dangerous flags on an allowed subcommand.
+    flags = {_norm_token(a) for a in args if a.startswith("-")}
+    bad = flags & _FORBIDDEN_FLAGS
     if bad:
-        raise GhError(f"refused: forbidden token(s) in write op: {sorted(bad)}")
+        raise GhError(f"refused: forbidden flag(s) in write op: {sorted(bad)}")
     if prefix == ("pr", "edit"):
         # `pr edit` is permitted ONLY for base retarget: the sole flags may be -R and --base. Any other
         # flag (title/body/reviewer/state/draft/ready/milestone/…) turns this into a generic editor — reject.
-        flags = {_norm_token(a) for a in args if a.startswith("-")}
         extra = flags - _PR_EDIT_ALLOWED_FLAGS
         if extra:
             raise GhError(f"refused: `pr edit` may only retarget the base (-R/--base); got {sorted(extra)}")

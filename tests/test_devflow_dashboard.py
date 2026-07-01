@@ -2632,6 +2632,9 @@ class WritesEnabledHttpTests(DashboardBase):
         self.assertIn("Post @codex review", body)
         self.assertNotIn("never mutates GitHub", body)            # no contradictory read-only claim
         self.assertNotIn("the dashboard never posts it", body)
+        # Codex PR#17 F2: the write-mode copy must acknowledge the retarget button, not deny it
+        self.assertIn("Retarget base", body)
+        self.assertNotIn("never retargets", body)                # the read-only-only claim must be gone
 
     def test_duplicate_post_shows_honest_not_posted_message(self):
         # an idempotent no-op must NOT claim "Posted" (Codex R3 P1 honesty)
