@@ -37,19 +37,26 @@ $notice
   <section class="card">
     <h3>Mode</h3>
     <label class="radio-line">
-      <input type="radio" name="mode" value="dry-run" checked>
+      <input type="radio" name="mode" value="dry-run"$dry_checked>
       <span>dry-run</span>
       <span class="muted">Simulates the advisory and pauses at approval. No GitHub writes.</span>
     </label>
-    <label class="radio-line disabled">
-      <input type="radio" name="mode" value="real" disabled>
+    <label class="$real_label_class">
+      <input type="radio" name="mode" value="real"$real_checked$real_disabled_attr>
       <span>real GitHub advisory</span>
-      <span class="muted">Deferred. GitHub writes are $writes_status.</span>
+      <span class="muted">Creates a real issue and posts the advisory request comment only. GitHub writes are $writes_status.</span>
     </label>
     <p class="note">$real_note</p>
 
     <label for="confirmation">real-mode confirmation</label>
-    <input type="text" id="confirmation" name="confirmation" placeholder="$confirmation_phrase" disabled>
+    <input type="text" id="confirmation" name="confirmation" value="$confirmation" placeholder="$confirmation_phrase"$confirmation_disabled_attr>
+
+    <label for="max_polls">max_polls</label>
+    <input type="text" id="max_polls" name="max_polls" value="$max_polls">
+
+    <label for="poll_seconds">poll_seconds</label>
+    <input type="text" id="poll_seconds" name="poll_seconds" value="$poll_seconds">
+    <p class="muted">Real mode uses bounded polling only: max_polls 0..$max_polls_limit, poll_seconds 0..$poll_seconds_limit.</p>
   </section>
 
   <p><button type="submit" class="primary">Start advisory flow</button></p>

@@ -7,14 +7,15 @@ safe in ONE place:
 
 * **runs / checkpoints** are the stdlib-fallback JSON checkpoints :mod:`devflow.cli` already writes
   (``CKPT_DIR``); we only read them or run the workflow that writes them.
-* **the workflow is ALWAYS the pure-stdlib DRY-RUN backend** (``build_graph(prefer_fallback=True)``)
-  and ``real_github`` is NEVER enabled — so no GitHub mutation can happen from the dashboard, ever.
+* **the workflow uses the pure-stdlib fallback backend** (``build_graph(prefer_fallback=True)``).
+  Start defaults to dry-run; real GitHub advisory mode is an explicit localhost-only write path that
+  creates an advisory issue/comment only and stops before implementation.
 * **packets** are the same local files ``create``/``export-implementation-packet`` write
   (:func:`devflow.tools.packet_writer.write_packet`).
 * **the watcher** reuses :func:`devflow.cli.cmd_watch_codex_reviews` VERBATIM (read-only) and only
   captures its output — no reimplementation, no divergence from the CLI's marker precedence.
 
-Pure stdlib. No shell execution, no network writes, no LangGraph requirement.
+Pure stdlib. No arbitrary shell execution, no LangGraph requirement.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from devflow.tools.packet_writer import (
     render_manual_markdown, write_packet, PacketError,  # noqa: F401 (re-exported for the app layer)
 )
 from devflow.tools.review_orchestrator_runner import build_orchestration_result
-from devflow.tools.github_cli import GhError, check_gh_available
+from devflow.tools.github_cli import GhError, check_gh_available, _SECRET_RE
 from devflow.tools.fallback_review_prompt import (
     build_fallback_review_prompt, FOCUS_MODES, DIFF_BUDGETS,
 )
@@ -66,6 +67,15 @@ AGENT_PROFILES = ("codex", "claude_code", "generic")
 START_MODE_DRY_RUN = "dry-run"
 START_MODE_REAL = "real"
 START_REAL_CONFIRMATION = "START REAL ADVISORY"
+START_REAL_DASHBOARD_MODE = "real-github-advisory"
+START_REAL_ACTION = "start_real_advisory"
+START_REAL_STATE_FILE = "start-real-advisory-state.json"
+START_REAL_MAX_POLLS_DEFAULT = 1
+START_REAL_POLL_SECONDS_DEFAULT = 0
+START_REAL_MAX_POLLS_LIMIT = 10
+START_REAL_POLL_SECONDS_LIMIT = 60
+
+_START_REAL_LOCK = threading.Lock()
 
 
 def _now_iso() -> str:
@@ -112,6 +122,152 @@ def _agent_profile(value: str) -> str:
     if value not in AGENT_PROFILES:
         raise ValueError("agent_profile must be one of: %s" % ", ".join(AGENT_PROFILES))
     return value
+
+
+def _bounded_int(value, name: str, default: int, minimum: int, maximum: int) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        out = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError("%s must be an integer" % name)
+    if out < minimum or out > maximum:
+        raise ValueError("%s must be between %d and %d" % (name, minimum, maximum))
+    return out
+
+
+def _redact_audit_text(text) -> str:
+    """Keep the local audit trail useful without writing obvious tokens into it."""
+    return _SECRET_RE.sub("[REDACTED]", "" if text is None else str(text))
+
+
+def _start_real_state_path(audit_dir: Optional[str] = None, state_file: Optional[str] = None) -> str:
+    if state_file:
+        return state_file
+    return os.path.join(audit_dir or dashboard_writes.AUDIT_DIR, START_REAL_STATE_FILE)
+
+
+def _read_start_real_state(audit_dir: Optional[str] = None,
+                           state_file: Optional[str] = None) -> dict:
+    try:
+        with open(_start_real_state_path(audit_dir, state_file), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_start_real_state(data: dict, audit_dir: Optional[str] = None,
+                            state_file: Optional[str] = None) -> None:
+    try:
+        path = _start_real_state_path(audit_dir, state_file)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _audit_start_real(record: dict, audit_dir: Optional[str] = None) -> None:
+    """Best-effort append to the shared dashboard write audit log."""
+    rec = {
+        "timestamp": _now_iso(),
+        "action": START_REAL_ACTION,
+        "actor": "dashboard",
+    }
+    rec.update(record)
+    try:
+        dashboard_writes._audit(audit_dir, rec)
+    except Exception:
+        pass
+
+
+def _audit_start_attempt(result: str, repo: str, thread_id: str, task: str,
+                         agent_profile: str, reason: str = "",
+                         issue_number=None, issue_url: str = "",
+                         audit_dir: Optional[str] = None) -> None:
+    rec = {
+        "repo": (repo or "").strip(),
+        "thread_id": (thread_id or "").strip(),
+        "task": _redact_audit_text(task),
+        "agent_profile": (agent_profile or "").strip(),
+        "result": result,
+        "issue_number": issue_number,
+        "issue_url": issue_url or "",
+    }
+    if reason:
+        rec["reason"] = _redact_audit_text(reason)
+    _audit_start_real(rec, audit_dir=audit_dir)
+
+
+def _refuse_start_real(repo: str, thread_id: str, task: str, agent_profile: str,
+                       reason: str, audit_dir: Optional[str] = None) -> None:
+    _audit_start_attempt("refused", repo, thread_id, task, agent_profile, reason,
+                         audit_dir=audit_dir)
+    raise ValueError(reason)
+
+
+def _remember_start_real(final: dict, result: str, task: str,
+                         audit_dir: Optional[str] = None,
+                         state_file: Optional[str] = None) -> None:
+    thread_id = final.get("thread_id") or ""
+    if not thread_id:
+        return
+    data = _read_start_real_state(audit_dir, state_file)
+    data[thread_id] = {
+        "created_at": _now_iso(),
+        "thread_id": thread_id,
+        "repo": final.get("repo") or "",
+        "task": _redact_audit_text(task),
+        "agent_profile": final.get("agent_profile") or "",
+        "issue_number": final.get("issue_number"),
+        "issue_url": final.get("issue_url") or "",
+        "result": result,
+        "request_sent": _start_real_request_sent(final),
+        "checkpoint_thread_id": thread_id if final.get("status") == "paused" else "",
+    }
+    _write_start_real_state(data, audit_dir, state_file)
+
+
+def _start_real_errors(final: dict) -> list[str]:
+    return [str(e) for e in (final.get("errors") or [])]
+
+
+def _start_real_request_failed(final: dict) -> bool:
+    return any(
+        e.startswith("create_advisory_issue:")
+        or e.startswith("request_codex_advisory:")
+        for e in _start_real_errors(final)
+    )
+
+
+def _start_real_request_sent(final: dict) -> bool:
+    return bool(final.get("issue_number")) and not _start_real_request_failed(final)
+
+
+def _pause_start_real_timeout_checkpoint(final: dict) -> dict:
+    """Keep a browser-inspectable/exportable checkpoint after a sent request times out."""
+    paused = dict(final)
+    gate = GATE_ALIASES["advisory"]
+    event_log = list(paused.get("event_log") or [])
+    event_log.append("[dashboard_start] real advisory request timed out; saved an advisory "
+                     "gate checkpoint for inspection/export.")
+    payload = dict(paused.get("interrupt_payload") or {})
+    payload.update({
+        "gate": gate,
+        "question": "Codex advisory did not arrive within the bounded poll window.",
+        "advisory": (paused.get("advisory_packet") or {}).get("summary"),
+    })
+    paused.update({
+        "status": "paused",
+        "paused_at_gate": gate,
+        "paused_at_node": GATE_TO_NODE.get(gate),
+        "interrupt_payload": payload,
+        "event_log": event_log,
+    })
+    return paused
 
 
 # ----------------------------------------------------------------------------------------
@@ -240,6 +396,129 @@ def create_start_run(task: str, thread_id: str = "", repo: str = "",
     return final
 
 
+def _classify_start_real_result(final: dict) -> str:
+    if final.get("status") == "paused":
+        return "success"
+    errors = _start_real_errors(final)
+    request_or_poll_failure = any(
+        e.startswith("create_advisory_issue:")
+        or e.startswith("request_codex_advisory:")
+        or e.startswith("wait_for_codex_advisory:")
+        for e in errors
+    )
+    if request_or_poll_failure:
+        return "failure"
+    if (final.get("codex_advisory_status") == "timeout"
+            and _start_real_request_sent(final)):
+        return "timeout"
+    return "failure" if errors else "success"
+
+
+def create_start_real_advisory_run(task: str, thread_id: str = "", repo: str = "",
+                                   agent_profile: str = "codex", confirmation: str = "",
+                                   max_polls=None, poll_seconds=None, *,
+                                   writes_enabled: bool = False,
+                                   audit_dir: Optional[str] = None,
+                                   state_file: Optional[str] = None) -> dict:
+    """Launch the Start Wizard's real GitHub advisory mode.
+
+    This is intentionally narrower than a generic dashboard write API: it creates the existing
+    advisory issue, posts the existing advisory request comment, then bounded-polls for Codex and
+    stops at the advisory approval gate. It never implements, creates a PR, pushes, or merges.
+    """
+    raw_task, raw_repo, raw_thread = task, repo, thread_id
+    task = (task or "").strip()
+    repo = (repo or "").strip()
+    thread_id = (thread_id or "").strip()
+    profile = (agent_profile or "").strip()
+
+    if not writes_enabled:
+        _refuse_start_real(raw_repo, raw_thread, raw_task, profile,
+                           "real GitHub advisory requires --allow-github-writes on localhost",
+                           audit_dir=audit_dir)
+    if (confirmation or "") != START_REAL_CONFIRMATION:
+        _refuse_start_real(repo, thread_id, task, profile,
+                           "confirmation does not match - type exactly: %s"
+                           % START_REAL_CONFIRMATION,
+                           audit_dir=audit_dir)
+    if not repo:
+        _refuse_start_real(repo, thread_id, task, profile, "repo is required",
+                           audit_dir=audit_dir)
+    if not task:
+        _refuse_start_real(repo, thread_id, task, profile, "task is required",
+                           audit_dir=audit_dir)
+    if not thread_id:
+        _refuse_start_real(repo, thread_id, task, profile,
+                           "thread_id is required for real GitHub advisory mode",
+                           audit_dir=audit_dir)
+    if profile not in AGENT_PROFILES:
+        _refuse_start_real(repo, thread_id, task, profile,
+                           "agent_profile must be one of: %s" % ", ".join(AGENT_PROFILES),
+                           audit_dir=audit_dir)
+    try:
+        max_polls_i = _bounded_int(max_polls, "max_polls", START_REAL_MAX_POLLS_DEFAULT,
+                                   0, START_REAL_MAX_POLLS_LIMIT)
+        poll_seconds_i = _bounded_int(poll_seconds, "poll_seconds",
+                                      START_REAL_POLL_SECONDS_DEFAULT,
+                                      0, START_REAL_POLL_SECONDS_LIMIT)
+    except ValueError as ex:
+        _refuse_start_real(repo, thread_id, task, profile, str(ex), audit_dir=audit_dir)
+
+    with _START_REAL_LOCK:
+        if get_run(thread_id) is not None:
+            _refuse_start_real(repo, thread_id, task, profile,
+                               "a run with thread_id %r already exists - choose a unique id "
+                               "(or remove the existing run first)" % (thread_id,),
+                               audit_dir=audit_dir)
+        seen = _read_start_real_state(audit_dir, state_file).get(thread_id)
+        if isinstance(seen, dict) and (seen.get("request_sent") or
+                                       seen.get("checkpoint_thread_id") or
+                                       seen.get("result") in ("success", "timeout")):
+            msg = "real advisory already started for thread_id %r" % thread_id
+            if seen.get("issue_url"):
+                msg += " (%s)" % seen.get("issue_url")
+            _refuse_start_real(repo, thread_id, task, profile, msg, audit_dir=audit_dir)
+
+        gh = check_gh_available()
+        if not (gh.get("available") and gh.get("authenticated")):
+            reason = gh.get("error") or "gh CLI is not available/authenticated"
+            _audit_start_attempt("failure", repo, thread_id, task, profile, reason,
+                                 audit_dir=audit_dir)
+            raise GhError(reason)
+
+        state = new_state(task_type=task, thread_id=thread_id, repo=repo, approvals={},
+                          pause_at=GATE_ALIASES["advisory"], real_github=True,
+                          max_polls=max_polls_i, poll_seconds=poll_seconds_i)
+        state["task_text"] = task
+        state["agent_profile"] = profile
+        state["dashboard_start_mode"] = START_REAL_DASHBOARD_MODE
+        state["real_github"] = True
+        state["event_log"].append(
+            "[dashboard_start] mode=real-github-advisory agent_profile=%s repo=%s "
+            "task=%s max_polls=%s poll_seconds=%s"
+            % (profile, repo, task, max_polls_i, poll_seconds_i)
+        )
+        app = build_graph(prefer_fallback=True)
+        with _STDOUT_LOCK:
+            final = app.invoke(state)
+
+        result = _classify_start_real_result(final)
+        final["dashboard_start_result"] = result
+        if result == "timeout":
+            final = _pause_start_real_timeout_checkpoint(final)
+            final["dashboard_start_result"] = result
+        _persist(thread_id, final)
+
+        _audit_start_attempt(result, repo, thread_id, task, profile,
+                             "; ".join(str(e) for e in (final.get("errors") or [])),
+                             issue_number=final.get("issue_number"),
+                             issue_url=final.get("issue_url") or "",
+                             audit_dir=audit_dir)
+        if result in ("success", "timeout") or _start_real_request_sent(final):
+            _remember_start_real(final, result, task, audit_dir=audit_dir, state_file=state_file)
+        return final
+
+
 def decide_gate(thread_id: str, gate: str, decision: str) -> dict:
     """Resume a paused run with an approve/reject decision (DRY-RUN; ``real_github`` never enabled).
     ``gate`` is an alias (advisory|fix|merge). Raises ValueError on bad input / wrong state."""
@@ -252,13 +531,11 @@ def decide_gate(thread_id: str, gate: str, decision: str) -> dict:
         raise ValueError("no checkpoint for thread %r" % (thread_id,))
     if state.get("status") != "paused":
         raise ValueError("thread %r is not paused (status=%r)" % (thread_id, state.get("status")))
-    # the dashboard is DRY-RUN only; resuming a live (--real-github) checkpoint would force it back to
-    # dry-run and re-persist over the real provenance, breaking a later `devflow resume --real-github`.
-    # Refuse it (the run is still inspectable/exportable, just not resumable from here).
+    # The dashboard can launch a live advisory, but it does not resume live checkpoints into
+    # implementation/PR behavior. Refuse it (the run is still inspectable/exportable).
     if state.get("real_github"):
-        raise ValueError("run %r was started with --real-github (a live flow); the dashboard is "
-                         "dry-run only and will not resume it — use the CLI: "
-                         "devflow resume --real-github" % (thread_id,))
+        raise ValueError("run %r was started with real_github; the dashboard will not resume a "
+                         "live checkpoint - export an Implementation Packet instead" % (thread_id,))
     full_gate = GATE_ALIASES[gate]
     paused_gate = state.get("paused_at_gate")
     # FAIL CLOSED: a paused checkpoint with no recorded gate (truncated / hand-edited / foreign) must
