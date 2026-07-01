@@ -2319,6 +2319,8 @@ class RetargetHelperTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="rt_")
         self.audit = os.path.join(self.tmp, "actions")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        dw._POSTED.clear()
+        self.addCleanup(dw._POSTED.clear)
 
     def _fakes(self, head="abc1234", state="OPEN", base="feat/parent", write_ok=True):
         ro = mock.Mock()
@@ -2482,6 +2484,22 @@ class RetargetHelperTests(unittest.TestCase):
         self.assertTrue(res["ok"])
         save.assert_not_called()
 
+    def test_success_clears_codex_post_dedup_marker(self):
+        # Codex PR#17 R3: the base change makes a prior @codex review (same head) stale, so the operator's
+        # follow-up review request must NOT be skipped as a duplicate — clear _POSTED[(repo, n)] on success
+        dw._POSTED[("owner/repo", 9)] = "abc1234"           # a prior post at this (unchanged) head
+        ro, writer, calls = self._fakes()
+        res = self._call(ro, writer)
+        self.assertTrue(res["ok"])
+        self.assertNotIn(("owner/repo", 9), dw._POSTED)      # marker cleared -> re-request will post
+
+    def test_failed_retarget_keeps_dedup_marker(self):
+        dw._POSTED[("owner/repo", 9)] = "abc1234"
+        ro, writer, calls = self._fakes(write_ok=False)
+        res = self._call(ro, writer)
+        self.assertFalse(res["ok"])
+        self.assertIn(("owner/repo", 9), dw._POSTED)         # no clear on a failed write
+
 
 class CodexReviewServiceCandidatesTests(unittest.TestCase):
     """`service.request_codex_review` recomputes the CURRENT request_review candidates and passes them
@@ -2551,7 +2569,22 @@ class CodexReviewServiceCandidatesTests(unittest.TestCase):
         rec = self._audit_lines(audit)[-1]
         self.assertEqual(rec["action"], "retarget_pr_base")
         self.assertEqual(rec["result"], "failure")
-        self.assertIn("gh error", rec["reason"])
+        self.assertIn("plan recompute failed", rec["reason"])
+
+    def test_valueerror_during_retarget_recompute_is_audited(self):
+        # Codex PR#17 R3: a ValueError from the recompute (e.g. empty repo) must ALSO be audited before
+        # re-raising — the helper's own audited gates never run in that case, so the trail would miss it
+        tmp = tempfile.mkdtemp(prefix="svc_rt_ve_")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        audit = os.path.join(tmp, "actions")
+        with mock.patch.object(service, "run_orchestrator", side_effect=ValueError("repo is required")):
+            with self.assertRaises(ValueError):
+                service.retarget_pr_base("", "9", "abc", "feat/parent", "main",
+                                         "RETARGET #9 TO main", audit_dir=audit)
+        rec = self._audit_lines(audit)[-1]
+        self.assertEqual(rec["action"], "retarget_pr_base")
+        self.assertEqual(rec["result"], "failure")
+        self.assertIn("plan recompute failed", rec["reason"])
 
     def _audit_lines(self, audit_dir):
         p = os.path.join(audit_dir, dw.AUDIT_FILE)

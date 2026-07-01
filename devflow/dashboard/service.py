@@ -461,10 +461,18 @@ def retarget_pr_base(repo, pr_number, expected_head_sha, expected_current_base, 
     orchestrator state. Returns the helper result; raises ValueError on a gate failure, GhError on gh."""
     try:
         candidates, targets = _current_needs_retarget(repo, limit=limit)
+    except (ValueError, GhError) as ex:
+        # the plan recompute failed BEFORE the helper's own audited gates (e.g. empty repo -> ValueError,
+        # or a gh failure) — audit this refused/failed attempt so the trail isn't missing it, then re-raise.
+        dashboard_writes.audit_failure(dashboard_writes.RETARGET_ACTION, repo, pr_number,
+                                       "plan recompute failed: %s" % ex, audit_dir=audit_dir)
+        raise
+    try:
         return dashboard_writes.retarget_pr_base(
             repo, pr_number, expected_head_sha, expected_current_base, target_base, confirmation,
             live=True, candidates=candidates, targets=targets, audit_dir=audit_dir)
     except GhError as ex:
+        # the helper's read (get_pr_meta) failed — audit it; the helper's ValueError gates self-audit.
         dashboard_writes.audit_failure(dashboard_writes.RETARGET_ACTION, repo, pr_number,
                                        "gh error: %s" % ex, audit_dir=audit_dir)
         raise

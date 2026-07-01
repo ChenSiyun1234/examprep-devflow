@@ -365,5 +365,9 @@ def retarget_pr_base(repo: str, pr_number, expected_head_sha: str, expected_curr
         if not ok:
             return {"ok": False, "error": res.get("error") or "retarget failed",
                     "pr_number": n, "head_sha": head, "from_base": cur_base, "to_base": target}
+        # the base changed, so a prior @codex review posted from THIS dashboard is stale — drop the
+        # same-head post-dedup marker so the operator's follow-up @codex review (which the success page
+        # tells them to send) actually posts and is NOT skipped as a duplicate at the unchanged head.
+        _POSTED.pop((repo, n), None)
     return {"ok": True, "pr_number": n, "head_sha": head, "from_base": cur_base, "to_base": target,
             "action": RETARGET_ACTION}
