@@ -291,7 +291,9 @@ human/manual step, out of scope.
    **intentional boundary**: the retarget write deliberately never rewrites the shared planner state
    (`converged` / `done` / `requested_head`) — automatically invalidating base-sensitive review state in
    the *shared* planner (which the external auto-merge automation also reads) is left to a follow-up, and
-   the dashboard itself has **no** merge button, so its residual risk is advisory-only. Helper:
+   the dashboard itself has **no** merge button, so its residual risk is advisory-only. (Honest caveat:
+   like editing *any* PR, changing the base can trigger the **target repo's own** `pull_request: edited`
+   workflows if defined — inherent to a base edit; the dashboard itself never invokes Actions.) Helper:
    `devflow/tools/dashboard_writes.retarget_pr_base` → the narrow `GitHubWriter.retarget_pr_base`.
 
 **GPT fallback prompt builder (`/gpt-review`) — read-only text builder.** Creates a copyable

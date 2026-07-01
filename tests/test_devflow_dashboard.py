@@ -1907,6 +1907,13 @@ class OrchestratorWriteRenderTests(unittest.TestCase):
         html = app._render_orchestration(self._with_needs_retarget(), True, 120)
         self.assertIn("name='limit' value='120'", html)
 
+    def test_retarget_form_warns_about_edited_actions(self):
+        # Codex PR#17 R4: `gh pr edit --base` can trigger the target repo's pull_request:edited workflows —
+        # the retarget button copy must carry that honest caveat (like the codex/mark-ready caveats)
+        html = app._render_orchestration(self._with_needs_retarget(), True, 50)
+        self.assertIn("pull_request: edited", html)
+        self.assertIn("never invokes", html)
+
 
 class CodexWriteFlagTests(unittest.TestCase):
     """`--allow-github-writes` enables the write path ONLY on a localhost bind."""

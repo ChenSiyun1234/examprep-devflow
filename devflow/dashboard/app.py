@@ -186,7 +186,10 @@ def _retarget_forms(repo, nums, targets, prs_by_num, limit=50) -> str:
             "PR is still OPEN, still in needs_retarget, its head and current base still match, the target "
             "equals the planner's, and the confirmation is exact. Afterwards the PR diff has changed, so "
             "<strong>re-request <code>@codex review</code></strong> (any prior review is stale against the "
-            "new base) and recompute the Review Queue.</p>" + "".join(rows))
+            "new base) and recompute the Review Queue. (Honest caveat: like editing <em>any</em> PR, "
+            "changing the base can trigger the <strong>target repo's own</strong> "
+            "<code>pull_request: edited</code> workflows if defined — inherent to a base edit; the "
+            "dashboard itself never invokes GitHub Actions.)</p>" + "".join(rows))
 
 
 def _render_orchestration(result: dict, allow_writes: bool = False, limit: int = 50) -> str:
