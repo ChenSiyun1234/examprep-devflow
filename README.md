@@ -286,7 +286,12 @@ human/manual step, out of scope.
    current base still match the page, and it is still OPEN. It touches **no** orchestrator state; because
    the base change alters the PR diff, **any prior Codex review is stale** — re-request `@codex review`
    and recompute the Review Queue afterwards (the planner keys "clean" by head SHA, which a base change
-   does not move, so it will not on its own ask for a fresh review). Helper:
+   does not move, so it will not on its own ask for a fresh review; and the retarget clears this
+   dashboard's `@codex review` post-dedup marker so that follow-up request actually posts). This is an
+   **intentional boundary**: the retarget write deliberately never rewrites the shared planner state
+   (`converged` / `done` / `requested_head`) — automatically invalidating base-sensitive review state in
+   the *shared* planner (which the external auto-merge automation also reads) is left to a follow-up, and
+   the dashboard itself has **no** merge button, so its residual risk is advisory-only. Helper:
    `devflow/tools/dashboard_writes.retarget_pr_base` → the narrow `GitHubWriter.retarget_pr_base`.
 
 **GPT fallback prompt builder (`/gpt-review`) — read-only text builder.** Creates a copyable
