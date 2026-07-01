@@ -1938,6 +1938,16 @@ class CodexWriteFlagTests(unittest.TestCase):
                                   bound_host="localhost")
         self.assertTrue(rs.call_args.kwargs.get("allow_writes"))
 
+    def test_write_enabled_banner_does_not_undercount_writes(self):
+        # Codex PR#17: the serving banner must not stale-claim "post @codex review only" now that there
+        # are three writes — it must mention all three, not just the first
+        rc, rs, out, _ = self._main(["--host", "127.0.0.1", "--port", "8765", "--allow-github-writes"])
+        self.assertIn("writes ENABLED", out)
+        self.assertNotIn("@codex review only", out)
+        low = out.lower()
+        for w in ("@codex review", "mark ready", "retarget"):
+            self.assertIn(w, low)
+
     def test_flag_on_non_localhost_refuses_writes(self):
         rc, rs, out, err = self._main(["--host", "0.0.0.0", "--port", "8765", "--allow-github-writes"],
                                       bound_host="0.0.0.0")

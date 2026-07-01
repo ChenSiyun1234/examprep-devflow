@@ -378,8 +378,9 @@ def set_packet_status(slug, status, base_dir=None) -> dict:
 
 
 # ----------------------------------------------------------------------------------------
-# The ONE real GitHub write the dashboard can do: post the fixed "@codex review" (gated by the app on
-# --allow-github-writes + localhost). Delegates to the narrow guarded helper; no generic comment API.
+# The narrow real GitHub writes the dashboard can do (gated by the app on --allow-github-writes +
+# localhost): post the fixed "@codex review", mark a draft ready, and retarget a base. Each delegates to
+# a narrow guarded helper; there is no generic comment/edit API.
 # ----------------------------------------------------------------------------------------
 def _current_request_review_candidates(repo, limit=None) -> list:
     """Recompute (READ-ONLY) the PR numbers the orchestrator CURRENTLY recommends requesting review for.

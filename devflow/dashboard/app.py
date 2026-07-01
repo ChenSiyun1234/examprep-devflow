@@ -522,9 +522,10 @@ class DashboardServer(ThreadingHTTPServer):
             self.address_family = socket.AF_INET6
         super().__init__(addr, handler)
         self.allowed_hosts = set(allowed_hosts)
-        # the ONE opt-in real-GitHub-write capability (post @codex review). Enforce the localhost-only
-        # boundary HERE (not just in main()) so an embedding/test harness calling run_server() directly
-        # can't enable writes on a non-loopback bind: writes stay off unless the bind host is a loopback.
+        # the opt-in real-GitHub-write capabilities (post @codex review / mark ready / retarget base).
+        # Enforce the localhost-only boundary HERE (not just in main()) so an embedding/test harness
+        # calling run_server() directly can't enable writes on a non-loopback bind: writes stay off
+        # unless the bind host is a loopback.
         self.allow_writes = _writes_allowed_for_host(addr[0], allow_writes)
 
 
@@ -1061,8 +1062,8 @@ def _allowed_hosts(host: str) -> set:
 def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                allow_writes: bool = False) -> DashboardServer:
     """Build (but do not serve) the dashboard server bound to ``host:port``. Caller serves it.
-    ``allow_writes`` enables the single opt-in GitHub-write control (post @codex review) — callers must
-    pass it True ONLY for a localhost bind (main() enforces this)."""
+    ``allow_writes`` enables the opt-in GitHub-write controls (post @codex review / mark ready / retarget
+    base) — callers must pass it True ONLY for a localhost bind (the factory also enforces this)."""
     httpd = DashboardServer((host, port), Handler, _allowed_hosts(host), allow_writes=allow_writes)
     return httpd
 
@@ -1095,15 +1096,16 @@ def main(argv=None) -> int:
     p.add_argument("--open", action="store_true",
                    help="after starting, open the dashboard URL in your browser (localhost binds only)")
     p.add_argument("--allow-github-writes", action="store_true",
-                   help="opt-in: enable the ONE real GitHub-write control (post '@codex review' from the "
-                        "Review Queue, with typed confirmation). Localhost binds ONLY; off by default")
+                   help="opt-in: enable the 3 narrow GitHub-write controls (post '@codex review' / mark a "
+                        "draft ready / retarget base) from the Review Queue, each with typed confirmation. "
+                        "Localhost binds ONLY; off by default")
     args = p.parse_args(argv)
     is_local = args.host.strip().lower() in _LOCALHOST_NAMES
     if not is_local:
         sys.stderr.write(
             "[dashboard] WARNING: binding %s is NOT localhost. This dashboard is a local dev tool "
             "with no authentication — do not expose it on an untrusted network.\n" % args.host)
-    # the ONE opt-in write capability is enabled ONLY with the flag AND a localhost bind.
+    # the opt-in write capabilities are enabled ONLY with the flag AND a localhost bind.
     allow_writes = bool(args.allow_github_writes) and is_local
     if args.allow_github_writes and not is_local:
         sys.stderr.write(
@@ -1113,7 +1115,7 @@ def main(argv=None) -> int:
     host_disp = "[%s]" % args.host if ":" in args.host else args.host    # bracket an IPv6 literal for the URI
     url = "http://%s:%d" % (host_disp, httpd.server_address[1])          # ACTUAL bound port (handles --port 0)
     print("[dashboard] serving on %s  (Ctrl-C to stop; localhost-only; %s)"
-          % (url, "GitHub writes ENABLED (post @codex review only)" if allow_writes
+          % (url, "GitHub writes ENABLED (post @codex review / mark ready / retarget base)" if allow_writes
              else "read-only / dry-run"))
     if args.open:
         # convenience only, stdlib webbrowser (no shell). NEVER auto-open a non-localhost bind.

@@ -200,7 +200,8 @@ python -m devflow.dashboard.app        # then open http://127.0.0.1:8765
 python -m devflow.dashboard.app --open # start + open the URL in your browser (localhost binds only)
 devflow-dashboard --open               # same, via the console script once the package is installed
 # options: --host 127.0.0.1 (default; localhost-only) --port 8765
-#          --allow-github-writes  opt-in: enable the ONE real write (post '@codex review'); localhost only
+#          --allow-github-writes  opt-in: enable the 3 narrow writes (post '@codex review' / mark ready /
+#                                 retarget base); localhost only
 ```
 
 `--open` is a convenience (stdlib `webbrowser`, no shell); it is **skipped for a non-localhost `--host`**
@@ -208,10 +209,11 @@ devflow-dashboard --open               # same, via the console script once the p
 
 `--allow-github-writes` is **off by default**. Without it the dashboard performs **no** real GitHub writes
 at all (every button is read-only or dry-run). With it — and **only** on a localhost bind (enforced in the
-server factory) — the Review Queue gains **two** narrow opt-in write controls described below; passing it
-with a non-localhost `--host` is **refused** (a `REFUSED:` line prints and writes stay disabled). The two
-controls are: (1) post the fixed comment `@codex review`, and (2) mark a draft PR ready for review. Both
-require a typed confirmation; **neither merges** — and there is **no** other GitHub write.
+server factory) — the Review Queue gains **three** narrow opt-in write controls described below; passing it
+with a non-localhost `--host` is **refused** (a `REFUSED:` line prints and writes stay disabled). The three
+controls are: (1) post the fixed comment `@codex review`, (2) mark a draft PR ready for review, and
+(3) retarget a `needs_retarget` PR's base branch to the planner's exact target. All three require a typed
+confirmation; **none merges** — and there is **no** other GitHub write.
 
 Pages: **Runs** (list local checkpoints — thread id, status, paused gate) · **Run detail** (state
 fields, event log, errors, and — when paused — the gate payload with **Approve / Reject / Export
