@@ -216,7 +216,7 @@ def create_start_run(task: str, thread_id: str = "", repo: str = "",
     if not thread_id:
         raise ValueError("thread_id is required")
     if get_run(thread_id) is not None:
-        raise ValueError("a run with thread_id %r already exists 鈥?choose a unique id "
+        raise ValueError("a run with thread_id %r already exists - choose a unique id "
                          "(or remove the existing run first)" % (thread_id,))
     profile = _agent_profile(agent_profile or AGENT_PROFILES[0])
     repo = (repo or "").strip() or START_DEFAULT_REPO
@@ -464,8 +464,9 @@ def set_packet_status(slug, status, base_dir=None) -> dict:
 
 
 # ----------------------------------------------------------------------------------------
-# The ONE real GitHub write the dashboard can do: post the fixed "@codex review" (gated by the app on
-# --allow-github-writes + localhost). Delegates to the narrow guarded helper; no generic comment API.
+# The narrow real GitHub writes the dashboard can do (gated by the app on --allow-github-writes +
+# localhost): post the fixed "@codex review", mark a draft ready, and retarget a base. Each delegates to
+# a narrow guarded helper; there is no generic comment/edit API.
 # ----------------------------------------------------------------------------------------
 def _current_request_review_candidates(repo, limit=None) -> list:
     """Recompute (READ-ONLY) the PR numbers the orchestrator CURRENTLY recommends requesting review for.
@@ -523,5 +524,41 @@ def mark_ready_for_review(repo, pr_number, expected_head_sha, confirmation, *,
         # a gh read failure (candidate recompute / PR-metadata read) is a FAILED attempt — audit it too,
         # then propagate so the handler renders the error (the local trail must cover gh failures).
         dashboard_writes.audit_failure(dashboard_writes.MARK_READY_ACTION, repo, pr_number,
+                                       "gh error: %s" % ex, audit_dir=audit_dir)
+        raise
+
+
+def _current_needs_retarget(repo, limit=None):
+    """Recompute (READ-ONLY) the CURRENT ``needs_retarget`` PR numbers AND the planner's ``retarget_to``
+    map (pr -> exact target base). The retarget write may only target one of these PRs, and only to the
+    exact base the planner computed (least authority). ``limit`` MUST be the window the page used."""
+    result = run_orchestrator(repo, limit=limit if limit is not None else ORCH_LIMIT_DEFAULT)
+    plan = result.get("plan") or {}
+    return list(plan.get("needs_retarget") or []), dict(plan.get("retarget_to") or {})
+
+
+def retarget_pr_base(repo, pr_number, expected_head_sha, expected_current_base, target_base,
+                     confirmation, *, limit=None, audit_dir=None) -> dict:
+    """Retarget a PR's base branch. The APP gates this on --allow-github-writes + localhost BEFORE calling
+    here; this recomputes the CURRENT needs_retarget set + retarget_to map server-side (using the SAME
+    ``limit`` the page was rendered with, so a stale/tampered form can only retarget a PR the planner
+    still lists, and only to the planner's exact target) and delegates the confirmation / head / base /
+    OPEN / safe-ref / fixed-shape gating to the guarded writer. This does NOT merge and touches no
+    orchestrator state. Returns the helper result; raises ValueError on a gate failure, GhError on gh."""
+    try:
+        candidates, targets = _current_needs_retarget(repo, limit=limit)
+    except (ValueError, GhError) as ex:
+        # the plan recompute failed BEFORE the helper's own audited gates (e.g. empty repo -> ValueError,
+        # or a gh failure) — audit this refused/failed attempt so the trail isn't missing it, then re-raise.
+        dashboard_writes.audit_failure(dashboard_writes.RETARGET_ACTION, repo, pr_number,
+                                       "plan recompute failed: %s" % ex, audit_dir=audit_dir)
+        raise
+    try:
+        return dashboard_writes.retarget_pr_base(
+            repo, pr_number, expected_head_sha, expected_current_base, target_base, confirmation,
+            live=True, candidates=candidates, targets=targets, audit_dir=audit_dir)
+    except GhError as ex:
+        # the helper's read (get_pr_meta) failed — audit it; the helper's ValueError gates self-audit.
+        dashboard_writes.audit_failure(dashboard_writes.RETARGET_ACTION, repo, pr_number,
                                        "gh error: %s" % ex, audit_dir=audit_dir)
         raise

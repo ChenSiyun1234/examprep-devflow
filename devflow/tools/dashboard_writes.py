@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
-"""The narrow real-GitHub-writes the local Dashboard may perform, behind strong gating. Exactly TWO:
+"""The narrow real-GitHub-writes the local Dashboard may perform, behind strong gating. Exactly THREE:
 
 1. :func:`post_codex_review_request` — post the FIXED comment ``@codex review`` to a request_review PR.
 2. :func:`mark_pr_ready_for_review` — mark a ready_then_merge DRAFT PR ready (``gh pr ready``).
+3. :func:`retarget_pr_base` — change a needs_retarget PR's BASE branch to the planner's exact target
+   (``gh pr edit --base``, base only — never title/body/reviewers/state).
 
 There is deliberately NO generic write API here: the comment body is a module constant (never a
-parameter) and mark-ready takes no action/flag argument, so no caller can post arbitrary text or run an
-arbitrary GitHub mutation. Neither path merges / retargets / requests reviewers / closes / deletes /
-pushes / force-pushes / converts-to-draft, calls no LLM, and handles no secrets. The actual mutation
-goes through the existing guarded :class:`GitHubWriter` (write-shape allow-list + secret scan).
+parameter), mark-ready takes no action/flag argument, and retarget only sets ``--base`` to a validated
+simple branch name — so no caller can post arbitrary text or run an arbitrary GitHub mutation. None of
+the three merges / requests reviewers / closes / deletes / pushes / force-pushes / converts-to-draft,
+none calls an LLM, none handles secrets. The actual mutation goes through the existing guarded
+:class:`GitHubWriter` (write-shape allow-list + secret scan).
 
 Hardening (Codex reviews on PR #15):
 * every write ATTEMPT is audited — including REFUSED ones (``result: "refused"``), so the local trail
@@ -29,12 +32,13 @@ import os
 import threading
 from typing import Iterable, Optional
 
-from devflow.tools.github_cli import ReadOnlyGitHub, GitHubWriter, GhError
+from devflow.tools.github_cli import ReadOnlyGitHub, GitHubWriter, GhError, is_safe_base_ref
 from devflow.tools import review_orchestrator as orch
 
 CODEX_REVIEW_BODY = "@codex review"                    # the ONLY comment body this module may post
 POST_ACTION = "post_codex_review"
 MARK_READY_ACTION = "mark_ready_for_review"
+RETARGET_ACTION = "retarget_pr_base"
 AUDIT_DIR = os.path.join(".devflow", "actions")        # local tool-state, gitignored
 AUDIT_FILE = "dashboard-writes.jsonl"
 
@@ -61,17 +65,24 @@ def ready_confirmation_text(pr_number) -> str:
     return "MARK #%s READY" % pr_number
 
 
+def retarget_confirmation_text(pr_number, target_base) -> str:
+    """The exact phrase the operator must type to confirm a base retarget — PR + target specific."""
+    return "RETARGET #%s TO %s" % (pr_number, target_base)
+
+
 def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _audit_record(action, repo, pr_number, head, result, reason="", body=None) -> dict:
+def _audit_record(action, repo, pr_number, head, result, reason="", body=None, extra=None) -> dict:
     rec = {
         "timestamp": _now_iso(), "action": action, "repo": repo, "pr_number": pr_number,
         "head_sha": head, "result": result, "actor": "dashboard",
     }
     if body is not None:                                # only the @codex review post carries a body
         rec["body"] = body
+    if extra:                                           # e.g. retarget's from_base / to_base
+        rec.update(extra)
     if reason:
         rec["reason"] = reason
     return rec
@@ -93,10 +104,10 @@ def _audit(audit_dir: Optional[str], record: dict) -> None:
         pass
 
 
-def _refuse(action, audit_dir, repo, pr_number, head, reason) -> None:
+def _refuse(action, audit_dir, repo, pr_number, head, reason, extra=None) -> None:
     """Audit a REFUSED write attempt (best-effort) then raise ``ValueError(reason)``. Every gate failure
     routes through here so the local trail also records rejected attempts, not only executed writes."""
-    _audit(audit_dir, _audit_record(action, repo, pr_number, head, "refused", reason))
+    _audit(audit_dir, _audit_record(action, repo, pr_number, head, "refused", reason, extra=extra))
     raise ValueError(reason)
 
 
@@ -263,3 +274,100 @@ def mark_pr_ready_for_review(repo: str, pr_number, expected_head_sha: str, confi
             return {"ok": False, "error": res.get("error") or "mark-ready failed",
                     "pr_number": n, "head_sha": head}
     return {"ok": True, "pr_number": n, "head_sha": head, "action": MARK_READY_ACTION}
+
+
+def retarget_pr_base(repo: str, pr_number, expected_head_sha: str, expected_current_base: str,
+                     target_base: str, confirmation: str, *, live: bool = True,
+                     candidates: Optional[Iterable] = None, targets: Optional[dict] = None,
+                     audit_dir: Optional[str] = None) -> dict:
+    """Change DRAFT/OPEN PR ``pr_number``'s BASE branch to ``target_base`` — and NOTHING else (no merge /
+    rebase / push / reviewer / title / body / state change).
+
+    Gates (each audits a ``refused`` line then raises ValueError, so nothing is written): repo non-empty;
+    PR number a positive int; ``expected_head_sha`` present; ``expected_current_base`` present;
+    ``target_base`` present AND a safe simple branch name; ``confirmation`` exactly equals
+    :func:`retarget_confirmation_text` (LITERAL, whitespace-sensitive); if ``candidates`` is supplied the
+    PR must be in it (a CURRENT ``needs_retarget`` member — least authority); if ``targets`` is supplied
+    the recomputed ``retarget_to[pr]`` must equal ``target_base`` (the operator can't pick a different
+    base than the planner computed); the PR (read read-only) is OPEN, its head still equals
+    ``expected_head_sha`` AND its base still equals ``expected_current_base``. Then ``gh pr edit --base``
+    runs via the guarded GitHubWriter. Audit is best-effort. Does NOT touch orchestrator state (retarget
+    changes the diff context — it must not pretend review was requested/completed). Raises GhError on a gh
+    failure during the read."""
+    repo = (repo or "").strip()
+    target = (target_base or "").strip()
+    cur_base = (expected_current_base or "").strip()
+    ex = {"from_base": cur_base, "to_base": target}        # audit context for every refusal/attempt
+    if not repo:
+        _refuse(RETARGET_ACTION, audit_dir, repo, pr_number, "", "repo is required", extra=ex)
+    try:
+        n = int(str(pr_number).strip())
+        if n <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        _refuse(RETARGET_ACTION, audit_dir, repo, pr_number, "", "PR number must be a positive integer",
+                extra=ex)
+    expected = (expected_head_sha or "").strip()
+    if not expected:
+        _refuse(RETARGET_ACTION, audit_dir, repo, n, "", "expected_head_sha is required", extra=ex)
+    if not cur_base:
+        _refuse(RETARGET_ACTION, audit_dir, repo, n, "", "expected_current_base is required", extra=ex)
+    if not target:
+        _refuse(RETARGET_ACTION, audit_dir, repo, n, "", "target_base is required", extra=ex)
+    if not is_safe_base_ref(target):
+        _refuse(RETARGET_ACTION, audit_dir, repo, n, "",
+                "target_base %r is not a safe simple branch name" % target, extra=ex)
+    if (confirmation or "") != retarget_confirmation_text(n, target):   # LITERAL, whitespace-sensitive
+        _refuse(RETARGET_ACTION, audit_dir, repo, n, "",
+                "confirmation does not match — type exactly: %s" % retarget_confirmation_text(n, target),
+                extra=ex)
+
+    # Least authority: only retarget a PR the dashboard CURRENTLY lists under needs_retarget, and only to
+    # the EXACT base the planner computed for it (the operator can't substitute a different target).
+    if candidates is not None:
+        try:
+            allowed = {int(c) for c in candidates}
+        except (TypeError, ValueError):
+            allowed = set()
+        if n not in allowed:
+            _refuse(RETARGET_ACTION, audit_dir, repo, n, "",
+                    "PR #%s is not in the current needs_retarget set — refresh the Review Queue" % n,
+                    extra=ex)
+    if targets is not None and (targets.get(str(n)) or "") != target:
+        _refuse(RETARGET_ACTION, audit_dir, repo, n, "",
+                "target_base %r != the planner's retarget_to for #%s — refresh the Review Queue"
+                % (target, n), extra=ex)
+
+    # read-only verification: OPEN, head unchanged, base unchanged — before any write.
+    meta = ReadOnlyGitHub(repo).get_pr_meta(n)
+    head = (meta.get("head_oid") or "").strip()
+    ex["head_sha"] = head
+    if (meta.get("state") or "").upper() != "OPEN":
+        _refuse(RETARGET_ACTION, audit_dir, repo, n, head,
+                "PR #%s is not OPEN (state=%s) — refusing to retarget" % (n, meta.get("state")), extra=ex)
+    if not head or head != expected:
+        _refuse(RETARGET_ACTION, audit_dir, repo, n, head,
+                "PR #%s head changed (now %s, expected %s) — refresh Review Queue and retry"
+                % (n, (head[:8] or "?"), expected[:8]), extra=ex)
+    cur = (meta.get("base_ref") or "").strip()
+    if cur != cur_base:
+        _refuse(RETARGET_ACTION, audit_dir, repo, n, head,
+                "PR #%s base changed (now %s, expected %s) — refresh Review Queue and retry"
+                % (n, cur or "?", cur_base), extra=ex)
+
+    # Serialize the write (shared lock). Retarget only sets --base; no orchestrator-state mutation (the
+    # diff context changed, so the planner must be recomputed by the operator — we don't pretend anything).
+    with _POST_LOCK:
+        res = GitHubWriter(repo, live=bool(live)).retarget_pr_base(n, target)
+        ok = bool(res.get("executed")) and not res.get("error")
+        _audit(audit_dir, _audit_record(RETARGET_ACTION, repo, n, head, "success" if ok else "failure",
+                                        extra=ex))
+        if not ok:
+            return {"ok": False, "error": res.get("error") or "retarget failed",
+                    "pr_number": n, "head_sha": head, "from_base": cur_base, "to_base": target}
+        # the base changed, so a prior @codex review posted from THIS dashboard is stale — drop the
+        # same-head post-dedup marker so the operator's follow-up @codex review (which the success page
+        # tells them to send) actually posts and is NOT skipped as a duplicate at the unchanged head.
+        _POSTED.pop((repo, n), None)
+    return {"ok": True, "pr_number": n, "head_sha": head, "from_base": cur_base, "to_base": target,
+            "action": RETARGET_ACTION}
